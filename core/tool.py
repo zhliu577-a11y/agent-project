@@ -2,6 +2,7 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
+
 class Tool(ABC):
     @property
     @abstractmethod
@@ -13,7 +14,7 @@ class Tool(ABC):
 
     @property
     @abstractmethod
-    def parameters(self) -> dict: ...      # JSON Schema
+    def parameters(self) -> dict[str, Any]: ...      # JSON Schema
 
     @abstractmethod
-    def execute(self, **kwargs) -> Any: ...
+    def execute(self, **kwargs: Any) -> Any: ...
