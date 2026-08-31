@@ -8,7 +8,6 @@ class Message:
     content: str
     tool_calls: list = field(default_factory=list)
     tool_call_id: str = ""
-
 @dataclass
 class ToolCall:
     id: str
