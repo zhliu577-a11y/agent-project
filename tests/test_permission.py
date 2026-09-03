@@ -34,7 +34,7 @@ class FakeModel(ModelAdapter):
     def __init__(self, script):
         self._script = list(script)
 
-    async def complete(self, messages, tool_schemas) -> ModelResponse:
+    async def complete(self, messages, tool_schemas, on_token=None) -> ModelResponse:
         return self._script.pop(0)
 
 

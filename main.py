@@ -1,4 +1,4 @@
-# main.py —— 入口（全异步）：DeepSeek + 插件目录按需加载 MCP + 权限钩子
+# main.py —— 入口（全异步）：DeepSeek + 插件目录按需加载 MCP + 权限钩子 + 流式输出
 import asyncio
 import logging
 import sys
@@ -21,6 +21,15 @@ logging.basicConfig(
 
 async def chat(model, tools, hooks, system_prompt: str) -> None:
     print("已连接 DeepSeek。输入 exit / quit / 退出 结束对话。")
+
+    streamed = {"active": False}
+
+    def on_token(text: str) -> None:
+        if not streamed["active"]:
+            print("助手: ", end="", flush=True)
+            streamed["active"] = True
+        print(text, end="", flush=True)
+
     while True:
         user_input = input("你: ").strip()
         if not user_input:
@@ -28,8 +37,16 @@ async def chat(model, tools, hooks, system_prompt: str) -> None:
         if user_input.lower() in {"exit", "quit", "退出"}:
             break
 
-        ctx = await run_agent(model, tools, hooks, system_prompt, user_input)
-        print(f"助手: {ctx.messages[-1].content}")
+        streamed["active"] = False
+        ctx = await run_agent(
+            model, tools, hooks, system_prompt, user_input, on_token=on_token
+        )
+
+        if not streamed["active"]:
+            # 没有流式输出（例如被拒绝或出错），整段补打
+            print(f"助手: {ctx.messages[-1].content}")
+        else:
+            print()  # 流式输出已结束，补一个换行
         if ctx.stop_reason != "done":
             print(f"[提示] 本轮结束原因: {ctx.stop_reason}")
 

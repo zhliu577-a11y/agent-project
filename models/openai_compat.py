@@ -1,6 +1,7 @@
-# models/openai_compat.py —— OpenAI 兼容模型适配器（异步版）
+# models/openai_compat.py —— OpenAI 兼容模型适配器（异步 + 流式）
 import json
 import os
+from collections.abc import Callable
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -55,6 +56,7 @@ class OpenAICompatModel(ModelAdapter):
         self,
         messages: list[Message],
         tool_schemas: list[dict[str, object]],
+        on_token: Callable[[str], None] | None = None,
     ) -> ModelResponse:
         payload: dict[str, Any] = {
             "model": self._model,
@@ -64,15 +66,42 @@ class OpenAICompatModel(ModelAdapter):
             payload["tools"] = tool_schemas
             payload["tool_choice"] = "auto"
 
-        resp = await self._client.chat.completions.create(**payload)
-        choice = resp.choices[0].message
+        # 全程流式：文本增量即时回调；工具调用增量静默累积
+        stream = await self._client.chat.completions.create(**payload, stream=True)
+
+        content_parts: list[str] = []
+        tool_calls_acc: dict[int, dict[str, str]] = {}
+        saw_tool_call = False
+
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+
+            if delta.tool_calls:
+                saw_tool_call = True
+                for tc in delta.tool_calls:
+                    acc = tool_calls_acc.setdefault(
+                        tc.index, {"id": "", "name": "", "arguments": ""}
+                    )
+                    if tc.id:
+                        acc["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        acc["name"] += tc.function.name
+                    if tc.function and tc.function.arguments:
+                        acc["arguments"] += tc.function.arguments
+
+            if delta.content:
+                content_parts.append(delta.content)
+                if on_token is not None and not saw_tool_call:
+                    on_token(delta.content)
 
         tool_calls = [
             ToolCall(
-                id=c.id,
-                name=c.function.name,
-                arguments=json.loads(c.function.arguments or "{}"),
+                id=acc["id"] or f"call_{index}",
+                name=acc["name"],
+                arguments=json.loads(acc["arguments"] or "{}"),
             )
-            for c in (choice.tool_calls or [])
+            for index, acc in sorted(tool_calls_acc.items())
         ]
-        return ModelResponse(content=choice.content or "", tool_calls=tool_calls, raw=resp)
+        return ModelResponse(content="".join(content_parts), tool_calls=tool_calls)

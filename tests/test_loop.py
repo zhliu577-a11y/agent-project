@@ -17,8 +17,11 @@ class FakeModel(ModelAdapter):
     def __init__(self, script: list[ModelResponse]) -> None:
         self._script = list(script)
 
-    async def complete(self, messages, tool_schemas) -> ModelResponse:
-        return self._script.pop(0)
+    async def complete(self, messages, tool_schemas, on_token=None) -> ModelResponse:
+        resp = self._script.pop(0)
+        if on_token is not None and not resp.tool_calls:
+            on_token(resp.content)
+        return resp
 
 
 class GetTime(Tool):
@@ -69,3 +72,18 @@ async def test_loop_stops_at_max_turns() -> None:
     ctx = await run_agent(model, tools, HookManager(), "你是助手", "一直调用", max_turns=3)
     assert ctx.stop_reason == "max_turns"
     assert ctx.turn == 3
+
+
+async def test_loop_streams_final_answer_tokens() -> None:
+    model = FakeModel([ModelResponse(content="你好世界", tool_calls=[])])
+    received: list[str] = []
+    ctx = await run_agent(
+        model,
+        ToolRegistry(),
+        HookManager(),
+        "你是助手",
+        "你好",
+        on_token=received.append,
+    )
+    assert received == ["你好世界"]
+    assert ctx.stop_reason == "done"

@@ -1,5 +1,6 @@
-# loop.py —— 内核：固定 agent loop（异步）
+# loop.py —— 内核：固定 agent loop（异步，支持流式输出）
 import logging
+from collections.abc import Callable
 
 from core.hooks import HookManager
 from core.model import ModelAdapter
@@ -16,8 +17,12 @@ async def run_agent(
     system_prompt: str,
     user_input: str,
     max_turns: int = 20,
+    on_token: Callable[[str], None] | None = None,
 ) -> TurnContext:
-    """执行固定循环：调模型 → 执行工具 → 回填 → 直到模型不再请求工具。"""
+    """执行固定循环：调模型 → 执行工具 → 回填 → 直到模型不再请求工具。
+
+    on_token：透传给模型适配器，用于流式显示最终回答。
+    """
     ctx = TurnContext(
         messages=[
             Message(role="system", content=system_prompt),
@@ -30,7 +35,9 @@ async def run_agent(
         await hooks.turn_start(ctx)
 
         try:
-            resp: ModelResponse = await model.complete(ctx.messages, tools.list_schemas())
+            resp: ModelResponse = await model.complete(
+                ctx.messages, tools.list_schemas(), on_token=on_token
+            )
         except Exception as exc:
             logger.exception("模型调用失败: %s", exc)
             ctx.stop_reason = "error"
