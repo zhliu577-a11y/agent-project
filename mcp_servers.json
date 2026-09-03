@@ -1,14 +1,22 @@
 {
-  "servers": [
+  "plugins": [
     {
       "name": "time",
-      "command": "python",
-      "args": ["mcp_servers/time_server.py"]
+      "description": "查询指定时区的当前时间",
+      "enabled": true,
+      "mcp": {
+        "command": "python",
+        "args": ["mcp_servers/time_server.py"]
+      }
     },
     {
       "name": "math",
-      "command": "python",
-      "args": ["mcp_servers/math_server.py"]
+      "description": "安全计算数学表达式",
+      "enabled": true,
+      "mcp": {
+        "command": "python",
+        "args": ["mcp_servers/math_server.py"]
+      }
     }
   ]
 }

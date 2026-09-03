@@ -1,17 +1,16 @@
-# main.py —— 入口（全异步）：DeepSeek + MCP 工具
+# main.py —— 入口（全异步）：DeepSeek + 插件目录按需加载 MCP
 import asyncio
-import json
 import logging
 import sys
-from pathlib import Path
 
 from dotenv import load_dotenv
 
 from core.hooks import HookManager
 from core.registry import ToolRegistry
 from loop import run_agent
-from mcp_bridge import McpBridge, register_mcp_server
+from mcp_bridge import McpBridge
 from models.openai_compat import OpenAICompatModel
+from plugin_loader import UseServer, load_directory
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,8 +18,8 @@ logging.basicConfig(
 )
 
 
-async def chat(model, tools, hooks) -> None:
-    print("已连接 DeepSeek 与 MCP 工具。输入 exit / quit / 退出 结束对话。")
+async def chat(model, tools, hooks, system_prompt: str) -> None:
+    print("已连接 DeepSeek。输入 exit / quit / 退出 结束对话。")
     while True:
         user_input = input("你: ").strip()
         if not user_input:
@@ -28,7 +27,7 @@ async def chat(model, tools, hooks) -> None:
         if user_input.lower() in {"exit", "quit", "退出"}:
             break
 
-        ctx = await run_agent(model, tools, hooks, "你是一个乐于助人的助手。", user_input)
+        ctx = await run_agent(model, tools, hooks, system_prompt, user_input)
         print(f"助手: {ctx.messages[-1].content}")
         if ctx.stop_reason != "done":
             print(f"[提示] 本轮结束原因: {ctx.stop_reason}")
@@ -37,26 +36,25 @@ async def chat(model, tools, hooks) -> None:
 async def main() -> None:
     load_dotenv()
 
+    # 1. 只读目录，不连接任何服务器
+    entries = load_directory("mcp_servers.json")
+    catalog = "\n".join(f"- {e.name}: {e.description}" for e in entries)
+    system_prompt = (
+        "你是一个乐于助人的助手。你可以通过调用 use_server 按需加载工具服务器。\n"
+        f"可用服务器：\n{catalog}\n"
+        "需要用到某台服务器时，先调用 use_server 加载它，加载成功后再使用它提供的工具。"
+    )
+    print(f"插件目录（尚未连接）: {[e.name for e in entries]}")
+
     model = OpenAICompatModel()
     tools = ToolRegistry()
     hooks = HookManager()
 
     bridge = McpBridge()
     try:
-        # 配置驱动：连哪些 MCP 服务器由 mcp_servers.json 决定，不改代码
-        config = json.loads(Path("mcp_servers.json").read_text(encoding="utf-8"))
-        names: list[str] = []
-        for server in config["servers"]:
-            command = server["command"]
-            if command == "python":
-                command = sys.executable  # 用当前解释器启动服务器子进程
-            names += await register_mcp_server(
-                tools, bridge,
-                command=command,
-                args=server["args"],
-            )
-        print(f"已注册 MCP 工具: {names}")
-        await chat(model, tools, hooks)
+        # 2. 只注册"加载器"这一个工具，具体服务器等模型决定后再连
+        tools.register(UseServer(bridge, tools, entries, python=sys.executable))
+        await chat(model, tools, hooks, system_prompt)
     finally:
         await bridge.close()
 
