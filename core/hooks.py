@@ -1,4 +1,4 @@
-# core/hooks.py —— 生命周期钩子（类型化事件）
+# core/hooks.py —— 生命周期钩子（类型化事件，异步）
 import logging
 from typing import Any
 
@@ -10,11 +10,11 @@ logger = logging.getLogger(__name__)
 class LifecycleHooks:
     """插件继承此类，覆写需要关心的方法。不覆写的自动忽略。"""
 
-    def turn_start(self, ctx: TurnContext) -> None: ...
-    def llm_response(self, ctx: TurnContext, resp: ModelResponse) -> None: ...
-    def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> None: ...
-    def tool_after(self, ctx: TurnContext, tool_call: ToolCall, result: Any, ok: bool) -> None: ...
-    def turn_end(self, ctx: TurnContext) -> None: ...
+    async def turn_start(self, ctx: TurnContext) -> None: ...
+    async def llm_response(self, ctx: TurnContext, resp: ModelResponse) -> None: ...
+    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> None: ...
+    async def tool_after(self, ctx: TurnContext, tool_call: ToolCall, result: Any, ok: bool) -> None: ...
+    async def turn_end(self, ctx: TurnContext) -> None: ...
 
 
 class HookManager:
@@ -26,37 +26,37 @@ class HookManager:
     def add(self, hook: LifecycleHooks) -> None:
         self._hooks.append(hook)
 
-    def turn_start(self, ctx: TurnContext) -> None:
+    async def turn_start(self, ctx: TurnContext) -> None:
         for h in self._hooks:
             try:
-                h.turn_start(ctx)
+                await h.turn_start(ctx)
             except Exception as exc:
                 logger.exception("turn_start 钩子执行失败: %s", exc)
 
-    def llm_response(self, ctx: TurnContext, resp: ModelResponse) -> None:
+    async def llm_response(self, ctx: TurnContext, resp: ModelResponse) -> None:
         for h in self._hooks:
             try:
-                h.llm_response(ctx, resp)
+                await h.llm_response(ctx, resp)
             except Exception as exc:
                 logger.exception("llm_response 钩子执行失败: %s", exc)
 
-    def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> None:
+    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> None:
         for h in self._hooks:
             try:
-                h.tool_before(ctx, tool_call)
+                await h.tool_before(ctx, tool_call)
             except Exception as exc:
                 logger.exception("tool_before 钩子执行失败: %s", exc)
 
-    def tool_after(self, ctx: TurnContext, tool_call: ToolCall, result: Any, ok: bool) -> None:
+    async def tool_after(self, ctx: TurnContext, tool_call: ToolCall, result: Any, ok: bool) -> None:
         for h in self._hooks:
             try:
-                h.tool_after(ctx, tool_call, result, ok)
+                await h.tool_after(ctx, tool_call, result, ok)
             except Exception as exc:
                 logger.exception("tool_after 钩子执行失败: %s", exc)
 
-    def turn_end(self, ctx: TurnContext) -> None:
+    async def turn_end(self, ctx: TurnContext) -> None:
         for h in self._hooks:
             try:
-                h.turn_end(ctx)
+                await h.turn_end(ctx)
             except Exception as exc:
                 logger.exception("turn_end 钩子执行失败: %s", exc)

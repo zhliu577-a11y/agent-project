@@ -1,4 +1,4 @@
-# core/tool.py —— 工具接口：所有工具插件都要实现这个抽象类
+# core/tool.py —— 工具接口：所有工具插件都要实现这个异步接口
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -17,4 +17,4 @@ class Tool(ABC):
     def parameters(self) -> dict[str, Any]: ...      # JSON Schema
 
     @abstractmethod
-    def execute(self, **kwargs: Any) -> Any: ...
+    async def execute(self, **kwargs: Any) -> Any: ...

@@ -29,8 +29,8 @@ class ToolRegistry:
             for t in self._tools.values()
         ]
 
-    def execute(self, name: str, arguments: dict[str, Any]) -> Any:
+    async def execute(self, name: str, arguments: dict[str, Any]) -> Any:
         tool = self._tools.get(name)
         if tool is None:
             raise KeyError(f"未注册的工具: {name}")
-        return tool.execute(**arguments)
+        return await tool.execute(**arguments)

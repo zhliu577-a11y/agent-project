@@ -1,9 +1,9 @@
-# models/openai_compat.py —— OpenAI 兼容模型适配器（DeepSeek / OpenAI / 本地 vLLM）
+# models/openai_compat.py —— OpenAI 兼容模型适配器（异步版）
 import json
 import os
 from typing import Any
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from core.model import ModelAdapter
 from core.types import Message, ModelResponse, ToolCall
@@ -33,7 +33,7 @@ def message_to_payload(msg: Message) -> dict[str, Any]:
 
 
 class OpenAICompatModel(ModelAdapter):
-    """通过 OpenAI 兼容接口调用 DeepSeek（也适用于 OpenAI、通义、本地 vLLM）。"""
+    """通过 OpenAI 兼容接口异步调用 DeepSeek（也适用于 OpenAI、通义、本地 vLLM）。"""
 
     def __init__(
         self,
@@ -45,13 +45,13 @@ class OpenAICompatModel(ModelAdapter):
         if not api_key:
             raise RuntimeError("缺少 DEEPSEEK_API_KEY，请在 .env 中配置后再运行")
 
-        self._client = OpenAI(
+        self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         )
         self._model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-    def complete(
+    async def complete(
         self,
         messages: list[Message],
         tool_schemas: list[dict[str, object]],
@@ -64,7 +64,7 @@ class OpenAICompatModel(ModelAdapter):
             payload["tools"] = tool_schemas
             payload["tool_choice"] = "auto"
 
-        resp = self._client.chat.completions.create(**payload)
+        resp = await self._client.chat.completions.create(**payload)
         choice = resp.choices[0].message
 
         tool_calls = [

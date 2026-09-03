@@ -1,0 +1,12 @@
+ core/hooks.py           |  32 [32m+++++++[m[31m-------[m
+ core/model.py           |   4 [32m+[m[31m-[m
+ core/registry.py        |   4 [32m+[m[31m-[m
+ core/tool.py            |   4 [32m+[m[31m-[m
+ debug_mcp.py            |  22 [32m++++++++++[m
+ loop.py                 |  18 [32m++++[m[31m----[m
+ main.py                 |  19 [32m++++[m[31m----[m
+ mcp_bridge.py           | 112 [32m+++++++++++++++++[m[31m-------------------------------[m
+ models/openai_compat.py |  14 [32m+++[m[31m---[m
+ requirements.txt        |   3 [32m+[m[31m-[m
+ tests/test_loop.py      |  24 [32m++++++[m[31m-----[m
+ 11 files changed, 126 insertions(+), 130 deletions(-)
