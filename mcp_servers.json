@@ -1,0 +1,14 @@
+{
+  "servers": [
+    {
+      "name": "time",
+      "command": "python",
+      "args": ["mcp_servers/time_server.py"]
+    },
+    {
+      "name": "math",
+      "command": "python",
+      "args": ["mcp_servers/math_server.py"]
+    }
+  ]
+}

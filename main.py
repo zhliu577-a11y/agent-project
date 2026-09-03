@@ -1,7 +1,9 @@
 # main.py —— 入口（全异步）：DeepSeek + MCP 工具
 import asyncio
+import json
 import logging
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -41,12 +43,19 @@ async def main() -> None:
 
     bridge = McpBridge()
     try:
-        names = await register_mcp_server(
-            tools, bridge,
-            command=sys.executable,
-            args=["mcp_servers/time_server.py"],
-        )
-        print(f"已注册 MCP 工具: {names or '（无）'}")
+        # 配置驱动：连哪些 MCP 服务器由 mcp_servers.json 决定，不改代码
+        config = json.loads(Path("mcp_servers.json").read_text(encoding="utf-8"))
+        names: list[str] = []
+        for server in config["servers"]:
+            command = server["command"]
+            if command == "python":
+                command = sys.executable  # 用当前解释器启动服务器子进程
+            names += await register_mcp_server(
+                tools, bridge,
+                command=command,
+                args=server["args"],
+            )
+        print(f"已注册 MCP 工具: {names}")
         await chat(model, tools, hooks)
     finally:
         await bridge.close()

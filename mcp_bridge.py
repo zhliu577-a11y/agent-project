@@ -1,4 +1,4 @@
-# mcp_bridge.py —— MCP 工具桥接（异步版）
+# mcp_bridge.py —— MCP 工具桥接（异步版，支持多个服务器）
 from typing import Any
 
 from mcp import ClientSession
@@ -40,38 +40,36 @@ class McpTool(Tool):
 
 
 class McpBridge:
-    """管理 MCP 会话生命周期（异步，与 asyncio.run(main()) 配合使用）。"""
+    """管理多个 MCP 服务器会话（异步）。"""
 
     def __init__(self) -> None:
-        self._stdio_cm = None
-        self._session_cm = None
-        self._session = None
+        # 每个连接保存 (session_cm, stdio_cm)，close 时逐个清理
+        self._connections: list[tuple[Any, Any]] = []
 
     async def connect_stdio(self, command: str, args: list[str]) -> list[McpTool]:
-        self._stdio_cm = stdio_client(
-            StdioServerParameters(command=command, args=args)
-        )
-        read, write = await self._stdio_cm.__aenter__()
-        self._session_cm = ClientSession(read, write)
-        self._session = await self._session_cm.__aenter__()
-        await self._session.initialize()
+        stdio_cm = stdio_client(StdioServerParameters(command=command, args=args))
+        read, write = await stdio_cm.__aenter__()
+        session_cm = ClientSession(read, write)
+        session = await session_cm.__aenter__()
+        await session.initialize()
 
-        tools = await self._session.list_tools()
+        # 记住连接，而不是覆盖：这样能同时连多个服务器
+        self._connections.append((session_cm, stdio_cm))
+
+        tools = await session.list_tools()
         return [
-            McpTool(self._session, t.name, t.description or "", t.input_schema)
+            McpTool(session, t.name, t.description or "", t.input_schema)
             for t in tools.tools
         ]
 
     async def close(self) -> None:
-        for cm in (self._session_cm, self._stdio_cm):
-            if cm is not None:
+        for session_cm, stdio_cm in reversed(self._connections):
+            for cm in (session_cm, stdio_cm):
                 try:
                     await cm.__aexit__(None, None, None)
                 except Exception:
                     pass
-        self._session_cm = None
-        self._stdio_cm = None
-        self._session = None
+        self._connections.clear()
 
 
 async def register_mcp_server(
@@ -80,7 +78,7 @@ async def register_mcp_server(
     command: str,
     args: list[str],
 ) -> list[str]:
-    """连接 MCP 服务器并把所有工具注册进注册表，返回工具名列表。"""
+    """连接一个 MCP 服务器并把所有工具注册进注册表，返回工具名列表。"""
     tools = await bridge.connect_stdio(command, args)
     for tool in tools:
         registry.register(tool)
