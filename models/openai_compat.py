@@ -1,4 +1,4 @@
-# models/openai_compat.py —— OpenAI 兼容模型适配器（异步 + 流式）
+# models/openai_compat.py —— OpenAI 兼容模型适配器（异步 + 流式 + 超时重试）
 import json
 import os
 from collections.abc import Callable
@@ -46,9 +46,15 @@ class OpenAICompatModel(ModelAdapter):
         if not api_key:
             raise RuntimeError("缺少 DEEPSEEK_API_KEY，请在 .env 中配置后再运行")
 
+        # 超时与重试：客户端内置指数退避，仅重试连接错误/429/5xx 等安全场景
+        timeout = float(os.getenv("DEEPSEEK_TIMEOUT", "60"))
+        max_retries = int(os.getenv("DEEPSEEK_MAX_RETRIES", "3"))
+
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            timeout=timeout,
+            max_retries=max_retries,
         )
         self._model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
