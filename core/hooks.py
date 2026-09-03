@@ -12,7 +12,11 @@ class LifecycleHooks:
 
     async def turn_start(self, ctx: TurnContext) -> None: ...
     async def llm_response(self, ctx: TurnContext, resp: ModelResponse) -> None: ...
-    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> None: ...
+
+    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> bool:
+        """返回 False 表示拒绝该工具调用（权限决策）。"""
+        return True
+
     async def tool_after(self, ctx: TurnContext, tool_call: ToolCall, result: Any, ok: bool) -> None: ...
     async def turn_end(self, ctx: TurnContext) -> None: ...
 
@@ -40,12 +44,17 @@ class HookManager:
             except Exception as exc:
                 logger.exception("llm_response 钩子执行失败: %s", exc)
 
-    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> None:
+    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> bool:
+        """汇总所有钩子的决策：任何一个拒绝就拒绝；钩子异常按拒绝处理（安全侧默认拒绝）。"""
         for h in self._hooks:
             try:
-                await h.tool_before(ctx, tool_call)
+                allowed = await h.tool_before(ctx, tool_call)
             except Exception as exc:
                 logger.exception("tool_before 钩子执行失败: %s", exc)
+                return False
+            if not allowed:
+                return False
+        return True
 
     async def tool_after(self, ctx: TurnContext, tool_call: ToolCall, result: Any, ok: bool) -> None:
         for h in self._hooks:

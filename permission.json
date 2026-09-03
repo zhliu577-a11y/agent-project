@@ -1,0 +1,9 @@
+{
+  "default": "allow",
+  "rules": [
+    { "tool": "shell", "mode": "deny" },
+    { "tool": "delete_file", "mode": "ask" },
+    { "tool": "write_file", "mode": "ask" },
+    { "tool": "edit_file", "mode": "ask" }
+  ]
+}

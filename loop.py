@@ -48,7 +48,16 @@ async def run_agent(
         )
 
         for tc in resp.tool_calls:
-            await hooks.tool_before(ctx, tc)
+            # 权限闸门：任一钩子拒绝则不执行工具
+            allowed = await hooks.tool_before(ctx, tc)
+            if not allowed:
+                reason = "工具调用被权限策略拒绝"
+                await hooks.tool_after(ctx, tc, reason, False)
+                ctx.messages.append(
+                    Message(role="tool", content=reason, tool_call_id=tc.id)
+                )
+                continue
+
             try:
                 result = await tools.execute(tc.name, tc.arguments)
                 ok = True

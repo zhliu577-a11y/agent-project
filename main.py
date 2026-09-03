@@ -1,4 +1,4 @@
-# main.py —— 入口（全异步）：DeepSeek + 插件目录按需加载 MCP
+# main.py —— 入口（全异步）：DeepSeek + 插件目录按需加载 MCP + 权限钩子
 import asyncio
 import logging
 import sys
@@ -10,6 +10,7 @@ from core.registry import ToolRegistry
 from loop import run_agent
 from mcp_bridge import McpBridge
 from models.openai_compat import OpenAICompatModel
+from permission import load_policy
 from plugin_loader import UseServer, load_directory
 
 logging.basicConfig(
@@ -36,7 +37,7 @@ async def chat(model, tools, hooks, system_prompt: str) -> None:
 async def main() -> None:
     load_dotenv()
 
-    # 1. 只读目录，不连接任何服务器
+    # 1. 只读插件目录，不连接任何服务器
     entries = load_directory("mcp_servers.json")
     catalog = "\n".join(f"- {e.name}: {e.description}" for e in entries)
     system_prompt = (
@@ -48,11 +49,14 @@ async def main() -> None:
 
     model = OpenAICompatModel()
     tools = ToolRegistry()
+
+    # 2. 权限钩子：按 permission.json 策略放行/询问/拦截工具调用
     hooks = HookManager()
+    hooks.add(load_policy("permission.json"))
 
     bridge = McpBridge()
     try:
-        # 2. 只注册"加载器"这一个工具，具体服务器等模型决定后再连
+        # 3. 只注册"加载器"工具，具体服务器等模型决定后再连
         tools.register(UseServer(bridge, tools, entries, python=sys.executable))
         await chat(model, tools, hooks, system_prompt)
     finally:
