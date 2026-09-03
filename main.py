@@ -17,14 +17,16 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+logger = logging.getLogger("main")
 
 
 async def chat(model, tools, hooks, system_prompt: str) -> None:
-    print("已连接 DeepSeek。输入 exit / quit / 退出 结束对话。")
+    logger.info("对话已启动，输入 exit / quit / 退出 结束。")
 
     streamed = {"active": False}
 
     def on_token(text: str) -> None:
+        # 用户可见的对话内容：保持 print（stdout），不走日志
         if not streamed["active"]:
             print("助手: ", end="", flush=True)
             streamed["active"] = True
@@ -35,6 +37,7 @@ async def chat(model, tools, hooks, system_prompt: str) -> None:
         if not user_input:
             continue
         if user_input.lower() in {"exit", "quit", "退出"}:
+            logger.info("用户退出对话")
             break
 
         streamed["active"] = False
@@ -46,7 +49,7 @@ async def chat(model, tools, hooks, system_prompt: str) -> None:
         else:
             print()  # 流式输出已结束，补一个换行
         if ctx.stop_reason != "done":
-            print(f"[提示] 本轮结束原因: {ctx.stop_reason}")
+            logger.warning("本轮结束原因: %s", ctx.stop_reason)
 
 
 async def main() -> None:
@@ -60,7 +63,7 @@ async def main() -> None:
         f"可用服务器：\n{catalog}\n"
         "需要用到某台服务器时，先调用 use_server 加载它，加载成功后再使用它提供的工具。"
     )
-    print(f"插件目录（尚未连接）: {[e.name for e in entries]}")
+    logger.info("插件目录（尚未连接）: %s", [e.name for e in entries])
 
     model = OpenAICompatModel()
     tools = ToolRegistry()

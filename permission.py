@@ -1,11 +1,14 @@
 # permission.py —— 工具权限策略（配置驱动）
 import fnmatch
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 from core.hooks import LifecycleHooks
 from core.types import ToolCall, TurnContext
+
+logger = logging.getLogger(__name__)
 
 _VALID_MODES = {"allow", "ask", "deny"}
 
@@ -39,9 +42,10 @@ class PermissionHooks(LifecycleHooks):
         if mode == "allow":
             return True
         if mode == "deny":
-            print(f"[权限] 已拦截工具调用: {tool_call.name}（策略拒绝）")
+            logger.warning("已拦截工具调用: %s（策略拒绝）", tool_call.name)
             return False
-        # mode == "ask"：在终端询问用户
+        # mode == "ask"：交互提示必须走 input（不能进日志，用户要看得见并回答）
+        logger.info("请求用户确认工具调用: %s", tool_call.name)
         answer = (
             input(f"[权限] 是否允许调用 {tool_call.name}(参数: {tool_call.arguments})? [y/N]: ")
             .strip()
