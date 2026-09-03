@@ -29,6 +29,17 @@ class ToolRegistry:
             for t in self._tools.values()
         ]
 
+    def describe(self, name: str) -> dict[str, Any] | None:
+        """返回某个工具的元信息（name/description/parameters），供错误提示使用。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        return {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }
+
     async def execute(self, name: str, arguments: dict[str, Any]) -> Any:
         tool = self._tools.get(name)
         if tool is None:

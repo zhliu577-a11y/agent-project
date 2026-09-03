@@ -1,4 +1,4 @@
-# permission.py —— 工具权限策略（配置驱动）
+# permission.py —— 工具权限策略（配置驱动，带 schema 校验）
 import fnmatch
 import json
 import logging
@@ -55,7 +55,32 @@ class PermissionHooks(LifecycleHooks):
 
 
 def load_policy(path: str | Path = "permission.json") -> PermissionHooks:
-    """从 JSON 读取权限策略。"""
+    """读取并校验权限策略 JSON。"""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    rules = [Rule(rule["tool"], rule["mode"]) for rule in raw.get("rules", [])]
-    return PermissionHooks(rules, default=raw.get("default", "allow"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: 顶层必须是 JSON 对象")
+
+    default = raw.get("default", "allow")
+    if default not in _VALID_MODES:
+        raise ValueError(f"{path}: 非法的 default '{default}'，可选: {sorted(_VALID_MODES)}")
+
+    rules_raw = raw.get("rules", [])
+    if not isinstance(rules_raw, list):
+        raise ValueError(f"{path}: 'rules' 必须是数组")
+
+    rules: list[Rule] = []
+    for i, rule in enumerate(rules_raw, start=1):
+        where = f"{path}: 第 {i} 条规则"
+        if not isinstance(rule, dict):
+            raise ValueError(f"{where} 必须是对象")
+        tool = rule.get("tool")
+        mode = rule.get("mode")
+        if not isinstance(tool, str) or not tool.strip():
+            raise ValueError(f"{where} 缺少非空 'tool'")
+        if mode not in _VALID_MODES:
+            raise ValueError(
+                f"{where} ('{tool}'): 非法的 mode '{mode}'，可选: {sorted(_VALID_MODES)}"
+            )
+        rules.append(Rule(tool, mode))
+
+    return PermissionHooks(rules, default=default)

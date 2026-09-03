@@ -1,4 +1,4 @@
-# plugin_loader.py —— 插件目录解析 + 按需连接工具
+# plugin_loader.py —— 插件目录解析（带 schema 校验）+ 按需连接工具
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,20 +19,49 @@ class PluginEntry:
     args: list[str]
 
 
+def _expect(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
 def load_directory(path: str | Path) -> list[PluginEntry]:
-    """读取插件目录，返回 enabled 的条目。零副作用：不连接任何服务器。"""
+    """读取并校验插件目录，返回 enabled 的条目。零副作用：不连接任何服务器。"""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    _expect(isinstance(raw, dict), f"{path}: 顶层必须是 JSON 对象")
+
+    plugins = raw.get("plugins", [])
+    _expect(isinstance(plugins, list), f"{path}: 'plugins' 必须是数组")
+
     entries: list[PluginEntry] = []
-    for plugin in raw.get("plugins", []):
+    for i, plugin in enumerate(plugins, start=1):
+        where = f"{path}: 第 {i} 个插件"
+        _expect(isinstance(plugin, dict), f"{where} 必须是对象")
+
+        name = plugin.get("name")
+        _expect(isinstance(name, str) and name.strip(), f"{where} 缺少非空 'name'")
+
+        mcp = plugin.get("mcp")
+        _expect(isinstance(mcp, dict), f"{where} ('{name}') 缺少 'mcp' 对象")
+        command = mcp.get("command")
+        args = mcp.get("args", [])
+        _expect(
+            isinstance(command, str) and command.strip(),
+            f"{where} ('{name}') 的 mcp.command 必须是非空字符串",
+        )
+        _expect(
+            isinstance(args, list) and all(isinstance(a, str) for a in args),
+            f"{where} ('{name}') 的 mcp.args 必须是字符串数组",
+        )
+
         if not plugin.get("enabled", True):
-            continue
-        mcp = plugin.get("mcp", {})
+            continue  # 结构已校验；未启用的不加载
+
         entries.append(
             PluginEntry(
-                name=plugin["name"],
+                name=name,
                 description=plugin.get("description", ""),
-                command=mcp.get("command", "python"),
-                args=mcp.get("args", []),
+                command=command,
+                args=args,
             )
         )
     return entries

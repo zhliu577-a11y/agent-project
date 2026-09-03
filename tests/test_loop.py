@@ -139,3 +139,39 @@ async def test_loop_executes_multiple_tools_in_parallel() -> None:
     # 并行时第二个工具会在第一个结束前启动；串行时不可能
     assert starts[1] < ends[0]
     assert ctx.stop_reason == "done"
+
+
+class AlwaysFail(Tool):
+    """每次执行都抛错的工具：用于验证失败计数与自动禁用。"""
+
+    name = "fail_tool"
+    description = "总是失败的工具"
+    parameters = {"type": "object", "properties": {"x": {"type": "string"}}}
+
+    def __init__(self, counter: dict) -> None:
+        self._counter = counter
+
+    async def execute(self, **kwargs):
+        self._counter["n"] += 1
+        raise ValueError("参数 x 格式不正确")
+
+
+async def test_loop_disables_tool_after_consecutive_failures() -> None:
+    counter = {"n": 0}
+    tool_call = lambda i: ModelResponse(  # noqa: E731
+        content="",
+        tool_calls=[ToolCall(id=str(i), name="fail_tool", arguments={"x": "bad"})],
+    )
+    script = [tool_call(1), tool_call(2), tool_call(3), tool_call(4)]
+    script.append(ModelResponse(content="我换一种方法", tool_calls=[]))
+
+    model = FakeModel(script)
+    tools = ToolRegistry()
+    tools.register(AlwaysFail(counter))
+
+    ctx = await run_agent(model, tools, HookManager(), "你是助手", "试试失败工具")
+
+    assert counter["n"] == 3  # 第 4 次调用被禁用，未真正执行
+    assert any("已连续失败" in m.content for m in ctx.messages)
+    assert "fail_tool" in ctx.state["blocked_tools"]
+    assert ctx.stop_reason == "done"
