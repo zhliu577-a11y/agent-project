@@ -1,4 +1,6 @@
 # tests/test_loop.py —— loop 的单元测试（异步）
+import asyncio
+
 import pytest
 
 from core.hooks import HookManager
@@ -86,4 +88,54 @@ async def test_loop_streams_final_answer_tokens() -> None:
         on_token=received.append,
     )
     assert received == ["你好世界"]
+    assert ctx.stop_reason == "done"
+
+
+class PauseTool(Tool):
+    """带停顿的工具：用于验证多个工具是否真的并行执行。"""
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+
+    @property
+    def name(self) -> str:
+        return f"pause_{self._label}"
+
+    description = "停顿 0.1 秒后返回"
+    parameters = {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs):
+        order.append(f"start-{self._label}")
+        await asyncio.sleep(0.1)
+        order.append(f"end-{self._label}")
+        return f"done-{self._label}"
+
+
+order: list[str] = []
+
+
+async def test_loop_executes_multiple_tools_in_parallel() -> None:
+    order.clear()
+    model = FakeModel(
+        [
+            ModelResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id="1", name="pause_a", arguments={}),
+                    ToolCall(id="2", name="pause_b", arguments={}),
+                ],
+            ),
+            ModelResponse(content="完成", tool_calls=[]),
+        ]
+    )
+    tools = ToolRegistry()
+    tools.register(PauseTool("a"))
+    tools.register(PauseTool("b"))
+
+    ctx = await run_agent(model, tools, HookManager(), "你是助手", "并行执行")
+
+    starts = [i for i, s in enumerate(order) if s.startswith("start")]
+    ends = [i for i, s in enumerate(order) if s.startswith("end")]
+    # 并行时第二个工具会在第一个结束前启动；串行时不可能
+    assert starts[1] < ends[0]
     assert ctx.stop_reason == "done"
