@@ -38,9 +38,7 @@ async def chat(model, tools, hooks, system_prompt: str) -> None:
             break
 
         streamed["active"] = False
-        ctx = await run_agent(
-            model, tools, hooks, system_prompt, user_input, on_token=on_token
-        )
+        ctx = await run_agent(model, tools, hooks, system_prompt, user_input, on_token=on_token)
 
         if not streamed["active"]:
             # 没有流式输出（例如被拒绝或出错），整段补打

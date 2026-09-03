@@ -7,7 +7,7 @@ from typing import Any
 
 @dataclass
 class Message:
-    role: str                    # "system" | "user" | "assistant" | "tool"
+    role: str  # "system" | "user" | "assistant" | "tool"
     content: str
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str = ""

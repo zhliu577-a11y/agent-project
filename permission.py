@@ -12,8 +12,8 @@ _VALID_MODES = {"allow", "ask", "deny"}
 
 @dataclass
 class Rule:
-    pattern: str   # 支持通配符，如 "delete_*"
-    mode: str      # allow | ask | deny
+    pattern: str  # 支持通配符，如 "delete_*"
+    mode: str  # allow | ask | deny
 
 
 class PermissionHooks(LifecycleHooks):
@@ -43,10 +43,7 @@ class PermissionHooks(LifecycleHooks):
             return False
         # mode == "ask"：在终端询问用户
         answer = (
-            input(
-                f"[权限] 是否允许调用 {tool_call.name}"
-                f"(参数: {tool_call.arguments})? [y/N]: "
-            )
+            input(f"[权限] 是否允许调用 {tool_call.name}(参数: {tool_call.arguments})? [y/N]: ")
             .strip()
             .lower()
         )

@@ -14,7 +14,7 @@ class Tool(ABC):
 
     @property
     @abstractmethod
-    def parameters(self) -> dict[str, Any]: ...      # JSON Schema
+    def parameters(self) -> dict[str, Any]: ...  # JSON Schema
 
     @abstractmethod
     async def execute(self, **kwargs: Any) -> Any: ...

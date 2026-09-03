@@ -62,9 +62,7 @@ async def run_agent(
             if not allowed:
                 reason = "工具调用被权限策略拒绝"
                 await hooks.tool_after(ctx, tc, reason, False)
-                ctx.messages.append(
-                    Message(role="tool", content=reason, tool_call_id=tc.id)
-                )
+                ctx.messages.append(Message(role="tool", content=reason, tool_call_id=tc.id))
                 continue
             approved.append(tc)
 
@@ -83,9 +81,7 @@ async def run_agent(
         # 3) 按原顺序回填结果
         for tc, result, ok in results:
             await hooks.tool_after(ctx, tc, result, ok)
-            ctx.messages.append(
-                Message(role="tool", content=str(result), tool_call_id=tc.id)
-            )
+            ctx.messages.append(Message(role="tool", content=str(result), tool_call_id=tc.id))
 
         ctx.turn += 1
         await hooks.turn_end(ctx)

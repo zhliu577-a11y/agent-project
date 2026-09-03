@@ -5,7 +5,7 @@ from core.hooks import HookManager, LifecycleHooks
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
 from core.tool import Tool
-from core.types import Message, ModelResponse, ToolCall
+from core.types import ModelResponse, ToolCall
 from loop import run_agent
 from permission import PermissionHooks, Rule
 
@@ -15,18 +15,14 @@ pytestmark = pytest.mark.asyncio
 async def test_deny_rule_blocks_tool() -> None:
     hooks = HookManager()
     hooks.add(PermissionHooks([Rule("delete_file", "deny")]))
-    allowed = await hooks.tool_before(
-        None, ToolCall(id="1", name="delete_file", arguments={})
-    )
+    allowed = await hooks.tool_before(None, ToolCall(id="1", name="delete_file", arguments={}))
     assert allowed is False
 
 
 async def test_unmatched_tool_allowed_by_default() -> None:
     hooks = HookManager()
     hooks.add(PermissionHooks([Rule("delete_file", "deny")]))
-    allowed = await hooks.tool_before(
-        None, ToolCall(id="1", name="get_time", arguments={})
-    )
+    allowed = await hooks.tool_before(None, ToolCall(id="1", name="get_time", arguments={}))
     assert allowed is True
 
 
@@ -74,6 +70,6 @@ async def test_loop_does_not_execute_denied_tool() -> None:
 
     ctx = await run_agent(model, tools, hooks, "你是助手", "现在几点")
 
-    assert counter["n"] == 0                      # 工具从未执行
+    assert counter["n"] == 0  # 工具从未执行
     assert any("拒绝" in m.content for m in ctx.messages)  # 模型看到拒绝原因
     assert ctx.stop_reason == "done"

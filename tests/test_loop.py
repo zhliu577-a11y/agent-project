@@ -7,7 +7,7 @@ from core.hooks import HookManager
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
 from core.tool import Tool
-from core.types import Message, ModelResponse, ToolCall
+from core.types import ModelResponse, ToolCall
 from loop import run_agent
 
 pytestmark = pytest.mark.asyncio

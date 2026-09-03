@@ -57,10 +57,7 @@ class McpBridge:
         self._connections.append((session_cm, stdio_cm))
 
         tools = await session.list_tools()
-        return [
-            McpTool(session, t.name, t.description or "", t.input_schema)
-            for t in tools.tools
-        ]
+        return [McpTool(session, t.name, t.description or "", t.input_schema) for t in tools.tools]
 
     async def close(self) -> None:
         for session_cm, stdio_cm in reversed(self._connections):

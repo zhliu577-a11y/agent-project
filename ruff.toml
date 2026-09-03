@@ -1,0 +1,10 @@
+# ruff.toml —— Python 代码规范配置（lint + format）
+line-length = 100
+target-version = "py313"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = []
+
+[lint.isort]
+known-first-party = ["core", "models", "loop", "main", "mcp_bridge", "permission", "plugin_loader"]
