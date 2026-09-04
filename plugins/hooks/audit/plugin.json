@@ -1,0 +1,11 @@
+{
+  "name": "audit",
+  "type": "hook",
+  "version": "1.0.0",
+  "description": "示例钩子：把模型回复与每次工具调用（含结果）记录到本插件目录的 audit.log",
+  "enabled": true,
+  "entry": {
+    "module": "hook.py",
+    "factory": "create_hook"
+  }
+}
