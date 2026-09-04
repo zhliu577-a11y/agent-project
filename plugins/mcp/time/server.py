@@ -1,4 +1,4 @@
-# mcp_servers/time_server.py —— 示例 MCP 服务器：提供一个"当前时间"工具
+# plugins/mcp/time/server.py —— 示例 MCP 插件服务器：提供一个"当前时间"工具
 from datetime import datetime
 from zoneinfo import ZoneInfo
 

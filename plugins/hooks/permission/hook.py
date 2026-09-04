@@ -1,4 +1,8 @@
-# permission.py —— 工具权限策略（配置驱动，带 schema 校验）
+# plugins/hooks/permission/hook.py —— 示例钩子插件：工具权限策略
+#
+# 一个钩子插件 = 实现 LifecycleHooks 的类 + 一个工厂函数。
+# 工厂接收插件目录（Path），返回钩子实例；清单里声明：
+#   "entry": { "module": "hook.py", "factory": "create_hook" }
 import fnmatch
 import json
 import logging
@@ -15,7 +19,7 @@ _VALID_MODES = {"allow", "ask", "deny"}
 
 @dataclass
 class Rule:
-    pattern: str  # 支持通配符，如 "delete_*"
+    pattern: str  # 支持通配符，如 "filesystem__*"
     mode: str  # allow | ask | deny
 
 
@@ -54,9 +58,10 @@ class PermissionHooks(LifecycleHooks):
         return answer in {"y", "yes"}
 
 
-def load_policy(path: str | Path = "permission.json") -> PermissionHooks:
+def load_policy(path: str | Path) -> PermissionHooks:
     """读取并校验权限策略 JSON。"""
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    path = Path(path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: 顶层必须是 JSON 对象")
 
@@ -84,3 +89,8 @@ def load_policy(path: str | Path = "permission.json") -> PermissionHooks:
         rules.append(Rule(tool, mode))
 
     return PermissionHooks(rules, default=default)
+
+
+def create_hook(plugin_dir: Path) -> PermissionHooks:
+    """插件工厂：加载本插件目录下的 permission.json 并返回策略实例。"""
+    return load_policy(plugin_dir / "permission.json")

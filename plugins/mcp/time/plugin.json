@@ -1,0 +1,11 @@
+{
+  "name": "time",
+  "type": "mcp",
+  "version": "1.0.0",
+  "description": "查询指定时区的当前时间",
+  "enabled": true,
+  "entry": {
+    "command": "python",
+    "args": ["server.py"]
+  }
+}

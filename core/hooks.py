@@ -1,4 +1,4 @@
-# core/hooks.py —— 生命周期钩子（类型化事件，异步）
+# core/hooks.py —— 钩子网关：所有钩子插件的统一入口（类型化事件，异步）
 import logging
 from typing import Any
 
@@ -8,7 +8,10 @@ logger = logging.getLogger(__name__)
 
 
 class LifecycleHooks:
-    """插件继承此类，覆写需要关心的方法。不覆写的自动忽略。"""
+    """钩子插件基类：覆写需要关心的方法，不覆写的自动忽略。
+
+    钩子插件放在 plugins/hooks/<name>/ 下，由插件加载器实例化后加入 HookGateway。
+    """
 
     async def turn_start(self, ctx: TurnContext) -> None: ...
     async def llm_response(self, ctx: TurnContext, resp: ModelResponse) -> None: ...
@@ -23,14 +26,22 @@ class LifecycleHooks:
     async def turn_end(self, ctx: TurnContext) -> None: ...
 
 
-class HookManager:
-    """管理多个钩子插件，按注册顺序逐个调用，并隔离异常。"""
+class HookGateway:
+    """钩子网关：聚合所有钩子插件，内核只面向这一个网关。
+
+    与 MCP 网关对应：内核把 turn/llm/tool 等生命周期事件交给本网关，
+    由网关按注册顺序扇出给每个钩子插件，并负责异常隔离与决策汇总。
+    """
 
     def __init__(self) -> None:
         self._hooks: list[LifecycleHooks] = []
 
     def add(self, hook: LifecycleHooks) -> None:
         self._hooks.append(hook)
+
+    @property
+    def count(self) -> int:
+        return len(self._hooks)
 
     async def turn_start(self, ctx: TurnContext) -> None:
         for h in self._hooks:

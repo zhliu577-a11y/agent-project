@@ -3,7 +3,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
-from core.hooks import HookManager
+from core.hooks import HookGateway
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
 from core.types import Message, ModelResponse, ToolCall, TurnContext
@@ -17,7 +17,7 @@ FAIL_LIMIT = 3
 async def run_agent(
     model: ModelAdapter,
     tools: ToolRegistry,
-    hooks: HookManager,
+    hooks: HookGateway,
     system_prompt: str,
     user_input: str,
     max_turns: int = 20,

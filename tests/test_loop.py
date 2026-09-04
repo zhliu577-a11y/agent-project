@@ -3,7 +3,7 @@ import asyncio
 
 import pytest
 
-from core.hooks import HookManager
+from core.hooks import HookGateway
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
 from core.tool import Tool
@@ -37,7 +37,7 @@ class GetTime(Tool):
 
 async def test_loop_ends_when_model_does_not_call_tools() -> None:
     model = FakeModel([ModelResponse(content="你好", tool_calls=[])])
-    ctx = await run_agent(model, ToolRegistry(), HookManager(), "你是助手", "你好")
+    ctx = await run_agent(model, ToolRegistry(), HookGateway(), "你是助手", "你好")
     assert ctx.stop_reason == "done"
     assert ctx.messages[-1].content == "你好"
 
@@ -54,7 +54,7 @@ async def test_loop_executes_tool_then_returns_final_answer() -> None:
     )
     tools = ToolRegistry()
     tools.register(GetTime())
-    ctx = await run_agent(model, tools, HookManager(), "你是助手", "现在几点")
+    ctx = await run_agent(model, tools, HookGateway(), "你是助手", "现在几点")
     assert ctx.stop_reason == "done"
     assert any(m.role == "tool" for m in ctx.messages)
     assert ctx.messages[-1].content == "现在是12点"
@@ -71,7 +71,7 @@ async def test_loop_stops_at_max_turns() -> None:
     model = FakeModel(script)
     tools = ToolRegistry()
     tools.register(GetTime())
-    ctx = await run_agent(model, tools, HookManager(), "你是助手", "一直调用", max_turns=3)
+    ctx = await run_agent(model, tools, HookGateway(), "你是助手", "一直调用", max_turns=3)
     assert ctx.stop_reason == "max_turns"
     assert ctx.turn == 3
 
@@ -82,7 +82,7 @@ async def test_loop_streams_final_answer_tokens() -> None:
     ctx = await run_agent(
         model,
         ToolRegistry(),
-        HookManager(),
+        HookGateway(),
         "你是助手",
         "你好",
         on_token=received.append,
@@ -132,7 +132,7 @@ async def test_loop_executes_multiple_tools_in_parallel() -> None:
     tools.register(PauseTool("a"))
     tools.register(PauseTool("b"))
 
-    ctx = await run_agent(model, tools, HookManager(), "你是助手", "并行执行")
+    ctx = await run_agent(model, tools, HookGateway(), "你是助手", "并行执行")
 
     starts = [i for i, s in enumerate(order) if s.startswith("start")]
     ends = [i for i, s in enumerate(order) if s.startswith("end")]
@@ -169,7 +169,7 @@ async def test_loop_disables_tool_after_consecutive_failures() -> None:
     tools = ToolRegistry()
     tools.register(AlwaysFail(counter))
 
-    ctx = await run_agent(model, tools, HookManager(), "你是助手", "试试失败工具")
+    ctx = await run_agent(model, tools, HookGateway(), "你是助手", "试试失败工具")
 
     assert counter["n"] == 3  # 第 4 次调用被禁用，未真正执行
     assert any("已连续失败" in m.content for m in ctx.messages)

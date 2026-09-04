@@ -1,0 +1,11 @@
+{
+  "name": "math",
+  "type": "mcp",
+  "version": "1.0.0",
+  "description": "安全计算数学表达式",
+  "enabled": true,
+  "entry": {
+    "command": "python",
+    "args": ["server.py"]
+  }
+}

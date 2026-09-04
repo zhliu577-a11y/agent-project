@@ -1,29 +1,47 @@
-# tests/test_permission.py —— 权限策略测试
+# tests/test_permission.py —— permission 钩子插件测试（不联网）
+from pathlib import Path
+
 import pytest
 
-from core.hooks import HookManager, LifecycleHooks
+from core.hooks import HookGateway, LifecycleHooks
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
 from core.tool import Tool
 from core.types import ModelResponse, ToolCall
 from loop import run_agent
-from permission import PermissionHooks, Rule
+from plugins.hooks.permission.hook import PermissionHooks, Rule
+from plugins.loader import load_hook_plugins
 
 pytestmark = pytest.mark.asyncio
 
 
 async def test_deny_rule_blocks_tool() -> None:
-    hooks = HookManager()
-    hooks.add(PermissionHooks([Rule("delete_file", "deny")]))
-    allowed = await hooks.tool_before(None, ToolCall(id="1", name="delete_file", arguments={}))
+    hooks = HookGateway()
+    hooks.add(PermissionHooks([Rule("filesystem__delete_file", "deny")]))
+    allowed = await hooks.tool_before(
+        None, ToolCall(id="1", name="filesystem__delete_file", arguments={})
+    )
     assert allowed is False
 
 
 async def test_unmatched_tool_allowed_by_default() -> None:
-    hooks = HookManager()
-    hooks.add(PermissionHooks([Rule("delete_file", "deny")]))
-    allowed = await hooks.tool_before(None, ToolCall(id="1", name="get_time", arguments={}))
+    hooks = HookGateway()
+    hooks.add(PermissionHooks([Rule("filesystem__delete_file", "deny")]))
+    allowed = await hooks.tool_before(None, ToolCall(id="1", name="math__calculate", arguments={}))
     assert allowed is True
+
+
+async def test_repo_permission_plugin_is_loaded_via_loader() -> None:
+    """仓库自带的 permission 插件应能通过插件目录加载并拦截危险工具。"""
+    root = Path(__file__).resolve().parents[1] / "plugins"
+    loaded = [(m, hook) for m, hook in load_hook_plugins(root) if m.name == "permission"]
+    assert loaded, "plugins/hooks/permission 应当被加载"
+    # loader 动态导入会产生独立的类对象，因此用类名而非 isinstance 判断
+    policy = next(hook for _, hook in loaded if type(hook).__name__ == "PermissionHooks")
+    allowed = await policy.tool_before(
+        None, ToolCall(id="1", name="filesystem__delete_file", arguments={})
+    )
+    assert allowed is False
 
 
 class FakeModel(ModelAdapter):
@@ -65,7 +83,7 @@ async def test_loop_does_not_execute_denied_tool() -> None:
     )
     tools = ToolRegistry()
     tools.register(CountingTime(counter))
-    hooks = HookManager()
+    hooks = HookGateway()
     hooks.add(DenyAll())
 
     ctx = await run_agent(model, tools, hooks, "你是助手", "现在几点")

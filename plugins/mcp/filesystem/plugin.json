@@ -1,0 +1,17 @@
+{
+  "name": "filesystem",
+  "type": "mcp",
+  "version": "1.0.0",
+  "description": "读写本地文件（含写入、编辑、移动等危险操作，由 permission 钩子插件拦截确认）",
+  "enabled": true,
+  "entry": {
+    "command": "cmd.exe",
+    "args": [
+      "/c",
+      "npx",
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "E:/documents/learning/Agent/demo_files"
+    ]
+  }
+}

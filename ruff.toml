@@ -7,4 +7,4 @@ select = ["E", "F", "W", "I", "UP", "B"]
 ignore = []
 
 [lint.isort]
-known-first-party = ["core", "models", "loop", "main", "mcp_bridge", "permission", "plugin_loader"]
+known-first-party = ["core", "gateways", "loop", "main", "models", "plugins"]

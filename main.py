@@ -1,17 +1,22 @@
-# main.py —— 入口（全异步）：DeepSeek + 插件目录按需加载 MCP + 权限钩子 + 流式输出
+# main.py —— Harness 启动器：发现插件 → 装配网关 → 进入固定 agent loop（全异步）
+#
+# 启动流程：
+#   1. 扫描 plugins/ 目录，加载全部钩子插件（hooks/*）与 MCP 插件清单（mcp/*）；
+#   2. 把所有钩子插件装进 HookGateway（钩子网关）；
+#   3. 创建 McpGateway（MCP 网关：内核与 MCP 世界之间的唯一通道）；
+#   4. 注册 use_plugin 挂载工具，进入固定 loop；模型按需让网关挂载插件。
 import asyncio
 import logging
-import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-from core.hooks import HookManager
+from core.hooks import HookGateway
 from core.registry import ToolRegistry
+from gateways.mcp_gateway import McpGateway, UsePlugin
 from loop import run_agent
-from mcp_bridge import McpBridge
 from models.openai_compat import OpenAICompatModel
-from permission import load_policy
-from plugin_loader import UseServer, load_directory
+from plugins.loader import load_hook_plugins, load_mcp_plugins
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,35 +59,45 @@ async def chat(model, tools, hooks, system_prompt: str) -> None:
 
 async def main() -> None:
     load_dotenv()
+    plugins_dir = Path(__file__).resolve().parent / "plugins"
 
-    # 0. 加载并校验配置：写错字段立刻报错退出，而不是静默出错
+    # 0. 装配插件：写错清单/入口立刻报错退出，而不是静默出错
     try:
-        entries = load_directory("mcp_servers.json")
-        hooks = HookManager()
-        hooks.add(load_policy("permission.json"))
-    except (ValueError, OSError) as exc:
-        logger.error("配置加载失败: %s", exc)
+        hook_plugins = load_hook_plugins(plugins_dir)
+        mcp_specs = load_mcp_plugins(plugins_dir)
+    except ValueError as exc:
+        logger.error("插件装配失败: %s", exc)
         return
 
-    # 1. 只读插件目录，不连接任何服务器
-    catalog = "\n".join(f"- {e.name}: {e.description}" for e in entries)
-    system_prompt = (
-        "你是一个乐于助人的助手。你可以通过调用 use_server 按需加载工具服务器。\n"
-        f"可用服务器：\n{catalog}\n"
-        "需要用到某台服务器时，先调用 use_server 加载它，加载成功后再使用它提供的工具。"
+    # 1. 钩子网关：内核只面向它，具体钩子全部来自插件目录
+    hooks = HookGateway()
+    for manifest, hook in hook_plugins:
+        hooks.add(hook)
+        logger.info("钩子网关已接入插件: %s", manifest.name)
+
+    # 2. 只读 MCP 插件目录，尚未连接任何服务器；模型需要时通过网关挂载
+    catalog = "\n".join(
+        f"- {spec.manifest.name}: {spec.manifest.description}" for spec in mcp_specs
     )
-    logger.info("插件目录（尚未连接）: %s", [e.name for e in entries])
+    system_prompt = (
+        "你是一个乐于助人的助手。你的工具由 MCP 插件网关统一提供，"
+        "工具名格式为 <插件名>__<工具名>。\n"
+        "需要用到某个 MCP 插件时，先调用 use_plugin 挂载它，挂载成功后再使用其工具。\n"
+        f"可挂载插件：\n{catalog}"
+    )
+    logger.info("MCP 插件目录（尚未连接）: %s", [spec.manifest.name for spec in mcp_specs])
 
     model = OpenAICompatModel()
     tools = ToolRegistry()
 
-    bridge = McpBridge()
+    # 3. MCP 网关：整个应用生命周期里，只有它持有 MCP 连接
+    gateway = McpGateway(mcp_specs)
     try:
-        # 2. 只注册"加载器"工具，具体服务器等模型决定后再连
-        tools.register(UseServer(bridge, tools, entries, python=sys.executable))
+        # 4. 只注册"挂载器"工具，具体插件等模型决定后再由网关连接
+        tools.register(UsePlugin(gateway, tools))
         await chat(model, tools, hooks, system_prompt)
     finally:
-        await bridge.close()
+        await gateway.close()
 
 
 if __name__ == "__main__":

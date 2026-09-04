@@ -1,4 +1,4 @@
-# mcp_servers/math_server.py —— 示例 MCP 服务器：安全计算器（不使用 eval）
+# plugins/mcp/math/server.py —— 示例 MCP 插件服务器：安全计算器（不使用 eval）
 import ast
 import operator
 from typing import Any

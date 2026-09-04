@@ -1,0 +1,10 @@
+{
+  "default": "allow",
+  "rules": [
+    { "tool": "filesystem__delete_file", "mode": "deny" },
+    { "tool": "filesystem__move_file", "mode": "ask" },
+    { "tool": "filesystem__edit_file", "mode": "ask" },
+    { "tool": "filesystem__write_file", "mode": "ask" },
+    { "tool": "*__shell", "mode": "deny" }
+  ]
+}
