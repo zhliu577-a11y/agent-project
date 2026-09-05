@@ -3,7 +3,7 @@
 # 每个插件是一个自包含的目录，目录内必须有 plugin.json 清单：
 # {
 #   "name": "time",            # 唯一名（字母/数字/下划线/连字符）
-#   "type": "mcp",             # 插件类别：mcp | hook | tool | model
+#   "type": "mcp",             # 插件类别：mcp | hook | tool | model | skill
 #   "version": "1.0.0",        # 可选
 #   "description": "…",        # 可选
 #   "enabled": true,           # 可选，默认 true
@@ -29,6 +29,12 @@
 #   - 只校验并持有 factory，不在装配时调用（实例化有环境变量副作用，
 #     由 Harness 选定激活插件后惰性创建）。
 #
+# 技能插件 entry（type: "skill"，纯内容，不执行代码）：
+#   { "content": "SKILL.md", "preload": false }
+#   - content 为正文文件（相对插件目录，默认 SKILL.md），装配时校验存在；
+#   - preload=false（默认）表示正文只在模型调用 use_skill 时读取（渐进披露）；
+#     preload=true 表示启动时把正文注入系统提示词（仅限全局规则，尽量少用）。
+#
 # 可选字段 priority（整数，默认 0）：钩子插件的执行顺序，越小越先执行；
 # 相同 priority 时按插件名排序，保证跨启动稳定。
 #
@@ -52,7 +58,7 @@ from core.tool import Tool
 logger = logging.getLogger(__name__)
 
 DEFAULT_PLUGINS_DIR = Path(__file__).resolve().parent
-SUPPORTED_KINDS = ("mcp", "hook", "tool", "model")
+SUPPORTED_KINDS = ("mcp", "hook", "tool", "model", "skill")
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -123,6 +129,15 @@ class ModelPlugin:
             f"模型工厂必须返回 ModelAdapter 实例，实际是 {type(model).__name__}",
         )
         return model
+
+
+@dataclass(frozen=True)
+class SkillPlugin:
+    """技能插件：纯内容目录（不执行代码），正文文件由网关惰性读取。"""
+
+    manifest: PluginManifest
+    content_path: Path
+    preload: bool
 
 
 def _expect(condition: bool, where: str, message: str) -> None:
@@ -340,6 +355,24 @@ def load_model_plugin(manifest: PluginManifest) -> ModelPlugin:
     return ModelPlugin(manifest=manifest, factory=factory)
 
 
+def load_skill_plugin(manifest: PluginManifest) -> SkillPlugin:
+    """校验单个技能插件：只检查清单与正文文件存在，不读取、不执行。"""
+    where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
+    entry = manifest.entry
+    content_rel = entry.get("content", "SKILL.md")
+    _expect(
+        isinstance(content_rel, str) and content_rel.strip(),
+        where,
+        "skill 插件必须在 entry 里声明非空 'content'",
+    )
+    preload = entry.get("preload", False)
+    _expect(isinstance(preload, bool), where, "'preload' 必须是布尔值")
+
+    content_path = manifest.directory / content_rel
+    _expect(content_path.is_file(), where, f"正文文件不存在: {content_path}")
+    return SkillPlugin(manifest=manifest, content_path=content_path, preload=preload)
+
+
 def _resolve_arg(plugin_dir: Path, arg: str) -> str:
     """插件目录下真实存在的相对路径参数 -> 绝对路径；其余参数原样保留。"""
     path = Path(arg)
@@ -400,6 +433,17 @@ def load_model_plugins(root: str | Path | None = None) -> list[ModelPlugin]:
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
+def load_skill_plugins(root: str | Path | None = None) -> list[SkillPlugin]:
+    """加载插件目录里全部启用的技能插件（零副作用：不读正文、不执行）。"""
+    plugins: list[SkillPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "skill":
+            continue
+        plugins.append(load_skill_plugin(manifest))
+        logger.info("技能插件已发现: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
 # ---------- kind 注册表与统一装配 ----------
 
 
@@ -411,6 +455,7 @@ class PluginAssembly:
     mcp: list[McpPluginSpec] = field(default_factory=list)
     tools: list[tuple[PluginManifest, list[Tool]]] = field(default_factory=list)
     models: list[ModelPlugin] = field(default_factory=list)
+    skills: list[SkillPlugin] = field(default_factory=list)
 
 
 def _add_hook(manifest: PluginManifest, assembly: PluginAssembly) -> None:
@@ -429,6 +474,10 @@ def _add_model(manifest: PluginManifest, assembly: PluginAssembly) -> None:
     assembly.models.append(load_model_plugin(manifest))
 
 
+def _add_skill(manifest: PluginManifest, assembly: PluginAssembly) -> None:
+    assembly.skills.append(load_skill_plugin(manifest))
+
+
 # kind 注册表：新增插件类别 = SUPPORTED_KINDS 登记 type + 这里注册一个处理器，
 # 处理器把单个清单的产物放进 PluginAssembly 的对应字段。
 _KIND_HANDLERS: dict[str, Callable[[PluginManifest, PluginAssembly], None]] = {
@@ -436,6 +485,7 @@ _KIND_HANDLERS: dict[str, Callable[[PluginManifest, PluginAssembly], None]] = {
     "mcp": _add_mcp,
     "tool": _add_tool,
     "model": _add_model,
+    "skill": _add_skill,
 }
 
 

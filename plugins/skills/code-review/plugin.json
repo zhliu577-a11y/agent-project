@@ -1,0 +1,11 @@
+{
+  "name": "code-review",
+  "type": "skill",
+  "version": "1.0.0",
+  "description": "代码评审规范与检查清单（改代码前按此自检）",
+  "enabled": true,
+  "entry": {
+    "content": "SKILL.md",
+    "preload": false
+  }
+}

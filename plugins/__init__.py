@@ -14,6 +14,7 @@ from plugins.loader import (
     NamespacedTool,
     PluginAssembly,
     PluginManifest,
+    SkillPlugin,
     assemble_plugins,
     discover_plugins,
     load_hook_plugin,
@@ -21,6 +22,8 @@ from plugins.loader import (
     load_mcp_plugins,
     load_model_plugin,
     load_model_plugins,
+    load_skill_plugin,
+    load_skill_plugins,
     load_tool_plugin,
     load_tool_plugins,
 )
@@ -32,6 +35,7 @@ __all__ = [
     "NamespacedTool",
     "PluginAssembly",
     "PluginManifest",
+    "SkillPlugin",
     "assemble_plugins",
     "discover_plugins",
     "load_hook_plugin",
@@ -39,6 +43,8 @@ __all__ = [
     "load_mcp_plugins",
     "load_model_plugin",
     "load_model_plugins",
+    "load_skill_plugin",
+    "load_skill_plugins",
     "load_tool_plugin",
     "load_tool_plugins",
 ]

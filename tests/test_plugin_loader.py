@@ -14,6 +14,7 @@ from plugins.loader import (
     load_hook_plugins,
     load_mcp_plugins,
     load_model_plugins,
+    load_skill_plugins,
     load_tool_plugins,
 )
 
@@ -69,7 +70,7 @@ def test_discover_returns_only_enabled_plugins(tmp_path) -> None:
 
 
 def test_discover_validates_disabled_plugins_too(tmp_path) -> None:
-    _write_plugin(tmp_path, "mcp", "future", _mcp_manifest(enabled=False, type="skill"))
+    _write_plugin(tmp_path, "mcp", "future", _mcp_manifest(enabled=False, type="session"))
     with pytest.raises(ValueError, match="type"):
         discover_plugins(tmp_path)
 
@@ -359,12 +360,25 @@ def test_assemble_plugins_groups_by_kind(tmp_path) -> None:
         },
         files={"model.py": _MODEL_MODULE},
     )
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "code-review",
+        {
+            "name": "code-review",
+            "type": "skill",
+            "description": "评审规范",
+            "entry": {"content": "SKILL.md"},
+        },
+        files={"SKILL.md": "# 评审清单\n"},
+    )
 
     assembly = assemble_plugins(tmp_path)
     assert [manifest.name for manifest, _ in assembly.hooks] == ["recorder"]
     assert [spec.manifest.name for spec in assembly.mcp] == ["time"]
     assert [manifest.name for manifest, _ in assembly.tools] == ["text"]
     assert [plugin.manifest.name for plugin in assembly.models] == ["deepseek"]
+    assert [plugin.manifest.name for plugin in assembly.skills] == ["code-review"]
 
 
 _MODEL_MODULE = """
@@ -426,3 +440,53 @@ def test_model_plugin_create_rejects_bad_factory_return(tmp_path) -> None:
     plugin = load_model_plugins(tmp_path)[0]
     with pytest.raises(ValueError, match="ModelAdapter"):
         plugin.create()
+
+
+def _skill_manifest(name: str = "code-review", **extra) -> dict:
+    manifest = {
+        "name": name,
+        "type": "skill",
+        "description": "评审规范",
+        "entry": {"content": "SKILL.md"},
+    }
+    manifest.update(extra)
+    return manifest
+
+
+def test_load_skill_plugins_points_to_content_file(tmp_path) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path,
+        "skills",
+        "code-review",
+        _skill_manifest(),
+        files={"SKILL.md": "# 评审\n正文"},
+    )
+    plugins = load_skill_plugins(tmp_path)
+    assert len(plugins) == 1
+    plugin = plugins[0]
+    assert plugin.manifest.name == "code-review"
+    assert plugin.content_path == plugin_dir / "SKILL.md"
+    assert plugin.preload is False
+
+
+def test_load_skill_plugins_rejects_missing_content_file(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "broken",
+        _skill_manifest(name="broken", entry={"content": "nope.md"}),
+    )
+    with pytest.raises(ValueError, match="正文文件不存在"):
+        load_skill_plugins(tmp_path)
+
+
+def test_load_skill_plugins_rejects_bad_preload_type(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "bad-preload",
+        _skill_manifest(name="bad-preload", entry={"content": "SKILL.md", "preload": "yes"}),
+        files={"SKILL.md": "# x\n"},
+    )
+    with pytest.raises(ValueError, match="preload"):
+        load_skill_plugins(tmp_path)

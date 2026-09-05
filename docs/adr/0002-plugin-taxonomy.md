@@ -52,7 +52,7 @@ PLUGIN_KINDS: dict[str, KindLoader] = {
 | `mcp` | 进程外/外部工具 | McpGateway（懒挂载） | 已落地 |
 | `tool` | 进程内轻量工具 | ToolRegistry（启动即注册） | 已落地（M1） |
 | `model` | LLM 适配器 | 当前激活的模型实例（AGENT_MODEL 选定） | 已落地（M2） |
-| `skill` | 按需注入的操作指令 | Skill 目录/渐进披露 | 待做 |
+| `skill` | 按需注入的操作指令 | SkillGateway + use_skill（渐进披露） | 已落地（M3） |
 | `session` | 会话持久化/恢复 | SessionStore | 未来评估 |
 
 约定：
@@ -80,12 +80,13 @@ PLUGIN_KINDS: dict[str, KindLoader] = {
 - **M0**：loader 改造为 kind 注册表 + 统一装配（地基，改动集中、可独立测试）；
 - **M1**：本地工具 kind（`plugins/tools/*`，无进程、直接函数）；
 - **M2**：模型 kind（`models/` 迁移为 `plugins/model/deepseek` 等，可配置切换）——已完成；
-- **M3**：Skill kind + 插件目录清单工具（渐进披露，替代硬拼 system prompt）；
+- **M3**：Skill kind + 插件目录清单工具（渐进披露，替代硬拼 system prompt）——已完成；
 - **M4**（未来）：session 持久化 kind、HTTP MCP、插件目录热加载（watch）。
 
 进度：M0（kind 注册表 + `PluginAssembly` 统一装配）、M1（本地工具 kind，
 `plugins/tools/text|json` 示例）、M2（模型 kind，`plugins/model/deepseek` +
-`AGENT_MODEL` 选择）均已完成。“除 Agent loop 外万物皆插件”在本仓库闭环：
+`AGENT_MODEL` 选择）、M3（技能 kind，`plugins/skills/code-review` + use_skill
+渐进披露）均已完成。“除 Agent loop 外万物皆插件”在本仓库闭环：
 模型、工具（本地 + MCP）、行为（hooks）全部来自插件目录。
 
 ## 后果
