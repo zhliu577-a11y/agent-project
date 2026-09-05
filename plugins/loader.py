@@ -18,6 +18,9 @@
 # 钩子插件 entry：
 #   { "module": "hook.py", "factory": "create_hook" }
 #   - 从插件目录加载 module，调用 factory(plugin_dir) 得到 LifecycleHooks 实例。
+#
+# 可选字段 priority（整数，默认 0）：钩子插件的执行顺序，越小越先执行；
+# 相同 priority 时按插件名排序，保证跨启动稳定。
 import hashlib
 import importlib.util
 import json
@@ -48,6 +51,7 @@ class PluginManifest:
     enabled: bool
     directory: Path
     entry: dict[str, Any]
+    priority: int = 0
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,13 @@ def _parse_manifest(path: Path) -> PluginManifest:
     entry = raw.get("entry")
     _expect(isinstance(entry, dict), where, "缺少 'entry' 对象")
 
+    priority = raw.get("priority", 0)
+    _expect(
+        isinstance(priority, int) and not isinstance(priority, bool),
+        where,
+        "'priority' 必须是整数",
+    )
+
     return PluginManifest(
         name=name,
         type=kind,
@@ -105,6 +116,7 @@ def _parse_manifest(path: Path) -> PluginManifest:
         enabled=enabled,
         directory=path.parent,
         entry=entry,
+        priority=priority,
     )
 
 
@@ -213,7 +225,8 @@ def load_hook_plugins(
             continue
         hooks.append((manifest, load_hook_plugin(manifest)))
         logger.info("钩子插件已加载: %s", manifest.name)
-    return hooks
+    # 执行顺序在装配阶段就确定：priority 升序，同优先级按名字典序（稳定可预测）
+    return sorted(hooks, key=lambda pair: (pair[0].priority, pair[0].name))
 
 
 def _resolve_arg(plugin_dir: Path, arg: str) -> str:

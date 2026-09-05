@@ -179,3 +179,48 @@ def test_load_hook_plugins_rejects_missing_module(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="入口模块不存在"):
         load_hook_plugins(tmp_path)
+
+
+def _hook_manifest(name: str, priority: int | None = None) -> dict:
+    manifest = {
+        "name": name,
+        "type": "hook",
+        "entry": {"module": "hook.py", "factory": "create_hook"},
+    }
+    if priority is not None:
+        manifest["priority"] = priority
+    return manifest
+
+
+def test_load_hook_plugins_sorts_by_priority_then_name(tmp_path) -> None:
+    for folder, name, priority in (
+        ("zeta", "zeta", 100),
+        ("beta", "beta", 0),
+        ("alpha", "alpha", 100),
+        ("aaa", "aaa", 0),
+    ):
+        _write_plugin(
+            tmp_path,
+            "hooks",
+            folder,
+            _hook_manifest(name, priority),
+            files={"hook.py": _RECORDER_HOOK},
+        )
+    hooks = load_hook_plugins(tmp_path)
+    assert [manifest.name for manifest, _ in hooks] == ["aaa", "beta", "alpha", "zeta"]
+
+
+def test_manifest_rejects_non_int_priority(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "hooks",
+        "bad",
+        {
+            "name": "bad",
+            "type": "hook",
+            "priority": "first",
+            "entry": {"module": "hook.py", "factory": "create_hook"},
+        },
+    )
+    with pytest.raises(ValueError, match="priority"):
+        load_hook_plugins(tmp_path)

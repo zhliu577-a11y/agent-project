@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from core.hooks import LifecycleHooks
+from core.hooks import HookDecision, LifecycleHooks
 from core.types import ToolCall, TurnContext
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,10 @@ class Rule:
 
 
 class PermissionHooks(LifecycleHooks):
-    """在 tool_before 时按策略决定：允许 / 询问用户 / 拒绝。"""
+    """在 tool_before 时按策略表态：allow / ask / deny。
+
+    只做“表态”，不做交互：ask 的确认提示统一由 HookGateway 折叠后执行一次。
+    """
 
     def __init__(self, rules: list[Rule] | None = None, default: str = "allow") -> None:
         if default not in _VALID_MODES:
@@ -41,21 +44,13 @@ class PermissionHooks(LifecycleHooks):
                 return rule.mode
         return self._default
 
-    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> bool:
+    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> HookDecision:
         mode = self.mode_for(tool_call.name)
-        if mode == "allow":
-            return True
         if mode == "deny":
             logger.warning("已拦截工具调用: %s（策略拒绝）", tool_call.name)
-            return False
-        # mode == "ask"：交互提示必须走 input（不能进日志，用户要看得见并回答）
-        logger.info("请求用户确认工具调用: %s", tool_call.name)
-        answer = (
-            input(f"[权限] 是否允许调用 {tool_call.name}(参数: {tool_call.arguments})? [y/N]: ")
-            .strip()
-            .lower()
-        )
-        return answer in {"y", "yes"}
+        elif mode == "ask":
+            logger.info("工具调用需要用户确认: %s", tool_call.name)
+        return mode
 
 
 def load_policy(path: str | Path) -> PermissionHooks:

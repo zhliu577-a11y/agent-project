@@ -3,6 +3,7 @@
   "type": "hook",
   "version": "1.0.0",
   "description": "工具权限策略：allow / ask / deny 闸门（策略文件随插件自带）",
+  "priority": 10,
   "enabled": true,
   "entry": {
     "module": "hook.py",

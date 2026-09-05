@@ -38,6 +38,16 @@ loop 通过 `use_server` 让模型逐台加载服务器。扩展一个新能力�
 - 钩子插件契约：`entry.module + entry.factory`，加载器动态导入并调用
   `factory(plugin_dir)`，要求返回 `LifecycleHooks`。
 
+#### 2.1 执行顺序与决策语义（2026-09-05 补充）
+
+- 清单新增可选 `priority`（默认 0），钩子按 `(priority, 注册顺序)` 升序执行，
+  同优先级按名字典序装配，保证跨启动稳定；
+- `tool_before` 的返回从布尔升级为三方表态 `allow / ask / deny`；网关收集
+  **全部**钩子表态后按 `deny > ask > allow` 折叠（对齐 dsh hook outcome 语义）；
+- 不做“首个拒绝即短路”，让审计类钩子也能看到被拒尝试；
+- 折叠结果为 `ask` 时只向用户确认一次（`confirm` 可注入以便测试/非交互环境）；
+- 钩子异常按该钩子表态 `deny` 处理，继续评估其余钩子。
+
 ### 3. MCP 网关（McpGateway）
 
 - `gateways/mcp_gateway.McpGateway` 是内核与 MCP 世界之间的唯一通道：

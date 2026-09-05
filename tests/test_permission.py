@@ -41,7 +41,7 @@ async def test_repo_permission_plugin_is_loaded_via_loader() -> None:
     allowed = await policy.tool_before(
         None, ToolCall(id="1", name="filesystem__delete_file", arguments={})
     )
-    assert allowed is False
+    assert allowed == "deny"
 
 
 class FakeModel(ModelAdapter):
@@ -66,8 +66,8 @@ class CountingTime(Tool):
 
 
 class DenyAll(LifecycleHooks):
-    async def tool_before(self, ctx, tool_call) -> bool:
-        return False
+    async def tool_before(self, ctx, tool_call):
+        return "deny"
 
 
 async def test_loop_does_not_execute_denied_tool() -> None:
