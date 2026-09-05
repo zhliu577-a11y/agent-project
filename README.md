@@ -12,11 +12,13 @@
 
 - 固定异步 agent loop（调模型 → 执行工具 → 回填 → 判断结束），支持流式输出与多个工具的并行执行
 - **插件目录（drop-in）**：`plugins/` 下每个插件是一个自包含目录 + `plugin.json`，
-  拖入即可被 Agent 发现；目前支持 `mcp` 与 `hook` 两类
+  拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool` 三类
 - **MCP 网关**：Agent 只面向网关这一个通道；网关统一维护各 MCP 插件的连接、
   会话、命名与清理，工具名带命名空间（`<插件名>__<工具名>`）
 - **钩子网关**：生命周期钩子全部插件化（`turn_start / llm_response /
   tool_before / tool_after / turn_end`），内核只面向 `HookGateway`
+- **本地工具插件**：高频轻量能力以进程内 Python 函数提供（`plugins/tools/*`），
+  启动即注册，无子进程、无挂载步骤
 - 按需挂载：模型通过 `use_plugin` 让网关挂载插件，避免无谓的进程与上下文开销
 - 权限钩子插件示例：`allow / ask / deny` 策略随插件文件夹走，支持通配符
 - 配置文件带 schema 校验：写错清单/策略启动即报错，绝不静默出错
@@ -39,13 +41,14 @@
         │                  │      │ 连接/维护/清理                        │
 ┌───────▼──────────────┐   ┌──────▼──────────────────────────────────────┐
 │  plugins/hooks/*     │   │  plugins/mcp/*（time / math / filesystem…） │
-│  permission 等钩子插件 │   └────────────────────────────────────────────┘
-└──────────────────────┘
+│  permission / audit  │   │  plugins/tools/*（text…，启动即注册）        │
+└──────────────────────┘   └────────────────────────────────────────────┘
 ```
 
-运行链路：启动时扫描 `plugins/` → 钩子插件实例化进 `HookGateway`、MCP 插件
-只读清单 → 模型决定调 `use_plugin` → 网关连接对应 MCP 插件并注册命名空间工具
-（先过权限钩子闸门）→ 结果回填 → 模型给出最终回答。
+运行链路：启动时扫描 `plugins/` → 钩子插件实例化进 `HookGateway`、本地工具
+直接注册进 `ToolRegistry`、MCP 插件只读清单 → 本地工具第一轮即可调用；MCP
+工具由模型决定调 `use_plugin` → 网关连接对应 MCP 插件并注册命名空间工具
+（都先过权限钩子闸门）→ 结果回填 → 模型给出最终回答。
 
 ## 快速开始
 
@@ -76,6 +79,11 @@ plugins/
 │   │   └── server.py           #   插件自带代码/配置
 │   ├── math/
 │   └── filesystem/             #   也可以是外部 MCP（npx 等）的启动配置
+├── tools/                      # 本地工具插件（进程内，启动即注册）
+│   ├── text/                   #   文本工具示例（slugify / count_words）
+│   └── json/                   #   JSON 处理（format / get）
+│       ├── plugin.json
+│       └── tool.py             #   实现 Tool 的类 + create_tools 工厂
 └── hooks/                      # 生命周期钩子插件
     └── permission/             #   权限策略示例（allow/ask/deny）
         ├── plugin.json
@@ -97,7 +105,7 @@ plugins/
 ```
 
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
-`mcp` / `hook`（未来可扩展 skill / model 等类别）；`enabled: false` 的插件
+`mcp` / `hook` / `tool`（未来可扩展 skill / model 等类别）；`enabled: false` 的插件
 结构仍会校验但不会加载。可选字段 `priority`（整数，默认 `0`）决定钩子插件的
 执行顺序：**越小越先执行**。字段写错启动即报错。
 
@@ -119,6 +127,33 @@ plugins/
   其余参数（如 `npx -y`）原样保留。
 - 子进程工作目录固定为该插件目录，插件自带资源用相对路径即可。
 - `transport` 目前只支持 `stdio`（远程 HTTP 在 Roadmap）。
+
+### 本地工具插件（`type: "tool"`）
+
+```json
+{
+  "name": "text",
+  "type": "tool",
+  "entry": { "module": "tool.py", "factory": "create_tools" }
+}
+```
+
+`tool.py` 实现 `core.tool.Tool`，工厂 `create_tools(plugin_dir)` 返回单个 Tool
+或 Tool 列表；加载器自动把每个工具包装成 `<插件名>__<工具名>`
+（如 `text__slugify`）并在启动时注册，模型第一轮就能调用。完整示例见
+`plugins/tools/text/`。
+
+什么时候用本地 tool、什么时候用 mcp：
+
+| 场景 | 用 `tool` | 用 `mcp` |
+|---|---|---|
+| 高频轻量、纯函数、内部逻辑 | 是（零成本） | 偏重 |
+| 需要现成生态（npx / node / docker） | 否 | 是 |
+| 需要独立进程/沙箱隔离 | 否 | 是 |
+| 将来要让别的 MCP 客户端复用 | 否 | 是 |
+
+两种工具在模型侧无差别：都是 `<插件名>__<工具名>`，都过同一套权限/审计钩子；
+区别只在“能力怎么托管”。
 
 ### 钩子插件（`type: "hook"`）
 

@@ -6,7 +6,14 @@ from pathlib import Path
 import pytest
 
 from core.hooks import LifecycleHooks
-from plugins.loader import discover_plugins, load_hook_plugins, load_mcp_plugins
+from plugins.loader import (
+    NamespacedTool,
+    assemble_plugins,
+    discover_plugins,
+    load_hook_plugins,
+    load_mcp_plugins,
+    load_tool_plugins,
+)
 
 
 def _write_plugin(
@@ -224,3 +231,123 @@ def test_manifest_rejects_non_int_priority(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="priority"):
         load_hook_plugins(tmp_path)
+
+
+_TOOL_MODULE = """
+from core.tool import Tool
+
+
+class EchoTool(Tool):
+    name = "echo"
+    description = "回显文本"
+    parameters = {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    }
+
+    async def execute(self, **kwargs):
+        return "echo:" + kwargs["text"]
+
+
+class CountTool(Tool):
+    name = "count"
+    description = "统计长度"
+    parameters = {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    }
+
+    async def execute(self, **kwargs):
+        return str(len(kwargs["text"]))
+
+
+def create_tools(plugin_dir):
+    return [EchoTool(), CountTool()]
+"""
+
+
+def _tool_manifest(name: str = "text") -> dict:
+    return {
+        "name": name,
+        "type": "tool",
+        "entry": {"module": "tool.py", "factory": "create_tools"},
+    }
+
+
+def test_load_tool_plugins_wraps_tools_with_plugin_namespace(tmp_path) -> None:
+    _write_plugin(tmp_path, "tools", "text", _tool_manifest(), files={"tool.py": _TOOL_MODULE})
+    plugins = load_tool_plugins(tmp_path)
+    assert len(plugins) == 1
+    manifest, tools = plugins[0]
+    assert manifest.name == "text"
+    assert [tool.name for tool in tools] == ["text__echo", "text__count"]
+    assert all(isinstance(tool, NamespacedTool) for tool in tools)
+
+
+def test_load_tool_plugins_accepts_single_tool_return(tmp_path) -> None:
+    single = _TOOL_MODULE.replace("return [EchoTool(), CountTool()]", "return EchoTool()")
+    _write_plugin(
+        tmp_path,
+        "tools",
+        "single",
+        _tool_manifest(name="single"),
+        files={"tool.py": single},
+    )
+    plugins = load_tool_plugins(tmp_path)
+    assert [tool.name for tool in plugins[0][1]] == ["single__echo"]
+
+
+def test_load_tool_plugins_rejects_non_tool_return(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "tools",
+        "bad",
+        _tool_manifest(name="bad"),
+        files={"tool.py": "def create_tools(plugin_dir):\n    return 'nope'\n"},
+    )
+    with pytest.raises(ValueError, match="Tool"):
+        load_tool_plugins(tmp_path)
+
+
+def test_load_tool_plugins_rejects_empty_result(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "tools",
+        "empty",
+        _tool_manifest(name="empty"),
+        files={"tool.py": "def create_tools(plugin_dir):\n    return []\n"},
+    )
+    with pytest.raises(ValueError, match="没有返回任何 Tool"):
+        load_tool_plugins(tmp_path)
+
+
+def test_assemble_plugins_groups_by_kind(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "mcp",
+        "time",
+        {
+            "name": "time",
+            "type": "mcp",
+            "entry": {"command": "python", "args": ["server.py"]},
+        },
+    )
+    _write_plugin(
+        tmp_path,
+        "hooks",
+        "recorder",
+        {
+            "name": "recorder",
+            "type": "hook",
+            "entry": {"module": "hook.py", "factory": "create_hook"},
+        },
+        files={"hook.py": _RECORDER_HOOK},
+    )
+    _write_plugin(tmp_path, "tools", "text", _tool_manifest(), files={"tool.py": _TOOL_MODULE})
+
+    assembly = assemble_plugins(tmp_path)
+    assert [manifest.name for manifest, _ in assembly.hooks] == ["recorder"]
+    assert [spec.manifest.name for spec in assembly.mcp] == ["time"]
+    assert [manifest.name for manifest, _ in assembly.tools] == ["text"]

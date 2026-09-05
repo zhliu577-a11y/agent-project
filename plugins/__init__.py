@@ -10,19 +10,29 @@
 from plugins.loader import (
     DEFAULT_PLUGINS_DIR,
     McpPluginSpec,
+    NamespacedTool,
+    PluginAssembly,
     PluginManifest,
+    assemble_plugins,
     discover_plugins,
     load_hook_plugin,
     load_hook_plugins,
     load_mcp_plugins,
+    load_tool_plugin,
+    load_tool_plugins,
 )
 
 __all__ = [
     "DEFAULT_PLUGINS_DIR",
     "McpPluginSpec",
+    "NamespacedTool",
+    "PluginAssembly",
     "PluginManifest",
+    "assemble_plugins",
     "discover_plugins",
     "load_hook_plugin",
     "load_hook_plugins",
     "load_mcp_plugins",
+    "load_tool_plugin",
+    "load_tool_plugins",
 ]

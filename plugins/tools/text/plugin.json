@@ -1,0 +1,11 @@
+{
+  "name": "text",
+  "type": "tool",
+  "version": "1.0.0",
+  "description": "高频轻量文本处理（slug 转换、字数统计），进程内直接执行",
+  "enabled": true,
+  "entry": {
+    "module": "tool.py",
+    "factory": "create_tools"
+  }
+}

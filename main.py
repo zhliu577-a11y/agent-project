@@ -16,7 +16,7 @@ from core.registry import ToolRegistry
 from gateways.mcp_gateway import McpGateway, UsePlugin
 from loop import run_agent
 from models.openai_compat import OpenAICompatModel
-from plugins.loader import load_hook_plugins, load_mcp_plugins
+from plugins.loader import assemble_plugins
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,11 +63,13 @@ async def main() -> None:
 
     # 0. 装配插件：写错清单/入口立刻报错退出，而不是静默出错
     try:
-        hook_plugins = load_hook_plugins(plugins_dir)
-        mcp_specs = load_mcp_plugins(plugins_dir)
+        assembly = assemble_plugins(plugins_dir)
     except ValueError as exc:
         logger.error("插件装配失败: %s", exc)
         return
+    hook_plugins = assembly.hooks
+    mcp_specs = assembly.mcp
+    tool_plugins = assembly.tools
 
     # 1. 钩子网关：内核只面向它，具体钩子全部来自插件目录
     hooks = HookGateway()
@@ -75,25 +77,39 @@ async def main() -> None:
         hooks.add(hook)
         logger.info("钩子网关已接入插件: %s", manifest.name)
 
-    # 2. 只读 MCP 插件目录，尚未连接任何服务器；模型需要时通过网关挂载
-    catalog = "\n".join(
-        f"- {spec.manifest.name}: {spec.manifest.description}" for spec in mcp_specs
+    # 2. 本地工具启动即注册；MCP 插件只读清单，模型需要时由网关挂载
+    local_catalog = (
+        "\n".join(
+            f"- {tool.name}: {tool.description}" for _, tools in tool_plugins for tool in tools
+        )
+        or "（暂无）"
+    )
+    mcp_catalog = (
+        "\n".join(f"- {spec.manifest.name}: {spec.manifest.description}" for spec in mcp_specs)
+        or "（暂无）"
     )
     system_prompt = (
-        "你是一个乐于助人的助手。你的工具由 MCP 插件网关统一提供，"
-        "工具名格式为 <插件名>__<工具名>。\n"
-        "需要用到某个 MCP 插件时，先调用 use_plugin 挂载它，挂载成功后再使用其工具。\n"
-        f"可挂载插件：\n{catalog}"
+        "你是一个乐于助人的助手。工具名格式为 <插件名>__<工具名>，分两类：\n"
+        "1. 本地工具（进程内实现，启动即就绪，可直接调用）：\n"
+        f"{local_catalog}\n"
+        "2. MCP 插件工具：需要某个 MCP 插件时，先调用 use_plugin 挂载它，"
+        "挂载成功后再调用其工具。\n"
+        f"可挂载的 MCP 插件：\n{mcp_catalog}"
     )
     logger.info("MCP 插件目录（尚未连接）: %s", [spec.manifest.name for spec in mcp_specs])
 
     model = OpenAICompatModel()
     tools = ToolRegistry()
 
-    # 3. MCP 网关：整个应用生命周期里，只有它持有 MCP 连接
+    # 3. 本地工具直接进注册表；MCP 网关是整个应用生命周期里唯一持有 MCP 连接的对象
+    for _, tools_list in tool_plugins:
+        for tool in tools_list:
+            tools.register(tool)
+        logger.info("本地工具已就绪: %s", [tool.name for tool in tools_list])
+
     gateway = McpGateway(mcp_specs)
     try:
-        # 4. 只注册"挂载器"工具，具体插件等模型决定后再由网关连接
+        # 4. 只注册"挂载器"工具，具体 MCP 插件等模型决定后再由网关连接
         tools.register(UsePlugin(gateway, tools))
         await chat(model, tools, hooks, system_prompt)
     finally:
