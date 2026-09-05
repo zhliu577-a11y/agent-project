@@ -1,12 +1,13 @@
 # main.py —— Harness 启动器：发现插件 → 装配网关 → 进入固定 agent loop（全异步）
 #
 # 启动流程：
-#   1. 扫描 plugins/ 目录，加载全部钩子插件（hooks/*）与 MCP 插件清单（mcp/*）；
-#   2. 把所有钩子插件装进 HookGateway（钩子网关）；
-#   3. 创建 McpGateway（MCP 网关：内核与 MCP 世界之间的唯一通道）；
-#   4. 注册 use_plugin 挂载工具，进入固定 loop；模型按需让网关挂载插件。
+#   1. assemble_plugins 统一装配 plugins/（hook / mcp / tool / model）；
+#   2. 钩子插件装进 HookGateway，本地工具直接注册进 ToolRegistry；
+#   3. 按 AGENT_MODEL（默认 deepseek）选定模型插件并惰性实例化；
+#   4. 创建 McpGateway 并注册 use_plugin，进入固定 loop。
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,7 +16,6 @@ from core.hooks import HookGateway
 from core.registry import ToolRegistry
 from gateways.mcp_gateway import McpGateway, UsePlugin
 from loop import run_agent
-from models.openai_compat import OpenAICompatModel
 from plugins.loader import assemble_plugins
 
 logging.basicConfig(
@@ -70,6 +70,7 @@ async def main() -> None:
     hook_plugins = assembly.hooks
     mcp_specs = assembly.mcp
     tool_plugins = assembly.tools
+    model_plugins = assembly.models
 
     # 1. 钩子网关：内核只面向它，具体钩子全部来自插件目录
     hooks = HookGateway()
@@ -98,7 +99,22 @@ async def main() -> None:
     )
     logger.info("MCP 插件目录（尚未连接）: %s", [spec.manifest.name for spec in mcp_specs])
 
-    model = OpenAICompatModel()
+    # 2.5 模型插件：AGENT_MODEL 选择（默认 deepseek），选定后才实例化
+    model_name = os.getenv("AGENT_MODEL", "deepseek")
+    model_plugin = next(
+        (plugin for plugin in model_plugins if plugin.manifest.name == model_name), None
+    )
+    if model_plugin is None:
+        logger.error(
+            "未知的模型插件: %s，可选: %s", model_name, [p.manifest.name for p in model_plugins]
+        )
+        return
+    try:
+        model = model_plugin.create()
+    except ValueError as exc:
+        logger.error("模型插件 %s 初始化失败: %s", model_name, exc)
+        return
+
     tools = ToolRegistry()
 
     # 3. 本地工具直接进注册表；MCP 网关是整个应用生命周期里唯一持有 MCP 连接的对象

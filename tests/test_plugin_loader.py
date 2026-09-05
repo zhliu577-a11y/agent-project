@@ -7,11 +7,13 @@ import pytest
 
 from core.hooks import LifecycleHooks
 from plugins.loader import (
+    ModelPlugin,
     NamespacedTool,
     assemble_plugins,
     discover_plugins,
     load_hook_plugins,
     load_mcp_plugins,
+    load_model_plugins,
     load_tool_plugins,
 )
 
@@ -346,8 +348,81 @@ def test_assemble_plugins_groups_by_kind(tmp_path) -> None:
         files={"hook.py": _RECORDER_HOOK},
     )
     _write_plugin(tmp_path, "tools", "text", _tool_manifest(), files={"tool.py": _TOOL_MODULE})
+    _write_plugin(
+        tmp_path,
+        "model",
+        "deepseek",
+        {
+            "name": "deepseek",
+            "type": "model",
+            "entry": {"module": "model.py", "factory": "create_model"},
+        },
+        files={"model.py": _MODEL_MODULE},
+    )
 
     assembly = assemble_plugins(tmp_path)
     assert [manifest.name for manifest, _ in assembly.hooks] == ["recorder"]
     assert [spec.manifest.name for spec in assembly.mcp] == ["time"]
     assert [manifest.name for manifest, _ in assembly.tools] == ["text"]
+    assert [plugin.manifest.name for plugin in assembly.models] == ["deepseek"]
+
+
+_MODEL_MODULE = """
+from core.model import ModelAdapter
+from core.types import Message, ModelResponse
+
+
+class FakeModelAdapter(ModelAdapter):
+    async def complete(self, messages, tool_schemas, on_token=None):
+        return ModelResponse(content="fake", tool_calls=[])
+
+
+def create_model(plugin_dir):
+    return FakeModelAdapter()
+"""
+
+
+def _model_manifest(name: str = "deepseek") -> dict:
+    return {
+        "name": name,
+        "type": "model",
+        "entry": {"module": "model.py", "factory": "create_model"},
+    }
+
+
+def test_load_model_plugins_is_lazy_and_create_returns_adapter(tmp_path) -> None:
+    _write_plugin(
+        tmp_path, "model", "deepseek", _model_manifest(), files={"model.py": _MODEL_MODULE}
+    )
+    plugins = load_model_plugins(tmp_path)
+    assert len(plugins) == 1
+    plugin = plugins[0]
+    assert isinstance(plugin, ModelPlugin)
+    assert plugin.manifest.name == "deepseek"
+    # 装配阶段不实例化（模型工厂有环境变量副作用），create() 时才创建
+    model = plugin.create()
+    assert type(model).__name__ == "FakeModelAdapter"
+
+
+def test_load_model_plugin_rejects_missing_entry(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "model",
+        "bad",
+        {"name": "bad", "type": "model", "entry": {}},
+    )
+    with pytest.raises(ValueError, match="model 插件必须在 entry"):
+        load_model_plugins(tmp_path)
+
+
+def test_model_plugin_create_rejects_bad_factory_return(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "model",
+        "bad",
+        _model_manifest(name="bad"),
+        files={"model.py": "def create_model(plugin_dir):\n    return 42\n"},
+    )
+    plugin = load_model_plugins(tmp_path)[0]
+    with pytest.raises(ValueError, match="ModelAdapter"):
+        plugin.create()

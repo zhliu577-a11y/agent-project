@@ -1,4 +1,8 @@
-# models/openai_compat.py —— OpenAI 兼容模型适配器（异步 + 流式 + 超时重试）
+# plugins/model/openai/model.py —— 模型插件示例：OpenAI
+#
+# 与 plugins/model/deepseek 相同的结构：实现 core.model.ModelAdapter + 工厂。
+# 这是“换一家模型 = 复制插件目录改配置”的演示——实例化读取 OPENAI_* 环境变量，
+# 由 Harness 通过 AGENT_MODEL=openai 选定后惰性创建。
 import json
 import os
 from collections.abc import Callable
@@ -33,8 +37,8 @@ def message_to_payload(msg: Message) -> dict[str, Any]:
     return payload
 
 
-class OpenAICompatModel(ModelAdapter):
-    """通过 OpenAI 兼容接口异步调用 DeepSeek（也适用于 OpenAI、通义、本地 vLLM）。"""
+class OpenAIModel(ModelAdapter):
+    """通过 OpenAI 官方接口异步调用 GPT 系列模型（流式 + 超时重试）。"""
 
     def __init__(
         self,
@@ -42,21 +46,20 @@ class OpenAICompatModel(ModelAdapter):
         base_url: str | None = None,
         model: str | None = None,
     ) -> None:
-        api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise RuntimeError("缺少 DEEPSEEK_API_KEY，请在 .env 中配置后再运行")
+            raise RuntimeError("缺少 OPENAI_API_KEY，请在 .env 中配置后再运行")
 
-        # 超时与重试：客户端内置指数退避，仅重试连接错误/429/5xx 等安全场景
-        timeout = float(os.getenv("DEEPSEEK_TIMEOUT", "60"))
-        max_retries = int(os.getenv("DEEPSEEK_MAX_RETRIES", "3"))
+        timeout = float(os.getenv("OPENAI_TIMEOUT", "60"))
+        max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 
         self._client = AsyncOpenAI(
             api_key=api_key,
-            base_url=base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            base_url=base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
             timeout=timeout,
             max_retries=max_retries,
         )
-        self._model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+        self._model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     async def complete(
         self,
@@ -72,7 +75,6 @@ class OpenAICompatModel(ModelAdapter):
             payload["tools"] = tool_schemas
             payload["tool_choice"] = "auto"
 
-        # 全程流式：文本增量即时回调；工具调用增量静默累积
         stream = await self._client.chat.completions.create(**payload, stream=True)
 
         content_parts: list[str] = []
@@ -111,3 +113,8 @@ class OpenAICompatModel(ModelAdapter):
             for index, acc in sorted(tool_calls_acc.items())
         ]
         return ModelResponse(content="".join(content_parts), tool_calls=tool_calls)
+
+
+def create_model(plugin_dir):
+    """插件工厂：返回模型适配器实例（实例化时读取 OPENAI_* 环境变量）。"""
+    return OpenAIModel()

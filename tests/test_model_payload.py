@@ -1,6 +1,6 @@
 # tests/test_model_payload.py —— 消息序列化测试（不需要联网）
 from core.types import Message, ToolCall
-from models.openai_compat import message_to_payload
+from plugins.model.deepseek.model import message_to_payload
 
 
 def test_assistant_without_tool_calls() -> None:

@@ -1,0 +1,11 @@
+{
+  "name": "deepseek",
+  "type": "model",
+  "version": "1.0.0",
+  "description": "DeepSeek 模型适配器（OpenAI 兼容协议，异步 + 流式 + 超时重试）",
+  "enabled": true,
+  "entry": {
+    "module": "model.py",
+    "factory": "create_model"
+  }
+}

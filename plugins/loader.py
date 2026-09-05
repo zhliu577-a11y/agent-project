@@ -3,7 +3,7 @@
 # 每个插件是一个自包含的目录，目录内必须有 plugin.json 清单：
 # {
 #   "name": "time",            # 唯一名（字母/数字/下划线/连字符）
-#   "type": "mcp",             # 插件类别：mcp | hook | tool（未来可扩展）
+#   "type": "mcp",             # 插件类别：mcp | hook | tool | model
 #   "version": "1.0.0",        # 可选
 #   "description": "…",        # 可选
 #   "enabled": true,           # 可选，默认 true
@@ -24,6 +24,11 @@
 #   - 调用 factory(plugin_dir) 得到一个 Tool 或 Tool 列表；
 #     工具会被包装成 <插件名>__<工具名>，启动即注册，无需挂载。
 #
+# 模型插件 entry（type: "model"）：
+#   { "module": "model.py", "factory": "create_model" }
+#   - 只校验并持有 factory，不在装配时调用（实例化有环境变量副作用，
+#     由 Harness 选定激活插件后惰性创建）。
+#
 # 可选字段 priority（整数，默认 0）：钩子插件的执行顺序，越小越先执行；
 # 相同 priority 时按插件名排序，保证跨启动稳定。
 #
@@ -41,12 +46,13 @@ from pathlib import Path
 from typing import Any
 
 from core.hooks import LifecycleHooks
+from core.model import ModelAdapter
 from core.tool import Tool
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PLUGINS_DIR = Path(__file__).resolve().parent
-SUPPORTED_KINDS = ("mcp", "hook", "tool")
+SUPPORTED_KINDS = ("mcp", "hook", "tool", "model")
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -95,6 +101,28 @@ class NamespacedTool(Tool):
 
     async def execute(self, **kwargs: Any) -> Any:
         return await self._tool.execute(**kwargs)
+
+
+@dataclass(frozen=True)
+class ModelPlugin:
+    """一个已校验的模型插件：清单 + 惰性工厂，由 Harness 选定后调用 create()。"""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> ModelAdapter:
+        """实例化模型适配器；工厂错误或返回类型错误都会明确报错。"""
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            model = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: 模型工厂执行失败: {exc}") from exc
+        _expect(
+            isinstance(model, ModelAdapter),
+            where,
+            f"模型工厂必须返回 ModelAdapter 实例，实际是 {type(model).__name__}",
+        )
+        return model
 
 
 def _expect(condition: bool, where: str, message: str) -> None:
@@ -306,6 +334,12 @@ def load_tool_plugin(manifest: PluginManifest) -> list[Tool]:
     return [NamespacedTool(manifest.name, tool) for tool in tools]
 
 
+def load_model_plugin(manifest: PluginManifest) -> ModelPlugin:
+    """校验单个模型插件并返回惰性工厂（不在此处实例化）。"""
+    factory = _load_entry_factory(manifest, "model")
+    return ModelPlugin(manifest=manifest, factory=factory)
+
+
 def _resolve_arg(plugin_dir: Path, arg: str) -> str:
     """插件目录下真实存在的相对路径参数 -> 绝对路径；其余参数原样保留。"""
     path = Path(arg)
@@ -355,6 +389,17 @@ def load_tool_plugins(
     return sorted(plugins, key=lambda pair: pair[0].name)
 
 
+def load_model_plugins(root: str | Path | None = None) -> list[ModelPlugin]:
+    """加载插件目录里全部启用的模型插件，返回惰性规格（不实例化）。"""
+    plugins: list[ModelPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "model":
+            continue
+        plugins.append(load_model_plugin(manifest))
+        logger.info("模型插件已发现: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
 # ---------- kind 注册表与统一装配 ----------
 
 
@@ -365,6 +410,7 @@ class PluginAssembly:
     hooks: list[tuple[PluginManifest, LifecycleHooks]] = field(default_factory=list)
     mcp: list[McpPluginSpec] = field(default_factory=list)
     tools: list[tuple[PluginManifest, list[Tool]]] = field(default_factory=list)
+    models: list[ModelPlugin] = field(default_factory=list)
 
 
 def _add_hook(manifest: PluginManifest, assembly: PluginAssembly) -> None:
@@ -379,12 +425,17 @@ def _add_tool(manifest: PluginManifest, assembly: PluginAssembly) -> None:
     assembly.tools.append((manifest, load_tool_plugin(manifest)))
 
 
+def _add_model(manifest: PluginManifest, assembly: PluginAssembly) -> None:
+    assembly.models.append(load_model_plugin(manifest))
+
+
 # kind 注册表：新增插件类别 = SUPPORTED_KINDS 登记 type + 这里注册一个处理器，
 # 处理器把单个清单的产物放进 PluginAssembly 的对应字段。
 _KIND_HANDLERS: dict[str, Callable[[PluginManifest, PluginAssembly], None]] = {
     "hook": _add_hook,
     "mcp": _add_mcp,
     "tool": _add_tool,
+    "model": _add_model,
 }
 
 

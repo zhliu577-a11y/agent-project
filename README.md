@@ -6,19 +6,22 @@
 本仓库借鉴 Harness 工程（Claude Code / DeepSeek Harness 一脉）的组织方式：
 生命周期行为做成 **hooks 插件**，外部工具做成 **MCP 插件**；内核不直接接触
 任何插件实现，只面向两个网关——`HookGateway`（钩子网关）与 `McpGateway`
-（MCP 网关）。
+（MCP 网关）。模型适配器同样是插件（`plugins/model/*`），由 `AGENT_MODEL`
+选定。
 
 ## 特性
 
 - 固定异步 agent loop（调模型 → 执行工具 → 回填 → 判断结束），支持流式输出与多个工具的并行执行
 - **插件目录（drop-in）**：`plugins/` 下每个插件是一个自包含目录 + `plugin.json`，
-  拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool` 三类
+  拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model` 四类
 - **MCP 网关**：Agent 只面向网关这一个通道；网关统一维护各 MCP 插件的连接、
   会话、命名与清理，工具名带命名空间（`<插件名>__<工具名>`）
 - **钩子网关**：生命周期钩子全部插件化（`turn_start / llm_response /
   tool_before / tool_after / turn_end`），内核只面向 `HookGateway`
 - **本地工具插件**：高频轻量能力以进程内 Python 函数提供（`plugins/tools/*`），
   启动即注册，无子进程、无挂载步骤
+- **模型插件**：LLM 适配器来自 `plugins/model/*`（当前 deepseek 为默认），
+  `AGENT_MODEL` 环境变量即可切换模型提供方
 - 按需挂载：模型通过 `use_plugin` 让网关挂载插件，避免无谓的进程与上下文开销
 - 权限钩子插件示例：`allow / ask / deny` 策略随插件文件夹走，支持通配符
 - 配置文件带 schema 校验：写错清单/策略启动即报错，绝不静默出错
@@ -84,6 +87,14 @@ plugins/
 │   └── json/                   #   JSON 处理（format / get）
 │       ├── plugin.json
 │       └── tool.py             #   实现 Tool 的类 + create_tools 工厂
+├── model/                      # 模型适配器插件
+│   ├── deepseek/               #   DeepSeek（默认）
+│   │   ├── plugin.json
+│   │   ├── model.py            #   ModelAdapter 实现 + create_model 工厂
+│   │   └── README.md
+│   └── openai/                 #   OpenAI（示例：如何加第二家模型）
+│       ├── plugin.json
+│       └── model.py
 └── hooks/                      # 生命周期钩子插件
     └── permission/             #   权限策略示例（allow/ask/deny）
         ├── plugin.json
@@ -105,7 +116,7 @@ plugins/
 ```
 
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
-`mcp` / `hook` / `tool`（未来可扩展 skill / model 等类别）；`enabled: false` 的插件
+`mcp` / `hook` / `tool` / `model`（未来可扩展 skill / session 等类别）；`enabled: false` 的插件
 结构仍会校验但不会加载。可选字段 `priority`（整数，默认 `0`）决定钩子插件的
 执行顺序：**越小越先执行**。字段写错启动即报错。
 
@@ -154,6 +165,23 @@ plugins/
 
 两种工具在模型侧无差别：都是 `<插件名>__<工具名>`，都过同一套权限/审计钩子；
 区别只在“能力怎么托管”。
+
+### 模型插件（`type: "model"`）
+
+```json
+{
+  "name": "deepseek",
+  "type": "model",
+  "entry": { "module": "model.py", "factory": "create_model" }
+}
+```
+
+`model.py` 实现 `core.model.ModelAdapter`，工厂 `create_model(plugin_dir)` 返回
+适配器实例。装配阶段只校验入口、**不实例化**（构造可能读取密钥等环境变量），
+由 Harness 根据 `AGENT_MODEL`（默认 `deepseek`）选出激活插件后惰性创建。
+仓库自带两个示例：`deepseek`（默认）与 `openai`。换模型 = 复制
+`plugins/model/openai/` 目录改成自己的适配器（或直接设
+`AGENT_MODEL=openai` 并用 `OPENAI_*` 配置），互不影响。
 
 ### 钩子插件（`type: "hook"`）
 
@@ -211,6 +239,7 @@ plugins/
 | `DEEPSEEK_MODEL` | `deepseek-chat` | 模型名 |
 | `DEEPSEEK_TIMEOUT` | `60` | 单次模型请求超时（秒） |
 | `DEEPSEEK_MAX_RETRIES` | `3` | 模型请求重试次数（仅安全场景） |
+| `AGENT_MODEL` | `deepseek` | 激活的模型插件名（plugins/model/* 里选） |
 | `MCP_CONNECT_TIMEOUT` | `20` | MCP 插件连接超时（秒） |
 | `MCP_CALL_TIMEOUT` | `30` | 单次 MCP 工具调用超时（秒） |
 
@@ -266,6 +295,5 @@ lint + format 检查 + 全部测试。
 
 - 远程 HTTP MCP 插件（`transport: "http"` + URL + 服务器级信任）
 - Skills 型插件（按需注入操作说明，plugin.json `type: "skill"`）
-- 模型适配器插件化（`type: "model"`，替换 `models/` 固定目录）
 - 钩子事件扩展（用户输入提交前、会话开始/结束等，对齐 Codex/Claude Code 拦截点）
 - MCP 网关进程化：把 `McpGateway` 换成独立代理进程/远程网关客户端（同一窄接口）
