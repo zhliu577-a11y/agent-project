@@ -8,4 +8,6 @@ __pycache__/
 *.log
 .sessions/
 .memory/
+.events/
+timeline.jsonl
 .env

@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from core.config import AppConfig
 from core.context import trim_history
+from core.events import Event, EventBus, jsonl_sink
 from core.hooks import HookGateway
 from core.prompt import build_system_prompt
 from core.registry import ToolRegistry
@@ -31,7 +32,7 @@ from gateways.memory_gateway import (
 from gateways.session_gateway import SessionGateway
 from gateways.skill_gateway import SkillGateway, UseSkill
 from loop import run_agent
-from plugins.loader import assemble_plugins
+from plugins.loader import assemble_plugins, attach_listener_plugins
 
 logger = logging.getLogger("main")
 
@@ -44,10 +45,19 @@ async def chat(
     history: list[Message] | None = None,
     session: SessionGateway | None = None,
     max_context_tokens: int = 20000,
+    events: EventBus | None = None,
 ) -> list[Message]:
     """交互循环；返回本会话最终历史（不含 system），供持久化/恢复。"""
     logger.info("对话已启动，输入 exit / quit / 退出 结束。")
     history = list(history or [])
+    session_id = session.session_id if session is not None else None
+
+    async def _publish(name: str, **payload: object) -> None:
+        if events is None:
+            return
+        await events.publish(Event(name=name, payload=dict(payload)))
+
+    await _publish("session.start", session_id=session_id)
 
     streamed = {"active": False}
 
@@ -68,6 +78,14 @@ async def chat(
 
         streamed["active"] = False
         begin_trace()
+        if events is not None:
+            decision = await events.decide(
+                Event("user_prompt.submit", {"session_id": session_id, "text": user_input})
+            )
+            if decision != "allow":
+                logger.warning("用户输入被事件总线策略拦截: %s", decision)
+                print(f"[bus] 本轮输入被策略拦截({decision})")
+                continue
         history, dropped = trim_history(history, max_context_tokens)
         if dropped:
             logger.warning(
@@ -83,6 +101,7 @@ async def chat(
             user_input,
             on_token=on_token,
             history=history,
+            events=events,
         )
         history = ctx.messages[1:]  # 去掉 system，其余全部进入下一轮上下文
         if session is not None:
@@ -96,6 +115,7 @@ async def chat(
             print()  # 流式输出已结束，补一个换行
         if ctx.stop_reason != "done":
             logger.warning("本轮结束原因: %s", ctx.stop_reason)
+    await _publish("session.end", session_id=session_id)
     return history
 
 
@@ -122,6 +142,17 @@ async def main() -> None:
     for manifest, hook in hook_plugins:
         hooks.add(hook)
         logger.info("钩子网关已接入插件: %s", manifest.name)
+
+    # 1.5 事件总线：观察层（hook 网关桥接其上；EVENT_LOG 可落 JSONL 时间线）
+    bus = EventBus()
+    event_log = os.getenv("EVENT_LOG")
+    if event_log:
+        bus.subscribe("*", jsonl_sink(event_log))
+        logger.info("事件总线日志已启用: %s", event_log)
+    hooks.attach(bus)
+    attach_listener_plugins(bus, assembly.listeners)
+    if assembly.listeners:
+        logger.info("listener 插件已接入: %s", [p.manifest.name for p in assembly.listeners])
 
     # 2.5 模型插件：AGENT_MODEL 选择（默认 deepseek），选定后才实例化
     model_name = config.model
@@ -188,7 +219,7 @@ async def main() -> None:
     except ValueError as exc:
         logger.error("长期记忆插件 %s 初始化失败: %s", memory_store_name, exc)
         return
-    memory_gateway = MemoryGateway(memory_store)
+    memory_gateway = MemoryGateway(memory_store, events=bus)
     logger.info("长期记忆已启用（%s 存储）", memory_store_name)
 
     tools = ToolRegistry()
@@ -243,6 +274,7 @@ async def main() -> None:
             history=history,
             session=session,
             max_context_tokens=config.context_max_tokens,
+            events=bus,
         )
     finally:
         await gateway.close()

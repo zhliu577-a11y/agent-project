@@ -1,0 +1,12 @@
+{
+  "name": "timeline",
+  "type": "listener",
+  "version": "1.0.0",
+  "description": "订阅全部观察事件并写成 JSONL 时间线（listener 插件示例）",
+  "enabled": true,
+  "events": ["*"],
+  "entry": {
+    "module": "listener.py",
+    "factory": "create_listener"
+  }
+}

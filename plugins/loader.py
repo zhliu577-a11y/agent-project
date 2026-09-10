@@ -53,6 +53,7 @@ from typing import Any
 
 from core.embedding import EmbeddingProvider
 from core.errors import AGENT_CATEGORIES, resolve_declared_error
+from core.events import EventBus, Subscription, coerce_subscriptions
 from core.hooks import LifecycleHooks
 from core.memory import MemoryStore
 from core.model import ModelAdapter
@@ -71,9 +72,11 @@ SUPPORTED_KINDS = (
     "session",
     "memory",
     "embedding",
+    "listener",
 )
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CODE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_EVENT_RE = re.compile(r"^(\*|[A-Za-z0-9_.-]+)$")
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,7 @@ class PluginManifest:
     entry: dict[str, Any]
     priority: int = 0
     errors: tuple[DeclaredError, ...] = ()
+    events: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -240,6 +244,31 @@ class EmbeddingPlugin:
         return provider
 
 
+@dataclass(frozen=True)
+class ListenerPlugin:
+    """事件订阅者插件：清单 + 惰性工厂，返回 Subscription 列表接入事件总线。"""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> tuple[Subscription, ...]:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            value = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: listener 工厂执行失败: {exc}") from exc
+        subscriptions = coerce_subscriptions(value, where)
+        if self.manifest.events:
+            declared = set(self.manifest.events)
+            for subscription in subscriptions:
+                if subscription.event not in declared:
+                    raise ValueError(
+                        f"{where}: 订阅了未声明的事件 '{subscription.event}'，"
+                        f"清单声明: {sorted(declared)}"
+                    )
+        return subscriptions
+
+
 def _expect(condition: bool, where: str, message: str) -> None:
     if not condition:
         raise ValueError(f"{where}: {message}")
@@ -285,6 +314,7 @@ def _parse_manifest(path: Path) -> PluginManifest:
     )
 
     errors = _parse_declared_errors(raw, where)
+    events = _parse_declared_events(raw, where)
 
     return PluginManifest(
         name=name,
@@ -296,7 +326,25 @@ def _parse_manifest(path: Path) -> PluginManifest:
         entry=entry,
         priority=priority,
         errors=errors,
+        events=events,
     )
+
+
+def _parse_declared_events(raw: dict[str, Any], where: str) -> tuple[str, ...]:
+    """校验 listener 插件的 events 声明（事件名列表，支持 "*"）。"""
+    items = raw.get("events", [])
+    _expect(isinstance(items, list), where, "'events' 必须是数组")
+    declared: list[str] = []
+    for index, item in enumerate(items, start=1):
+        item_where = f"{where} 第 {index} 个事件声明"
+        _expect(
+            isinstance(item, str) and bool(_EVENT_RE.fullmatch(item)),
+            item_where,
+            "事件名必须形如 'tool.after'，或为 '*'",
+        )
+        _expect(item not in declared, item_where, f"事件重复声明: {item}")
+        declared.append(item)
+    return tuple(declared)
 
 
 def _parse_declared_errors(raw: dict[str, Any], where: str) -> tuple[DeclaredError, ...]:
@@ -537,6 +585,12 @@ def load_embedding_plugin(manifest: PluginManifest) -> EmbeddingPlugin:
     return EmbeddingPlugin(manifest=manifest, factory=factory)
 
 
+def load_listener_plugin(manifest: PluginManifest) -> ListenerPlugin:
+    """校验单个 listener 插件并返回惰性工厂（不在此处实例化）。"""
+    factory = _load_entry_factory(manifest, "listener")
+    return ListenerPlugin(manifest=manifest, factory=factory)
+
+
 def _resolve_arg(plugin_dir: Path, arg: str) -> str:
     """插件目录下真实存在的相对路径参数 -> 绝对路径；其余参数原样保留。"""
     path = Path(arg)
@@ -641,6 +695,17 @@ def load_embedding_plugins(root: str | Path | None = None) -> list[EmbeddingPlug
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
+def load_listener_plugins(root: str | Path | None = None) -> list[ListenerPlugin]:
+    """加载插件目录里全部启用的 listener 插件（惰性，不实例化）。"""
+    plugins: list[ListenerPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "listener":
+            continue
+        plugins.append(load_listener_plugin(manifest))
+        logger.info("listener 插件已发现: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
 # ---------- kind 注册表与统一装配 ----------
 
 
@@ -656,6 +721,7 @@ class PluginAssembly:
     sessions: list[SessionPlugin] = field(default_factory=list)
     memories: list[MemoryPlugin] = field(default_factory=list)
     embeddings: list[EmbeddingPlugin] = field(default_factory=list)
+    listeners: list[ListenerPlugin] = field(default_factory=list)
 
 
 def _add_hook(manifest: PluginManifest, assembly: PluginAssembly) -> None:
@@ -690,6 +756,10 @@ def _add_embedding(manifest: PluginManifest, assembly: PluginAssembly) -> None:
     assembly.embeddings.append(load_embedding_plugin(manifest))
 
 
+def _add_listener(manifest: PluginManifest, assembly: PluginAssembly) -> None:
+    assembly.listeners.append(load_listener_plugin(manifest))
+
+
 # kind 注册表：新增插件类别 = SUPPORTED_KINDS 登记 type + 这里注册一个处理器，
 # 处理器把单个清单的产物放进 PluginAssembly 的对应字段。
 _KIND_HANDLERS: dict[str, Callable[[PluginManifest, PluginAssembly], None]] = {
@@ -701,7 +771,26 @@ _KIND_HANDLERS: dict[str, Callable[[PluginManifest, PluginAssembly], None]] = {
     "session": _add_session,
     "memory": _add_memory,
     "embedding": _add_embedding,
+    "listener": _add_listener,
 }
+
+
+def attach_listener_plugins(
+    bus: EventBus, listeners: list[ListenerPlugin]
+) -> list[Callable[[], None]]:
+    """把 listener 插件订阅到事件总线，返回退订函数列表（热卸载预留）。"""
+    tokens: list[Callable[[], None]] = []
+    for plugin in listeners:
+        for subscription in plugin.create():
+            tokens.append(
+                bus.subscribe(
+                    subscription.event,
+                    subscription.handler,
+                    priority=subscription.priority,
+                )
+            )
+        logger.info("listener 插件已接入事件总线: %s", plugin.manifest.name)
+    return tokens
 
 
 def assemble_plugins(root: str | Path | None = None) -> PluginAssembly:

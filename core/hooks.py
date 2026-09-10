@@ -3,6 +3,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
+from core.events import Event, EventBus
 from core.types import ModelResponse, ToolCall, TurnContext
 
 logger = logging.getLogger(__name__)
@@ -13,6 +14,9 @@ logger = logging.getLogger(__name__)
 HookDecision = Literal["allow", "ask", "deny"]
 
 ConfirmFn = Callable[[TurnContext, ToolCall], Awaitable[bool]]
+
+# 阶段一由总线桥接的观察事件（决策类 tool_before 仍走 HookGateway 本体）
+_BRIDGED_EVENTS = ("turn.start", "model.response", "tool.after", "turn.end")
 
 
 class LifecycleHooks:
@@ -62,6 +66,7 @@ class HookGateway:
 
     def __init__(self) -> None:
         self._hooks: list[tuple[int, int, LifecycleHooks]] = []
+        self._attached_buses: set[int] = set()
 
     def add(self, hook: LifecycleHooks, priority: int = 0) -> None:
         if not isinstance(priority, int) or isinstance(priority, bool):
@@ -71,6 +76,28 @@ class HookGateway:
     @property
     def count(self) -> int:
         return len(self._hooks)
+
+    def attach(self, bus: EventBus, *, priority: int = 100) -> None:
+        """把 hook 网关桥接到事件总线（幂等）；旧 hook 插件无需改动。"""
+        if id(bus) in self._attached_buses:
+            return
+        for name in _BRIDGED_EVENTS:
+            bus.subscribe(name, self._on_bus_event, priority=priority)
+        self._attached_buses.add(id(bus))
+        logger.info("HookGateway 已桥接事件总线（%d 个观察事件）", len(_BRIDGED_EVENTS))
+
+    async def _on_bus_event(self, event: Event) -> None:
+        payload = event.payload
+        if event.name == "turn.start":
+            await self.turn_start(payload["ctx"])
+        elif event.name == "model.response":
+            await self.llm_response(payload["ctx"], payload["resp"])
+        elif event.name == "tool.after":
+            await self.tool_after(
+                payload["ctx"], payload["tool_call"], payload["result"], payload["ok"]
+            )
+        elif event.name == "turn.end":
+            await self.turn_end(payload["ctx"])
 
     def _ordered(self) -> list[tuple[int, int, LifecycleHooks]]:
         return sorted(self._hooks)
