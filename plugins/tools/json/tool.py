@@ -5,6 +5,7 @@
 #   json__get('{"a":{"b":[1,2]}}', "a.b.1") -> "2"
 import json as _json
 
+from core.errors import DeclaredPluginError
 from core.tool import Tool
 
 
@@ -31,7 +32,7 @@ class FormatJson(Tool):
         try:
             obj = _json.loads(text)
         except _json.JSONDecodeError as exc:
-            return f"JSON 解析失败: {exc}"
+            raise DeclaredPluginError("invalid_json", f"JSON 解析失败: {exc}") from exc
         return _json.dumps(obj, ensure_ascii=False, indent=indent)
 
 
@@ -56,7 +57,7 @@ class GetJson(Tool):
         try:
             obj = _json.loads(text)
         except _json.JSONDecodeError as exc:
-            return f"JSON 解析失败: {exc}"
+            raise DeclaredPluginError("invalid_json", f"JSON 解析失败: {exc}") from exc
 
         node = obj
         if path != ".":

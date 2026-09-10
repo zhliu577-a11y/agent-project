@@ -4,6 +4,7 @@
 # 历史加载与保存；存储后端来自 plugins/session/*（SESSION_STORE 选定）。
 from typing import Any
 
+from core.errors import boundary
 from core.session import SessionStore
 from core.types import Message
 
@@ -19,19 +20,24 @@ class SessionGateway:
     def session_id(self) -> str:
         return self._session_id
 
+    @boundary("读取会话历史失败")
     async def load_history(self) -> list[Message]:
         """读取本会话历史；没有历史时返回空列表。"""
         return await self._store.load(self._session_id)
 
+    @boundary("保存会话历史失败")
     async def save_history(self, messages: list[Message]) -> None:
         """保存本会话历史（不含 system 消息，由调用方裁剪）。"""
         await self._store.save(self._session_id, messages)
 
+    @boundary("读取 checkpoint 失败")
     async def load_checkpoint(self) -> dict[str, Any] | None:
         return await self._store.load_checkpoint(self._session_id)
 
+    @boundary("保存 checkpoint 失败")
     async def save_checkpoint(self, snapshot: dict[str, Any]) -> None:
         await self._store.save_checkpoint(self._session_id, snapshot)
 
+    @boundary("删除 checkpoint 失败")
     async def delete_checkpoint(self) -> None:
         await self._store.delete_checkpoint(self._session_id)

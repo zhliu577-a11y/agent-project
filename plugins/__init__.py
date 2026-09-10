@@ -9,6 +9,7 @@
 # SUPPORTED_KINDS 中登记即可，内核与网关边界不变。
 from plugins.loader import (
     DEFAULT_PLUGINS_DIR,
+    DeclaredError,
     EmbeddingPlugin,
     McpPluginSpec,
     MemoryPlugin,
@@ -39,6 +40,7 @@ from plugins.loader import (
 
 __all__ = [
     "DEFAULT_PLUGINS_DIR",
+    "DeclaredError",
     "EmbeddingPlugin",
     "McpPluginSpec",
     "MemoryPlugin",

@@ -4,6 +4,13 @@
   "version": "1.0.0",
   "description": "安全计算数学表达式",
   "enabled": true,
+  "errors": [
+    {
+      "code": "unsupported_expression",
+      "category": "tool",
+      "hint": "只支持数字与 + - * / ** % 和括号，请修改表达式后重试"
+    }
+  ],
   "entry": {
     "command": "python",
     "args": ["server.py"]

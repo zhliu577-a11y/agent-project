@@ -4,6 +4,7 @@
 # 三个内核工具访问，工具同样过权限/审计钩子。
 from typing import Any
 
+from core.errors import ToolError, boundary
 from core.memory import MemoryNote, MemoryStore
 from core.tool import Tool
 
@@ -14,15 +15,19 @@ class MemoryGateway:
     def __init__(self, store: MemoryStore) -> None:
         self._store = store
 
+    @boundary("写入长期记忆失败", fallback=ToolError)
     async def remember(self, content: str, tags: list[str] | None = None) -> MemoryNote:
         return await self._store.add_note(content, tags or [])
 
+    @boundary("检索长期记忆失败", fallback=ToolError)
     async def recall(self, query: str = "") -> list[MemoryNote]:
         return await self._store.search_notes(query)
 
+    @boundary("删除长期记忆失败", fallback=ToolError)
     async def forget(self, note_id: str) -> bool:
         return await self._store.delete_note(note_id)
 
+    @boundary("更新长期记忆失败", fallback=ToolError)
     async def update(
         self,
         note_id: str,

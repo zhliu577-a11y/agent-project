@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from core.embedding import EmbeddingProvider
+from core.errors import AGENT_CATEGORIES, resolve_declared_error
 from core.hooks import LifecycleHooks
 from core.memory import MemoryStore
 from core.model import ModelAdapter
@@ -72,6 +73,17 @@ SUPPORTED_KINDS = (
     "embedding",
 )
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_CODE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+@dataclass(frozen=True)
+class DeclaredError:
+    """插件在清单里声明的领域错误（code/category/hint/retryable）。"""
+
+    code: str
+    category: str
+    hint: str
+    retryable: bool
 
 
 @dataclass(frozen=True)
@@ -86,6 +98,7 @@ class PluginManifest:
     directory: Path
     entry: dict[str, Any]
     priority: int = 0
+    errors: tuple[DeclaredError, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -99,11 +112,17 @@ class McpPluginSpec:
 
 
 class NamespacedTool(Tool):
-    """给本地工具包上 <插件名>__<工具名> 前缀，与 MCP 工具命名规则一致。"""
+    """给本地工具包上 <插件名>__<工具名> 前缀，并按其声明补全错误语义。"""
 
-    def __init__(self, plugin_name: str, tool: Tool) -> None:
+    def __init__(
+        self,
+        plugin_name: str,
+        tool: Tool,
+        declarations: dict[str, DeclaredError] | None = None,
+    ) -> None:
         self._plugin_name = plugin_name
         self._tool = tool
+        self._declarations = declarations or {}
 
     @property
     def name(self) -> str:
@@ -118,7 +137,13 @@ class NamespacedTool(Tool):
         return self._tool.parameters
 
     async def execute(self, **kwargs: Any) -> Any:
-        return await self._tool.execute(**kwargs)
+        try:
+            return await self._tool.execute(**kwargs)
+        except Exception as exc:
+            resolved = resolve_declared_error(exc, self._declarations, plugin=self._plugin_name)
+            if resolved is exc:
+                raise
+            raise resolved from exc
 
 
 @dataclass(frozen=True)
@@ -259,6 +284,8 @@ def _parse_manifest(path: Path) -> PluginManifest:
         "'priority' 必须是整数",
     )
 
+    errors = _parse_declared_errors(raw, where)
+
     return PluginManifest(
         name=name,
         type=kind,
@@ -268,7 +295,50 @@ def _parse_manifest(path: Path) -> PluginManifest:
         directory=path.parent,
         entry=entry,
         priority=priority,
+        errors=errors,
     )
+
+
+def _parse_declared_errors(raw: dict[str, Any], where: str) -> tuple[DeclaredError, ...]:
+    """校验清单里的 errors 声明：code 唯一、category 合法、retryable 自洽。"""
+    items = raw.get("errors", [])
+    _expect(isinstance(items, list), where, "'errors' 必须是数组")
+
+    declared: list[DeclaredError] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items, start=1):
+        item_where = f"{where} 第 {index} 个错误声明"
+        _expect(isinstance(item, dict), item_where, "必须是对象")
+
+        code = item.get("code")
+        _expect(
+            isinstance(code, str) and bool(_CODE_RE.fullmatch(code)),
+            item_where,
+            "缺少合法的 'code'（仅 A-Za-z0-9_.-）",
+        )
+        _expect(code not in seen, item_where, f"错误码重复: {code}")
+
+        category = item.get("category", "plugin")
+        _expect(
+            category in AGENT_CATEGORIES,
+            item_where,
+            f"非法的 category '{category}'，可选: {list(AGENT_CATEGORIES)}",
+        )
+
+        hint = item.get("hint", "")
+        _expect(isinstance(hint, str), item_where, "'hint' 必须是字符串")
+
+        retryable = item.get("retryable", category == "retryable")
+        _expect(isinstance(retryable, bool), item_where, "'retryable' 必须是布尔值")
+        _expect(
+            retryable == (category == "retryable"),
+            item_where,
+            "'retryable' 必须与 category == 'retryable' 一致",
+        )
+
+        declared.append(DeclaredError(code=code, category=category, hint=hint, retryable=retryable))
+        seen.add(code)
+    return tuple(declared)
 
 
 def _iter_manifest_paths(root: Path):
@@ -421,7 +491,8 @@ def load_tool_plugin(manifest: PluginManifest) -> list[Tool]:
     except Exception as exc:
         raise ValueError(f"{where}: 工厂执行失败: {exc}") from exc
     tools = _coerce_tools(produced, where)
-    return [NamespacedTool(manifest.name, tool) for tool in tools]
+    declarations = {declared.code: declared for declared in manifest.errors}
+    return [NamespacedTool(manifest.name, tool, declarations=declarations) for tool in tools]
 
 
 def load_model_plugin(manifest: PluginManifest) -> ModelPlugin:

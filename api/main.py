@@ -14,10 +14,12 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from core.config import AppConfig
 from core.context import history_tokens, trim_history
+from core.errors import AgentError
 from core.hooks import HookGateway
 from core.model import ModelAdapter
 from core.prompt import build_system_prompt
@@ -204,6 +206,27 @@ async def trace_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers["x-trace-id"] = current_trace_id() or "-"
     return response
+
+
+# 内部错误类别 → HTTP 状态码：接口层统一映射，不在每个端点里判断
+_ERROR_STATUS = {
+    "config": 400,
+    "model": 502,
+    "retryable": 503,
+    "tool": 500,
+    "plugin": 500,
+    "agent": 500,
+}
+
+
+@app.exception_handler(AgentError)
+async def agent_error_handler(request: Request, exc: AgentError) -> JSONResponse:
+    status = _ERROR_STATUS.get(exc.category, 500)
+    logger.warning("请求失败 category=%s: %s", exc.category, exc)
+    return JSONResponse(
+        status_code=status,
+        content={"detail": str(exc), "category": exc.category},
+    )
 
 
 def _session(app_: FastAPI, session_id: str) -> SessionGateway:

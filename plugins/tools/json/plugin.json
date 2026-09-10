@@ -4,6 +4,13 @@
   "version": "1.0.0",
   "description": "JSON 处理：美化格式化、按点路径取值（进程内直接执行）",
   "enabled": true,
+  "errors": [
+    {
+      "code": "invalid_json",
+      "category": "tool",
+      "hint": "检查 JSON 语法（引号/逗号/括号）后重试"
+    }
+  ],
   "entry": {
     "module": "tool.py",
     "factory": "create_tools"

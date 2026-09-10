@@ -4,6 +4,7 @@ import operator
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 server = MCPServer(name="math-server")
 
@@ -39,7 +40,8 @@ def calculate(expression: str) -> str:
         tree = ast.parse(expression, mode="eval")
         return str(_eval_node(tree.body))
     except Exception as exc:
-        return f"计算失败: {exc}"
+        # 错误契约约定：错误文本里带 [code]，网关按清单声明匹配
+        raise ToolError(f"[unsupported_expression] 表达式无法计算: {exc}") from exc
 
 
 if __name__ == "__main__":

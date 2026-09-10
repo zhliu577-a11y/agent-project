@@ -10,18 +10,24 @@
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from core.errors import DeclaredPluginError, PluginError, ToolError, translate_error
 from core.registry import ToolRegistry
 from core.retry import retry_async
 from core.tool import Tool
 from plugins.loader import McpPluginSpec
 
 logger = logging.getLogger(__name__)
+
+# MCP 的错误文本约定：[code] ... 或 code: ...（可能被 SDK 包一层文本，故用 search）
+_CODE_BRACKET_RE = re.compile(r"\[([A-Za-z0-9_.-]+)\]")
+_CODE_COLON_RE = re.compile(r"(?:^|\s)([A-Za-z0-9_.-]+):")
 
 
 def result_to_text(result) -> str:
@@ -57,6 +63,7 @@ class McpTool(Tool):
         description: str,
         input_schema,
         timeout: float = 30.0,
+        declarations: dict[str, Any] | None = None,
     ) -> None:
         self._session = session
         self._plugin_name = plugin_name
@@ -64,6 +71,7 @@ class McpTool(Tool):
         self._description = description
         self._schema = input_schema or {"type": "object", "properties": {}}
         self._timeout = timeout
+        self._declarations = declarations or {}
 
     @property
     def name(self) -> str:
@@ -88,7 +96,40 @@ class McpTool(Tool):
     async def execute(self, **kwargs: Any) -> Any:
         async with asyncio.timeout(self._timeout):
             result = await self._session.call_tool(self._tool_name, kwargs)
+        if _is_error_result(result):
+            text = result_to_text(result)
+            code = self._match_declared_code(text)
+            if code is not None:
+                declared = self._declarations[code]
+                raise DeclaredPluginError(
+                    code,
+                    text or f"工具 {self._tool_name} 返回错误",
+                    category=declared.category,
+                    hint=declared.hint,
+                    plugin=self._plugin_name,
+                )
+            raise ToolError(text or f"工具 {self._tool_name} 返回错误")
         return result_to_text(result)
+
+    def _match_declared_code(self, text: str) -> str | None:
+        """在错误文本里查找清单声明的错误码；未声明返回 None。"""
+        text = text or ""
+        for match in _CODE_BRACKET_RE.finditer(text):
+            if match.group(1) in self._declarations:
+                return match.group(1)
+        for match in _CODE_COLON_RE.finditer(text):
+            if match.group(1) in self._declarations:
+                return match.group(1)
+        return None
+
+
+def _is_error_result(result: Any) -> bool:
+    """兼容 SDK 的字段命名：isError（旧）与 is_error（snake_case）。"""
+    for attr in ("isError", "is_error"):
+        value = getattr(result, attr, None)
+        if isinstance(value, bool):
+            return value
+    return False
 
 
 class McpGateway:
@@ -211,7 +252,9 @@ class McpGateway:
         except Exception as exc:
             self._failed.add(name)
             logger.exception("MCP 插件 %s 挂载失败", name)
-            raise RuntimeError(f"插件 {name} 连接失败: {exc}") from exc
+            raise translate_error(
+                exc, context=f"插件 {name} 连接失败", fallback=PluginError
+            ) from exc
 
         tools = [
             McpTool(
@@ -221,6 +264,7 @@ class McpGateway:
                 description=description,
                 input_schema=schema,
                 timeout=self._call_timeout,
+                declarations={declared.code: declared for declared in spec.manifest.errors},
             )
             for raw_name, description, schema in raw_tools
         ]

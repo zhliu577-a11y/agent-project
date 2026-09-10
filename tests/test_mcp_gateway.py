@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from core.errors import DeclaredPluginError, ToolError
 from core.registry import ToolRegistry
 from gateways.mcp_gateway import (
     McpGateway,
@@ -12,7 +13,7 @@ from gateways.mcp_gateway import (
     UsePlugin,
     result_to_text,
 )
-from plugins.loader import McpPluginSpec, PluginManifest
+from plugins.loader import DeclaredError, McpPluginSpec, PluginManifest
 
 
 def _spec(name: str = "time") -> McpPluginSpec:
@@ -35,8 +36,10 @@ class FakeContent:
 
 
 class FakeResult:
-    def __init__(self, items) -> None:
+    def __init__(self, items, is_error: bool = False) -> None:
         self.content = items
+        self.isError = is_error
+        self.is_error = is_error  # 兼容 SDK 的 snake_case 字段
 
 
 class FakeSession:
@@ -57,6 +60,21 @@ class SlowSession:
     async def call_tool(self, name, arguments):
         await asyncio.sleep(1)
         return FakeResult([FakeContent("text", "太慢了")])
+
+
+class ErrorSession:
+    """返回 isError 结果的假会话，用于验证错误契约匹配。"""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    async def call_tool(self, name, arguments):
+        return FakeResult([FakeContent("text", self._text)], is_error=True)
+
+
+_RATE_LIMIT = DeclaredError(
+    code="rate_limited", category="retryable", hint="稍后重试", retryable=True
+)
 
 
 class FakeGateway(McpGateway):
@@ -154,3 +172,53 @@ async def test_mcp_tool_routes_call_with_raw_tool_name() -> None:
     result = await tool.execute(timezone="UTC")
     assert result == "time:get_current_time"
     assert session.calls == [("get_current_time", {"timezone": "UTC"})]
+
+
+@pytest.mark.asyncio
+async def test_mcp_is_error_matches_declared_code() -> None:
+    tool = McpTool(
+        ErrorSession("[rate_limited] 上游限流"),
+        "upstream",
+        "query",
+        "查询",
+        {},
+        timeout=1.0,
+        declarations={"rate_limited": _RATE_LIMIT},
+    )
+    with pytest.raises(DeclaredPluginError) as info:
+        await tool.execute()
+    assert info.value.code == "rate_limited"
+    assert info.value.category == "retryable"
+    assert info.value.hint == "稍后重试"
+
+
+@pytest.mark.asyncio
+async def test_mcp_is_error_without_declaration_falls_back_to_tool_error() -> None:
+    tool = McpTool(
+        ErrorSession("something exploded"),
+        "upstream",
+        "query",
+        "查询",
+        {},
+        timeout=1.0,
+        declarations={"rate_limited": _RATE_LIMIT},
+    )
+    with pytest.raises(ToolError, match="something exploded"):
+        await tool.execute()
+
+
+@pytest.mark.asyncio
+async def test_mcp_is_error_matches_code_wrapped_by_sdk_message() -> None:
+    """SDK 会把工具异常包装成 'Error executing tool x: ...'，code 需任意位置匹配。"""
+    tool = McpTool(
+        ErrorSession("Error executing tool query: [rate_limited] 上游限流"),
+        "upstream",
+        "query",
+        "查询",
+        {},
+        timeout=1.0,
+        declarations={"rate_limited": _RATE_LIMIT},
+    )
+    with pytest.raises(DeclaredPluginError) as info:
+        await tool.execute()
+    assert info.value.code == "rate_limited"

@@ -147,7 +147,8 @@ plugins/
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
 `mcp` / `hook` / `tool` / `model` / `skill` / `session` / `memory` / `embedding`；`enabled: false` 的插件
 结构仍会校验但不会加载。可选字段 `priority`（整数，默认 `0`）决定钩子插件的
-执行顺序：**越小越先执行**。字段写错启动即报错。
+执行顺序：**越小越先执行**；可选字段 `errors` 声明插件已知的领域错误
+（见下文“错误分类与重试”）。字段写错启动即报错。
 
 ### MCP 插件（`type: "mcp"`）
 
@@ -294,6 +295,40 @@ plugins/
 `DELETE /sessions/{id}`、`GET /context/{id}`、记忆 CRUD
 （`/memory/notes`）、`GET /plugins` 概览。Web 模式没有交互弹窗，
 权限 `ask` 默认按拒绝处理。
+
+### 错误分类与重试（边界翻译）
+
+外部异常（openai / sqlite / 子进程 / 文件）不会自动带语义，因此在四个边界
+统一翻译成内部类别：
+
+- `core/errors.py`：`classify_error()`（白名单映射，不认识的原样透传；
+  `CancelledError` 等控制异常绝不吞）、`translate_error()`（带上下文并保留
+  `__cause__`）、`boundary()` 装饰器；
+- 映射规则：超时 / 连接错误 / 408 / 429 / 5xx → `RetryableError`；
+  其它 HTTP 状态 → `ModelError`；`sqlite3.Error` → `ToolError`；
+  `OSError` → `PluginError`；
+- 消费方：`retry_async`（重试判定）、loop（工具失败反馈会带上错误类别，
+  瞬时错误提示模型可稍后重试）、FastAPI（按类别映射 HTTP 状态码并返回
+  `category` 字段：400/502/503/500）。
+
+**插件错误契约（声明式）**：插件可在 `plugin.json` 里声明已知错误，让调用方
+（尤其是模型）知道“会报什么、该怎么办”：
+
+```json
+{
+  "errors": [
+    { "code": "invalid_json", "category": "tool", "hint": "检查 JSON 语法后重试" },
+    { "code": "rate_limited", "category": "retryable", "hint": "稍后重试" }
+  ]
+}
+```
+
+- `code` 唯一、`category` 必须来自内核固定集合、`retryable` 需与 category 自洽；
+- 进程内插件抛 `DeclaredPluginError(code, message)`，由包装层按声明补全；
+- MCP 插件返回 `isError` 且文本以 `[code] …` 或 `code: …` 开头时按声明匹配，
+  匹配不到则退化为通用 `ToolError`；
+- 工具失败回填给模型时会带上 `错误类别 + code + hint`，例如
+  `错误类别: retryable，code: rate_limited（瞬时错误，可稍后重试）`。
 
 ### 钩子插件（`type: "hook"`）
 

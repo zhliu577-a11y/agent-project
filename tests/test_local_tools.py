@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from core.errors import DeclaredPluginError
 from core.hooks import HookGateway, LifecycleHooks
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
@@ -118,3 +119,20 @@ async def test_repo_json_tool_plugin_is_usable() -> None:
 
     missing = await registry.execute("json__get", {"text": "{}", "path": "x.y"})
     assert "不存在" in missing
+
+
+async def test_json_tool_declared_error_is_enriched() -> None:
+    """插件抛 DeclaredPluginError 后，包装层按清单声明补全 category/hint。"""
+    root = Path(__file__).resolve().parents[1] / "plugins"
+    by_name = {manifest.name: tools for manifest, tools in load_tool_plugins(root)}
+    registry = ToolRegistry()
+    for tool in by_name["json"]:
+        registry.register(tool)
+
+    with pytest.raises(DeclaredPluginError) as info:
+        await registry.execute("json__format", {"text": "{bad json"})
+
+    error = info.value
+    assert error.code == "invalid_json"
+    assert error.category == "tool"
+    assert "JSON 语法" in error.hint

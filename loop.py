@@ -3,6 +3,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
+from core.errors import RetryableError, classify_error
 from core.hooks import ConfirmFn, HookGateway
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
@@ -47,7 +48,10 @@ async def run_agent(
                 ctx.messages, tools.list_schemas(), on_token=on_token
             )
         except Exception as exc:
-            logger.exception("模型调用失败: %s", exc)
+            error = classify_error(exc)
+            category = getattr(error, "category", type(error).__name__)
+            logger.exception("模型调用失败（%s）: %s", category, error)
+            ctx.state["last_error"] = {"category": category, "message": str(error)}
             ctx.stop_reason = "error"
             break
 
@@ -95,12 +99,24 @@ async def run_agent(
                         "请停止调用它，改用其他工具或直接回答。"
                     )
                 else:
+                    error = classify_error(exc)
+                    category = getattr(error, "category", type(error).__name__)
+                    retryable = isinstance(error, RetryableError) or (
+                        getattr(error, "category", None) == "retryable"
+                    )
+                    retry_hint = "（瞬时错误，可稍后重试）" if retryable else ""
+                    code = getattr(error, "code", None)
+                    hint = getattr(error, "hint", "")
+                    code_part = f"，code: {code}" if code else ""
+                    hint_part = f"提示: {hint}。" if hint else ""
                     desc = tools.describe(tc.name)
                     schema_hint = ""
                     if desc is not None:
                         schema_hint = f"；期望参数 schema: {desc['parameters']}"
                     message = (
                         f"工具 {tc.name} 执行失败: {exc}{schema_hint}。"
+                        f"错误类别: {category}{code_part}{retry_hint}。"
+                        f"{hint_part}"
                         "如果这是参数问题，请修正参数后重试；否则请换一种方法。"
                     )
                 return tc, message, False

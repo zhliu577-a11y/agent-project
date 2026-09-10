@@ -239,6 +239,67 @@ def test_manifest_rejects_non_int_priority(tmp_path) -> None:
         load_hook_plugins(tmp_path)
 
 
+def test_manifest_parses_declared_errors(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "mcp",
+        "time",
+        _mcp_manifest(
+            errors=[
+                {"code": "rate_limited", "category": "retryable", "hint": "稍后重试"},
+                {"code": "bad_args", "category": "tool"},
+            ]
+        ),
+    )
+    manifest = discover_plugins(tmp_path)[0]
+    assert [declared.code for declared in manifest.errors] == ["rate_limited", "bad_args"]
+    assert manifest.errors[0].retryable is True
+    assert manifest.errors[1].retryable is False
+    assert manifest.errors[0].hint == "稍后重试"
+
+
+def test_manifest_rejects_duplicate_error_code(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "mcp",
+        "dup",
+        _mcp_manifest(
+            name="dup",
+            errors=[
+                {"code": "boom", "category": "tool"},
+                {"code": "boom", "category": "tool"},
+            ],
+        ),
+    )
+    with pytest.raises(ValueError, match="错误码重复"):
+        discover_plugins(tmp_path)
+
+
+def test_manifest_rejects_unknown_error_category(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "mcp",
+        "badcat",
+        _mcp_manifest(name="badcat", errors=[{"code": "boom", "category": "whatever"}]),
+    )
+    with pytest.raises(ValueError, match="category"):
+        discover_plugins(tmp_path)
+
+
+def test_manifest_rejects_retryable_mismatch(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "mcp",
+        "mismatch",
+        _mcp_manifest(
+            name="mismatch",
+            errors=[{"code": "boom", "category": "tool", "retryable": True}],
+        ),
+    )
+    with pytest.raises(ValueError, match="retryable"):
+        discover_plugins(tmp_path)
+
+
 _TOOL_MODULE = """
 from core.tool import Tool
 
