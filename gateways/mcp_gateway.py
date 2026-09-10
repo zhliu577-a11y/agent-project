@@ -17,6 +17,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from core.registry import ToolRegistry
+from core.retry import retry_async
 from core.tool import Tool
 from plugins.loader import McpPluginSpec
 
@@ -206,7 +207,7 @@ class McpGateway:
             return [tool for tool in self._tools.values() if tool.plugin_name == name]
 
         try:
-            connection, raw_tools = await self.connect_plugin(spec)
+            connection, raw_tools = await self._connect_with_retry(spec)
         except Exception as exc:
             self._failed.add(name)
             logger.exception("MCP 插件 %s 挂载失败", name)
@@ -234,6 +235,13 @@ class McpGateway:
             [tool.name for tool in tools],
         )
         return tools
+
+    async def _connect_with_retry(self, spec: McpPluginSpec):
+        """按 MCP_CONNECT_RETRIES（默认 0）对连接做指数退避重试。"""
+        extra_retries = int(os.getenv("MCP_CONNECT_RETRIES", "0"))
+        if extra_retries <= 0:
+            return await self.connect_plugin(spec)
+        return await retry_async(lambda: self.connect_plugin(spec), attempts=extra_retries + 1)
 
     async def close(self) -> None:
         """关闭全部插件连接并清空工具表（幂等，可重复调用）。"""

@@ -1,0 +1,11 @@
+{
+  "name": "jsonl",
+  "type": "memory",
+  "version": "1.0.0",
+  "description": "JSONL 文件长期记忆：语义笔记按行落盘，跨会话保留",
+  "enabled": true,
+  "entry": {
+    "module": "store.py",
+    "factory": "create_store"
+  }
+}

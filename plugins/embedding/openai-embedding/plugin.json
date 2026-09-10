@@ -1,0 +1,11 @@
+{
+  "name": "openai-embedding",
+  "type": "embedding",
+  "version": "1.0.0",
+  "description": "OpenAI text-embedding 接口：真实语义向量（需 OPENAI_API_KEY）",
+  "enabled": true,
+  "entry": {
+    "module": "provider.py",
+    "factory": "create_provider"
+  }
+}

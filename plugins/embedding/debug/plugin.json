@@ -1,0 +1,11 @@
+{
+  "name": "debug",
+  "type": "embedding",
+  "version": "1.0.0",
+  "description": "确定性哈希嵌入：离线可用，用于开发/测试向量链路（无语义）",
+  "enabled": true,
+  "entry": {
+    "module": "provider.py",
+    "factory": "create_provider"
+  }
+}

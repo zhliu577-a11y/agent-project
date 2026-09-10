@@ -11,9 +11,12 @@ from plugins.loader import (
     NamespacedTool,
     assemble_plugins,
     discover_plugins,
+    load_embedding_plugins,
     load_hook_plugins,
     load_mcp_plugins,
+    load_memory_plugins,
     load_model_plugins,
+    load_session_plugins,
     load_skill_plugins,
     load_tool_plugins,
 )
@@ -70,7 +73,7 @@ def test_discover_returns_only_enabled_plugins(tmp_path) -> None:
 
 
 def test_discover_validates_disabled_plugins_too(tmp_path) -> None:
-    _write_plugin(tmp_path, "mcp", "future", _mcp_manifest(enabled=False, type="session"))
+    _write_plugin(tmp_path, "mcp", "future", _mcp_manifest(enabled=False, type="bundle"))
     with pytest.raises(ValueError, match="type"):
         discover_plugins(tmp_path)
 
@@ -372,6 +375,39 @@ def test_assemble_plugins_groups_by_kind(tmp_path) -> None:
         },
         files={"SKILL.md": "# 评审清单\n"},
     )
+    _write_plugin(
+        tmp_path,
+        "session",
+        "jsonl",
+        {
+            "name": "jsonl",
+            "type": "session",
+            "entry": {"module": "store.py", "factory": "create_store"},
+        },
+        files={"store.py": _SESSION_MODULE},
+    )
+    _write_plugin(
+        tmp_path,
+        "memory",
+        "jsonl",
+        {
+            "name": "jsonl",
+            "type": "memory",
+            "entry": {"module": "store.py", "factory": "create_store"},
+        },
+        files={"store.py": _MEMORY_MODULE},
+    )
+    _write_plugin(
+        tmp_path,
+        "embedding",
+        "debug",
+        {
+            "name": "debug",
+            "type": "embedding",
+            "entry": {"module": "provider.py", "factory": "create_provider"},
+        },
+        files={"provider.py": _EMBEDDING_MODULE},
+    )
 
     assembly = assemble_plugins(tmp_path)
     assert [manifest.name for manifest, _ in assembly.hooks] == ["recorder"]
@@ -379,6 +415,9 @@ def test_assemble_plugins_groups_by_kind(tmp_path) -> None:
     assert [manifest.name for manifest, _ in assembly.tools] == ["text"]
     assert [plugin.manifest.name for plugin in assembly.models] == ["deepseek"]
     assert [plugin.manifest.name for plugin in assembly.skills] == ["code-review"]
+    assert [plugin.manifest.name for plugin in assembly.sessions] == ["jsonl"]
+    assert [plugin.manifest.name for plugin in assembly.memories] == ["jsonl"]
+    assert [plugin.manifest.name for plugin in assembly.embeddings] == ["debug"]
 
 
 _MODEL_MODULE = """
@@ -490,3 +529,170 @@ def test_load_skill_plugins_rejects_bad_preload_type(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="preload"):
         load_skill_plugins(tmp_path)
+
+
+_SESSION_MODULE = """
+from core.session import SessionStore
+
+
+class FakeStore(SessionStore):
+    async def load(self, session_id):
+        return []
+
+    async def save(self, session_id, messages):
+        pass
+
+    async def load_checkpoint(self, session_id):
+        return None
+
+    async def save_checkpoint(self, session_id, snapshot):
+        pass
+
+    async def delete_checkpoint(self, session_id):
+        pass
+
+
+def create_store(plugin_dir):
+    return FakeStore()
+"""
+
+
+def _session_manifest(name: str = "memory") -> dict:
+    return {
+        "name": name,
+        "type": "session",
+        "entry": {"module": "store.py", "factory": "create_store"},
+    }
+
+
+def test_load_session_plugins_is_lazy_and_create_returns_store(tmp_path) -> None:
+    _write_plugin(
+        tmp_path, "session", "memory", _session_manifest(), files={"store.py": _SESSION_MODULE}
+    )
+    plugins = load_session_plugins(tmp_path)
+    assert len(plugins) == 1
+    store = plugins[0].create()
+    assert type(store).__name__ == "FakeStore"
+
+
+def test_session_plugin_create_rejects_bad_factory_return(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "session",
+        "bad",
+        _session_manifest(name="bad"),
+        files={"store.py": "def create_store(plugin_dir):\n    return 42\n"},
+    )
+    plugin = load_session_plugins(tmp_path)[0]
+    with pytest.raises(ValueError, match="SessionStore"):
+        plugin.create()
+
+
+_MEMORY_MODULE = """
+from core.memory import MemoryStore
+
+
+class FakeMemory(MemoryStore):
+    async def list_notes(self):
+        return []
+
+    async def add_note(self, content, tags):
+        pass
+
+    async def delete_note(self, note_id):
+        return False
+
+    async def update_note(self, note_id, content=None, tags=None):
+        return None
+
+    async def search_notes(self, query):
+        return []
+
+
+def create_store(plugin_dir):
+    return FakeMemory()
+"""
+
+
+def test_load_memory_plugins_is_lazy_and_create_returns_store(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "memory",
+        "jsonl",
+        {
+            "name": "jsonl",
+            "type": "memory",
+            "entry": {"module": "store.py", "factory": "create_store"},
+        },
+        files={"store.py": _MEMORY_MODULE},
+    )
+    plugins = load_memory_plugins(tmp_path)
+    assert len(plugins) == 1
+    store = plugins[0].create()
+    assert type(store).__name__ == "FakeMemory"
+
+
+def test_memory_plugin_create_rejects_bad_factory_return(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "memory",
+        "bad",
+        {
+            "name": "bad",
+            "type": "memory",
+            "entry": {"module": "store.py", "factory": "create_store"},
+        },
+        files={"store.py": "def create_store(plugin_dir):\n    return 42\n"},
+    )
+    plugin = load_memory_plugins(tmp_path)[0]
+    with pytest.raises(ValueError, match="MemoryStore"):
+        plugin.create()
+
+
+_EMBEDDING_MODULE = """
+from core.embedding import EmbeddingProvider
+
+
+class FakeEmbedding(EmbeddingProvider):
+    async def embed(self, texts):
+        return [[0.1, 0.2]] * len(texts)
+
+
+def create_provider(plugin_dir):
+    return FakeEmbedding()
+"""
+
+
+def test_load_embedding_plugins_is_lazy_and_create_returns_provider(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "embedding",
+        "debug",
+        {
+            "name": "debug",
+            "type": "embedding",
+            "entry": {"module": "provider.py", "factory": "create_provider"},
+        },
+        files={"provider.py": _EMBEDDING_MODULE},
+    )
+    plugins = load_embedding_plugins(tmp_path)
+    assert len(plugins) == 1
+    provider = plugins[0].create()
+    assert type(provider).__name__ == "FakeEmbedding"
+
+
+def test_embedding_plugin_create_rejects_bad_factory_return(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "embedding",
+        "bad",
+        {
+            "name": "bad",
+            "type": "embedding",
+            "entry": {"module": "provider.py", "factory": "create_provider"},
+        },
+        files={"provider.py": "def create_provider(plugin_dir):\n    return 42\n"},
+    )
+    plugin = load_embedding_plugins(tmp_path)[0]
+    with pytest.raises(ValueError, match="EmbeddingProvider"):
+        plugin.create()

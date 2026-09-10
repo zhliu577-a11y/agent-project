@@ -119,6 +119,8 @@ def test_repo_skill_plugin_is_discoverable_and_readable() -> None:
     root = Path(__file__).resolve().parents[1] / "plugins"
     skills = load_skill_plugins(root)
     by_name = {skill.manifest.name: skill for skill in skills}
-    assert "code-review" in by_name
+    assert {"code-review", "commit-message"} <= set(by_name)
     content = by_name["code-review"].content_path.read_text(encoding="utf-8")
     assert "代码评审技能" in content
+    commit_content = by_name["commit-message"].content_path.read_text(encoding="utf-8")
+    assert "提交信息规范技能" in commit_content

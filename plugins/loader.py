@@ -51,14 +51,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.embedding import EmbeddingProvider
 from core.hooks import LifecycleHooks
+from core.memory import MemoryStore
 from core.model import ModelAdapter
+from core.session import SessionStore
 from core.tool import Tool
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PLUGINS_DIR = Path(__file__).resolve().parent
-SUPPORTED_KINDS = ("mcp", "hook", "tool", "model", "skill")
+SUPPORTED_KINDS = (
+    "mcp",
+    "hook",
+    "tool",
+    "model",
+    "skill",
+    "session",
+    "memory",
+    "embedding",
+)
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -138,6 +150,69 @@ class SkillPlugin:
     manifest: PluginManifest
     content_path: Path
     preload: bool
+
+
+@dataclass(frozen=True)
+class SessionPlugin:
+    """会话存储插件：清单 + 惰性工厂，由 Harness 选定 SESSION_STORE 后创建。"""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> SessionStore:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            store = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: 会话存储工厂执行失败: {exc}") from exc
+        _expect(
+            isinstance(store, SessionStore),
+            where,
+            f"会话存储工厂必须返回 SessionStore 实例，实际是 {type(store).__name__}",
+        )
+        return store
+
+
+@dataclass(frozen=True)
+class MemoryPlugin:
+    """长期记忆存储插件：清单 + 惰性工厂，由 Harness 选定 MEMORY_STORE 后创建。"""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> MemoryStore:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            store = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: 记忆存储工厂执行失败: {exc}") from exc
+        _expect(
+            isinstance(store, MemoryStore),
+            where,
+            f"记忆存储工厂必须返回 MemoryStore 实例，实际是 {type(store).__name__}",
+        )
+        return store
+
+
+@dataclass(frozen=True)
+class EmbeddingPlugin:
+    """嵌入提供方插件：清单 + 惰性工厂，由 EMBEDDING_PROVIDER 选定后创建。"""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> EmbeddingProvider:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            provider = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: 嵌入提供方工厂执行失败: {exc}") from exc
+        _expect(
+            isinstance(provider, EmbeddingProvider),
+            where,
+            f"嵌入提供方工厂必须返回 EmbeddingProvider 实例，实际是 {type(provider).__name__}",
+        )
+        return provider
 
 
 def _expect(condition: bool, where: str, message: str) -> None:
@@ -373,6 +448,24 @@ def load_skill_plugin(manifest: PluginManifest) -> SkillPlugin:
     return SkillPlugin(manifest=manifest, content_path=content_path, preload=preload)
 
 
+def load_session_plugin(manifest: PluginManifest) -> SessionPlugin:
+    """校验单个会话存储插件并返回惰性工厂（不在此处实例化）。"""
+    factory = _load_entry_factory(manifest, "session")
+    return SessionPlugin(manifest=manifest, factory=factory)
+
+
+def load_memory_plugin(manifest: PluginManifest) -> MemoryPlugin:
+    """校验单个长期记忆插件并返回惰性工厂（不在此处实例化）。"""
+    factory = _load_entry_factory(manifest, "memory")
+    return MemoryPlugin(manifest=manifest, factory=factory)
+
+
+def load_embedding_plugin(manifest: PluginManifest) -> EmbeddingPlugin:
+    """校验单个嵌入提供方插件并返回惰性工厂（不在此处实例化）。"""
+    factory = _load_entry_factory(manifest, "embedding")
+    return EmbeddingPlugin(manifest=manifest, factory=factory)
+
+
 def _resolve_arg(plugin_dir: Path, arg: str) -> str:
     """插件目录下真实存在的相对路径参数 -> 绝对路径；其余参数原样保留。"""
     path = Path(arg)
@@ -444,6 +537,39 @@ def load_skill_plugins(root: str | Path | None = None) -> list[SkillPlugin]:
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
+def load_session_plugins(root: str | Path | None = None) -> list[SessionPlugin]:
+    """加载插件目录里全部启用的会话存储插件（惰性，不实例化）。"""
+    plugins: list[SessionPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "session":
+            continue
+        plugins.append(load_session_plugin(manifest))
+        logger.info("会话存储插件已发现: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
+def load_memory_plugins(root: str | Path | None = None) -> list[MemoryPlugin]:
+    """加载插件目录里全部启用的长期记忆插件（惰性，不实例化）。"""
+    plugins: list[MemoryPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "memory":
+            continue
+        plugins.append(load_memory_plugin(manifest))
+        logger.info("长期记忆插件已发现: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
+def load_embedding_plugins(root: str | Path | None = None) -> list[EmbeddingPlugin]:
+    """加载插件目录里全部启用的嵌入提供方插件（惰性，不实例化）。"""
+    plugins: list[EmbeddingPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "embedding":
+            continue
+        plugins.append(load_embedding_plugin(manifest))
+        logger.info("嵌入提供方插件已发现: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
 # ---------- kind 注册表与统一装配 ----------
 
 
@@ -456,6 +582,9 @@ class PluginAssembly:
     tools: list[tuple[PluginManifest, list[Tool]]] = field(default_factory=list)
     models: list[ModelPlugin] = field(default_factory=list)
     skills: list[SkillPlugin] = field(default_factory=list)
+    sessions: list[SessionPlugin] = field(default_factory=list)
+    memories: list[MemoryPlugin] = field(default_factory=list)
+    embeddings: list[EmbeddingPlugin] = field(default_factory=list)
 
 
 def _add_hook(manifest: PluginManifest, assembly: PluginAssembly) -> None:
@@ -478,6 +607,18 @@ def _add_skill(manifest: PluginManifest, assembly: PluginAssembly) -> None:
     assembly.skills.append(load_skill_plugin(manifest))
 
 
+def _add_session(manifest: PluginManifest, assembly: PluginAssembly) -> None:
+    assembly.sessions.append(load_session_plugin(manifest))
+
+
+def _add_memory(manifest: PluginManifest, assembly: PluginAssembly) -> None:
+    assembly.memories.append(load_memory_plugin(manifest))
+
+
+def _add_embedding(manifest: PluginManifest, assembly: PluginAssembly) -> None:
+    assembly.embeddings.append(load_embedding_plugin(manifest))
+
+
 # kind 注册表：新增插件类别 = SUPPORTED_KINDS 登记 type + 这里注册一个处理器，
 # 处理器把单个清单的产物放进 PluginAssembly 的对应字段。
 _KIND_HANDLERS: dict[str, Callable[[PluginManifest, PluginAssembly], None]] = {
@@ -486,6 +627,9 @@ _KIND_HANDLERS: dict[str, Callable[[PluginManifest, PluginAssembly], None]] = {
     "tool": _add_tool,
     "model": _add_model,
     "skill": _add_skill,
+    "session": _add_session,
+    "memory": _add_memory,
+    "embedding": _add_embedding,
 }
 
 

@@ -1,0 +1,16 @@
+{
+  "model": "deepseek",
+  "session": {
+    "store": "jsonl",
+    "id": "default"
+  },
+  "memory": {
+    "store": "sqlite"
+  },
+  "embedding": {
+    "provider": "debug"
+  },
+  "context": {
+    "maxTokens": 20000
+  }
+}

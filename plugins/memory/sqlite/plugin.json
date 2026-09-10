@@ -1,0 +1,11 @@
+{
+  "name": "sqlite",
+  "type": "memory",
+  "version": "1.0.0",
+  "description": "SQLite 长期记忆：事务 + WAL + 参数化查询，面向生产的默认后端",
+  "enabled": true,
+  "entry": {
+    "module": "store.py",
+    "factory": "create_store"
+  }
+}

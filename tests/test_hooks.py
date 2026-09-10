@@ -2,7 +2,11 @@
 import pytest
 
 from core.hooks import HookGateway, LifecycleHooks
-from core.types import ToolCall, TurnContext
+from core.model import ModelAdapter
+from core.registry import ToolRegistry
+from core.tool import Tool
+from core.types import ModelResponse, ToolCall, TurnContext
+from loop import run_agent
 
 pytestmark = pytest.mark.asyncio
 
@@ -100,3 +104,53 @@ async def test_invalid_decision_counts_as_deny() -> None:
     gateway = HookGateway()
     gateway.add(Recording("weird", [], decision="maybe"))
     assert await gateway.tool_before(_ctx(), ToolCall(id="1", name="x", arguments={})) is False
+
+
+class EchoTool(Tool):
+    name = "echo"
+    description = "回显"
+    parameters = {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs):
+        return "executed"
+
+
+class AskGate(LifecycleHooks):
+    async def tool_before(self, ctx, tool_call):
+        return "ask"
+
+
+class FakeModel(ModelAdapter):
+    def __init__(self, script):
+        self._script = list(script)
+
+    async def complete(self, messages, tool_schemas, on_token=None) -> ModelResponse:
+        return self._script.pop(0)
+
+
+async def test_loop_passes_confirm_into_ask_fold() -> None:
+    confirmations: list[str] = []
+
+    async def confirm(ctx, tool_call) -> bool:
+        confirmations.append(tool_call.name)
+        return True
+
+    model = FakeModel(
+        [
+            ModelResponse(
+                content="",
+                tool_calls=[ToolCall(id="1", name="echo", arguments={})],
+            ),
+            ModelResponse(content="完成", tool_calls=[]),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    hooks = HookGateway()
+    hooks.add(AskGate())
+
+    ctx = await run_agent(model, registry, hooks, "你是助手", "执行", confirm=confirm)
+
+    assert confirmations == ["echo"]
+    assert any(message.content == "executed" for message in ctx.messages)
+    assert ctx.stop_reason == "done"

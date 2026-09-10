@@ -3,7 +3,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
-from core.hooks import HookGateway
+from core.hooks import ConfirmFn, HookGateway
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
 from core.types import Message, ModelResponse, ToolCall, TurnContext
@@ -22,15 +22,20 @@ async def run_agent(
     user_input: str,
     max_turns: int = 20,
     on_token: Callable[[str], None] | None = None,
+    history: list[Message] | None = None,
+    confirm: ConfirmFn | None = None,
 ) -> TurnContext:
-    """执行固定循环：调模型 → 执行工具 → 回填 → 直到模型不再请求工具。"""
+    """执行固定循环：调模型 → 执行工具 → 回填 → 直到模型不再请求工具。
+
+    history：本会话此前的消息（不含 system），用于多轮上下文延续。
+    """
     ctx = TurnContext(
-        messages=[
-            Message(role="system", content=system_prompt),
-            Message(role="user", content=user_input),
-        ],
+        messages=[Message(role="system", content=system_prompt)],
         max_turns=max_turns,
     )
+    if history:
+        ctx.messages.extend(history)
+    ctx.messages.append(Message(role="user", content=user_input))
     ctx.state.setdefault("fail_counts", {})  # 工具名 -> 连续失败次数
     ctx.state.setdefault("blocked_tools", set())  # 已禁用的工具名集合
 
@@ -60,7 +65,7 @@ async def run_agent(
         # 1) 权限检查：可能包含用户询问，逐个按顺序执行
         approved: list[ToolCall] = []
         for tc in resp.tool_calls:
-            allowed = await hooks.tool_before(ctx, tc)
+            allowed = await hooks.tool_before(ctx, tc, confirm=confirm)
             if not allowed:
                 reason = "工具调用被权限策略拒绝"
                 await hooks.tool_after(ctx, tc, reason, False)

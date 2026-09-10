@@ -24,6 +24,14 @@
   `AGENT_MODEL` 环境变量即可切换模型提供方
 - **技能插件**：纯内容插件（`plugins/skills/*`）按需注入操作说明——启动只放
   目录条目，模型需要时用 `use_skill` 读取完整正文（渐进披露）
+- **会话插件**：短期记忆插件化（`plugins/session/*`）——同一会话多轮历史
+  自动延续，退出后按 `SESSION_ID` 恢复
+- **长期记忆插件**：跨会话语义笔记（`plugins/memory/*`），模型通过
+  `remember / recall / forget` 主动读写
+- **上下文模块**：token 估算 + 每轮自动裁剪（`CONTEXT_MAX_TOKENS`），
+  历史只增不减的问题有解
+- **FastAPI 接口**：无头 Harness（chat / 会话历史 / 记忆 / 插件概览），
+  给前端和其它客户端调用
 - 按需挂载：模型通过 `use_plugin` 让网关挂载插件，避免无谓的进程与上下文开销
 - 权限钩子插件示例：`allow / ask / deny` 策略随插件文件夹走，支持通配符
 - 配置文件带 schema 校验：写错清单/策略启动即报错，绝不静默出错
@@ -98,9 +106,24 @@ plugins/
 │       ├── plugin.json
 │       └── model.py
 ├── skills/                     # 技能插件（纯内容，不执行代码）
-│   └── code-review/
+│   ├── code-review/            #   代码评审规范
+│   └── commit-message/         #   Git 提交信息规范
 │       ├── plugin.json         #   { "type": "skill", ... }
 │       └── SKILL.md            #   模型按需读取的完整说明
+├── session/                    # 会话存储插件（短期记忆）
+│   ├── jsonl/                  #   文件持久化（默认，重启可恢复）
+│   └── inmemory/               #   纯内存（重启即失，测试/临时用）
+│       ├── plugin.json         #   { "type": "session", ... }
+│       └── store.py            #   SessionStore 实现
+├── memory/                     # 长期记忆插件（跨会话语义笔记）
+│   ├── sqlite/                 #   生产默认：事务 + WAL + 参数化查询
+│   ├── jsonl/                  #   人眼可读的示例后端
+│   └── vector/                 #   语义检索后端（存 embedding + 余弦排序）
+│       ├── plugin.json         #   { "type": "memory", ... }
+│       └── store.py            #   MemoryStore 实现
+├── embedding/                  # 嵌入提供方插件（向量记忆后端使用）
+│   ├── debug/                  #   确定性哈希（离线开发/测试）
+│   └── openai-embedding/       #   OpenAI API（真实语义，需 OPENAI_API_KEY）
 └── hooks/                      # 生命周期钩子插件
     └── permission/             #   权限策略示例（allow/ask/deny）
         ├── plugin.json
@@ -122,7 +145,7 @@ plugins/
 ```
 
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
-`mcp` / `hook` / `tool` / `model` / `skill`（未来可扩展 session 等类别）；`enabled: false` 的插件
+`mcp` / `hook` / `tool` / `model` / `skill` / `session` / `memory` / `embedding`；`enabled: false` 的插件
 结构仍会校验但不会加载。可选字段 `priority`（整数，默认 `0`）决定钩子插件的
 执行顺序：**越小越先执行**。字段写错启动即报错。
 
@@ -210,6 +233,68 @@ plugins/
 
 完整示例见 `plugins/skills/code-review/`。
 
+### 会话存储插件（`type: "session"`）
+
+```json
+{
+  "name": "jsonl",
+  "type": "session",
+  "entry": { "module": "store.py", "factory": "create_store" }
+}
+```
+
+会话插件实现 `core.session.SessionStore`（`load` / `save`），是短期记忆的
+存储后端：
+
+- `SESSION_STORE`（默认 `jsonl`）选择激活的存储插件，语义与 `AGENT_MODEL` 一致；
+- 同一会话内每轮历史自动延续（loop 的 `history` 参数），退出后同
+  `SESSION_ID`（默认 `default`）自动恢复；
+- jsonl 示例把消息写在 `SESSION_DATA_DIR`（默认项目下 `.sessions/`，
+  已 gitignore）——换存储 = 复制 `plugins/session/jsonl/` 改实现。
+
+### 长期记忆插件（`type: "memory"`）
+
+```json
+{
+  "name": "jsonl",
+  "type": "memory",
+  "entry": { "module": "store.py", "factory": "create_store" }
+}
+```
+
+实现 `core.memory.MemoryStore`（`add_note` / `search_notes` / `delete_note`）。
+默认后端是 **sqlite**（生产方向：事务 + WAL + busy_timeout + 参数化 SQL，
+数据文件 `MEMORY_DB_PATH`，默认 `.memory/memory.db`）；`jsonl` 作为人眼可读的
+示例后端（`.memory/memory.jsonl`）。换后端只改 `MEMORY_STORE`。
+
+**语义检索后端**：`MEMORY_STORE=vector` 时，笔记会额外保存 embedding 向量，
+`recall` 先把 query 转成向量、按余弦相似度取 Top-K；相似度低于阈值自动回退
+子串/标签搜索。嵌入来源由 `EMBEDDING_PROVIDER` 选择：`debug`（确定性哈希，
+离线跑通链路）或 `openai-embedding`（真实语义，需 `OPENAI_API_KEY`）。
+模型侧提供三个工具：
+
+- `remember(content, tags?)`：把跨会话值得记住的事实写成笔记；
+- `recall(query?)`：按内容/标签检索（当前为子串/标签匹配）并返回笔记；
+- `update_note(note_id, content?, tags?)`：更新已有笔记（字段可省略）；
+- `forget(note_id)`：删除过期笔记。
+
+它们和普通工具一样过权限/审计钩子。
+
+### 上下文模块与 HTTP 接口
+
+- 上下文预算：`CONTEXT_MAX_TOKENS`（默认 20000），每轮请求前按
+  “丢最旧、保最近”裁剪历史，裁剪数量会打日志；
+- HTTP 接口（FastAPI）：
+
+```powershell
+.venv\Scripts\python.exe -m api.main   # 默认 http://127.0.0.1:8000，文档在 /docs
+```
+
+主要端点：`POST /chat`、`GET /sessions/{id}/history`、
+`DELETE /sessions/{id}`、`GET /context/{id}`、记忆 CRUD
+（`/memory/notes`）、`GET /plugins` 概览。Web 模式没有交互弹窗，
+权限 `ask` 默认按拒绝处理。
+
 ### 钩子插件（`type: "hook"`）
 
 ```json
@@ -267,6 +352,19 @@ plugins/
 | `DEEPSEEK_TIMEOUT` | `60` | 单次模型请求超时（秒） |
 | `DEEPSEEK_MAX_RETRIES` | `3` | 模型请求重试次数（仅安全场景） |
 | `AGENT_MODEL` | `deepseek` | 激活的模型插件名（plugins/model/* 里选） |
+| `SESSION_STORE` | `jsonl` | 激活的会话存储插件名（plugins/session/* 里选） |
+| `SESSION_ID` | `default` | 会话标识，同名会话自动恢复历史 |
+| `SESSION_DATA_DIR` | `.sessions/` | jsonl 会话数据目录 |
+| `MEMORY_STORE` | `sqlite` | 激活的长期记忆插件名（plugins/memory/* 里选） |
+| `MEMORY_DB_PATH` | `.memory/memory.db` | sqlite 后端的数据文件路径 |
+| `MEMORY_DATA_DIR` | `.memory/` | jsonl 长期记忆数据目录 |
+| `MEMORY_VECTOR_DB_PATH` | `.memory/vector.db` | vector 后端数据文件 |
+| `EMBEDDING_PROVIDER` | `debug` | 嵌入提供方插件（plugins/embedding/* 里选） |
+| `VECTOR_SIMILARITY_THRESHOLD` | `0.2` | 低于该相似度则回退字面搜索 |
+| `VECTOR_TOP_K` | `3` | 语义检索最多返回条数 |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI 嵌入模型名 |
+| `CONTEXT_MAX_TOKENS` | `20000` | 单轮模型上下文预算（超出丢最旧历史） |
+| `API_HOST` / `API_PORT` | `127.0.0.1` / `8000` | FastAPI 监听地址/端口 |
 | `MCP_CONNECT_TIMEOUT` | `20` | MCP 插件连接超时（秒） |
 | `MCP_CALL_TIMEOUT` | `30` | 单次 MCP 工具调用超时（秒） |
 
@@ -322,4 +420,6 @@ lint + format 检查 + 全部测试。
 
 - 远程 HTTP MCP 插件（`transport: "http"` + URL + 服务器级信任）
 - 钩子事件扩展（用户输入提交前、会话开始/结束等，对齐 Codex/Claude Code 拦截点）
+- 长期记忆插件（`type: "memory"`：跨会话语义笔记 + recall 注入）
+- 上下文预算 hook（对话过长时自动截断/摘要）
 - MCP 网关进程化：把 `McpGateway` 换成独立代理进程/远程网关客户端（同一窄接口）

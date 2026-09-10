@@ -1,0 +1,11 @@
+{
+  "name": "jsonl",
+  "type": "session",
+  "version": "1.0.0",
+  "description": "JSONL 文件会话存储：每条消息一行，重启后按 SESSION_ID 恢复",
+  "enabled": true,
+  "entry": {
+    "module": "store.py",
+    "factory": "create_store"
+  }
+}

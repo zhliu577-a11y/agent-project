@@ -1,0 +1,11 @@
+{
+  "name": "commit-message",
+  "type": "skill",
+  "version": "1.0.0",
+  "description": "编写规范的 Git 提交信息（Conventional Commits 中文风格）",
+  "enabled": true,
+  "entry": {
+    "content": "SKILL.md",
+    "preload": false
+  }
+}
