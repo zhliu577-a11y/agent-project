@@ -377,6 +377,24 @@ plugins/
 
 ## 配置说明
 
+### `config.json`（中心配置，随仓库提交）
+
+只承载“选择型配置”，优先级 **环境变量 > config.json > 内置默认**；
+密钥与数据目录仍只放 `.env`。
+
+```json
+{
+  "model": "deepseek",
+  "session": { "store": "jsonl", "id": "default" },
+  "memory": { "store": "sqlite" },
+  "embedding": { "provider": "debug" },
+  "context": { "maxTokens": 20000 }
+}
+```
+
+对应字段写错启动即报错（`core/config.py` 校验）；想临时换后端，用环境变量
+覆盖即可（例如 `SESSION_STORE=inmemory`）。
+
 ### `.env`（密钥与环境，已 gitignore，绝不提交）
 
 | 变量 | 默认 | 说明 |
@@ -402,6 +420,19 @@ plugins/
 | `API_HOST` / `API_PORT` | `127.0.0.1` / `8000` | FastAPI 监听地址/端口 |
 | `MCP_CONNECT_TIMEOUT` | `20` | MCP 插件连接超时（秒） |
 | `MCP_CALL_TIMEOUT` | `30` | 单次 MCP 工具调用超时（秒） |
+| `MCP_CONNECT_RETRIES` | `0` | MCP 连接失败额外重试次数（指数退避，默认不重试） |
+
+### 日志追踪与状态快照（tracing / checkpoint）
+
+- **tracing**：日志行带 `[trace=xxxx]`——CLI 每轮对话一个 trace id，
+  FastAPI 每个请求一个（可用 `X-Trace-Id` 请求头传入，响应会回传同名头），
+  便于把散落的日志串成一条链路；
+- **checkpoint**：每轮结束把运行状态（`turn / stop_reason / state`）写入
+  `<SESSION_ID>.checkpoint.json`；API 用 `GET /sessions/{id}/checkpoint` 查看，
+  `DELETE /sessions/{id}` 清空会话时一并删除。它只存状态元数据，不含消息历史
+  （历史在 `<SESSION_ID>.jsonl`）；
+- **重试**：MCP 连接失败按 `MCP_CONNECT_RETRIES` 做指数退避；错误类别、插件
+  声明的错误码与重试判定见上文“错误分类与重试（边界翻译）”。
 
 ### 权限策略（`plugins/hooks/permission/permission.json`）
 
