@@ -213,6 +213,11 @@ plugins/
 `plugins/model/openai/` 目录改成自己的适配器（或直接设
 `AGENT_MODEL=openai` 并用 `OPENAI_*` 配置），互不影响。
 
+模型插件只负责**传输**（鉴权 / base_url / 请求体 / 取流）；把流式分片翻译成
+`ModelResponse` 的解析逻辑由内核 [core/parser.py] 提供（`ResponseParser` +
+`ToolCallAccumulator` + `OpenAICompatibleParser`），deepseek/openai 直接复用，
+新接 OpenAI 兼容 provider 不必再抄一遍解析代码。
+
 ### 技能插件（`type: "skill"`）
 
 ```json

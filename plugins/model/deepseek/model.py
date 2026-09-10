@@ -11,7 +11,8 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from core.model import ModelAdapter
-from core.types import Message, ModelResponse, ToolCall
+from core.parser import OpenAICompatibleParser
+from core.types import Message, ModelResponse
 
 
 def message_to_payload(msg: Message) -> dict[str, Any]:
@@ -76,45 +77,12 @@ class OpenAICompatModel(ModelAdapter):
             payload["tools"] = tool_schemas
             payload["tool_choice"] = "auto"
 
-        # 全程流式：文本增量即时回调；工具调用增量静默累积
+        # 传输在本插件，解析交给内核的 OpenAI 兼容 parser（core/parser.py）
         stream = await self._client.chat.completions.create(**payload, stream=True)
-
-        content_parts: list[str] = []
-        tool_calls_acc: dict[int, dict[str, str]] = {}
-        saw_tool_call = False
-
+        parser = OpenAICompatibleParser(on_token=on_token)
         async for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-
-            if delta.tool_calls:
-                saw_tool_call = True
-                for tc in delta.tool_calls:
-                    acc = tool_calls_acc.setdefault(
-                        tc.index, {"id": "", "name": "", "arguments": ""}
-                    )
-                    if tc.id:
-                        acc["id"] = tc.id
-                    if tc.function and tc.function.name:
-                        acc["name"] += tc.function.name
-                    if tc.function and tc.function.arguments:
-                        acc["arguments"] += tc.function.arguments
-
-            if delta.content:
-                content_parts.append(delta.content)
-                if on_token is not None and not saw_tool_call:
-                    on_token(delta.content)
-
-        tool_calls = [
-            ToolCall(
-                id=acc["id"] or f"call_{index}",
-                name=acc["name"],
-                arguments=json.loads(acc["arguments"] or "{}"),
-            )
-            for index, acc in sorted(tool_calls_acc.items())
-        ]
-        return ModelResponse(content="".join(content_parts), tool_calls=tool_calls)
+            parser.feed(chunk)
+        return parser.finalize()
 
 
 def create_model(plugin_dir):
