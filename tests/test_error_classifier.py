@@ -252,11 +252,3 @@ async def test_loop_tool_failure_includes_category_for_agent() -> None:
 
     ctx = await run_agent(model, tools, HookGateway(), "系统", "试试")
     assert any("错误类别: tool" in message.content for message in ctx.messages)
-
-
-def test_api_status_mapping_covers_categories() -> None:
-    from api.main import _ERROR_STATUS
-
-    assert _ERROR_STATUS["retryable"] == 503
-    assert _ERROR_STATUS["config"] == 400
-    assert _ERROR_STATUS["model"] == 502

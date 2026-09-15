@@ -8,7 +8,6 @@
 import asyncio
 import logging
 import os
-from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -33,6 +32,7 @@ from gateways.session_gateway import SessionGateway
 from gateways.skill_gateway import SkillGateway, UseSkill
 from loop import run_agent
 from plugins.loader import assemble_plugins, attach_listener_plugins
+from plugins.manager import PluginManager
 
 logger = logging.getLogger("main")
 
@@ -124,11 +124,11 @@ async def main() -> None:
     load_dotenv()
     config = AppConfig.load()
     os.environ.setdefault("EMBEDDING_PROVIDER", config.embedding_provider)
-    plugins_dir = Path(__file__).resolve().parent / "plugins"
-
     # 0. 装配插件：写错清单/入口立刻报错退出，而不是静默出错
     try:
-        assembly = assemble_plugins(plugins_dir)
+        plugin_manager = PluginManager()
+        plugin_roots = plugin_manager.runtime_roots()
+        assembly = assemble_plugins(plugin_roots)
     except ValueError as exc:
         logger.error("插件装配失败: %s", exc)
         return

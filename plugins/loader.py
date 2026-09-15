@@ -62,7 +62,7 @@ import json
 import logging
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -123,6 +123,28 @@ class PluginContribution:
     @property
     def kind(self) -> str:
         return self.manifest.type
+
+
+@dataclass(frozen=True)
+class PackageInspection:
+    """静态检查后的插件包；不会导入或执行插件代码。"""
+
+    name: str
+    version: str
+    description: str
+    directory: Path
+    manifests: tuple[PluginManifest, ...]
+
+    @property
+    def contributions(self) -> tuple[PluginContribution, ...]:
+        return tuple(
+            PluginContribution(
+                package_name=manifest.package_name or manifest.name,
+                contribution_id=manifest.contribution_id or "default",
+                manifest=manifest,
+            )
+            for manifest in self.manifests
+        )
 
 
 @dataclass(frozen=True)
@@ -607,36 +629,37 @@ def discover_contributions(root: str | Path | None = None) -> list[PluginContrib
     discovery 只读磁盘，不导入代码、不连接服务。结构仍会校验：即便
     disabled，写错的清单也会抛 ValueError，绝不静默出错。
     """
-    root = Path(root) if root is not None else DEFAULT_PLUGINS_DIR
-    if not root.exists():
-        logger.warning("插件目录不存在，跳过: %s", root)
-        return []
-
+    roots = _normalize_roots(root)
     contributions: list[PluginContribution] = []
     package_directories: dict[str, Path] = {}
-    for manifest_path in _iter_manifest_paths(root):
-        raw = _read_manifest(manifest_path)
-        manifests = (
-            _parse_package_contributions(manifest_path, raw)
-            if "contributes" in raw
-            else [_parse_manifest(manifest_path)]
-        )
-        for manifest in manifests:
-            if manifest.package_name is not None:
-                previous = package_directories.get(manifest.package_name)
-                if previous is not None and previous != manifest.directory:
-                    raise ValueError(
-                        f"功能包重名（{manifest.package_name}）: {previous} / {manifest.directory}"
+    for plugin_root in roots:
+        if not plugin_root.exists():
+            logger.warning("插件目录不存在，跳过: %s", plugin_root)
+            continue
+        for manifest_path in _iter_manifest_paths(plugin_root):
+            raw = _read_manifest(manifest_path)
+            manifests = (
+                _parse_package_contributions(manifest_path, raw)
+                if "contributes" in raw
+                else [_parse_manifest(manifest_path)]
+            )
+            for manifest in manifests:
+                if manifest.package_name is not None:
+                    previous = package_directories.get(manifest.package_name)
+                    if previous is not None and previous != manifest.directory:
+                        raise ValueError(
+                            f"功能包重名（{manifest.package_name}）: "
+                            f"{previous} / {manifest.directory}"
+                        )
+                    package_directories[manifest.package_name] = manifest.directory
+                if manifest.enabled:
+                    contributions.append(
+                        PluginContribution(
+                            package_name=manifest.package_name or manifest.name,
+                            contribution_id=manifest.contribution_id or "default",
+                            manifest=manifest,
+                        )
                     )
-                package_directories[manifest.package_name] = manifest.directory
-            if manifest.enabled:
-                contributions.append(
-                    PluginContribution(
-                        package_name=manifest.package_name or manifest.name,
-                        contribution_id=manifest.contribution_id or "default",
-                        manifest=manifest,
-                    )
-                )
 
     seen: set[tuple[str, str]] = set()
     for contribution in contributions:
@@ -652,7 +675,103 @@ def discover_contributions(root: str | Path | None = None) -> list[PluginContrib
     )
 
 
-def discover_plugins(root: str | Path | None = None) -> list[PluginManifest]:
+def _normalize_roots(root: str | Path | Sequence[str | Path] | None) -> list[Path]:
+    if root is None:
+        return [DEFAULT_PLUGINS_DIR]
+    if isinstance(root, (str, Path)):
+        return [Path(root)]
+    return [Path(item) for item in root]
+
+
+def inspect_package(root: str | Path) -> PackageInspection:
+    """静态读取并校验一个插件目录，不导入任何插件代码。"""
+    package_dir = Path(root).resolve()
+    manifest_path = package_dir / "plugin.json"
+    raw = _read_manifest(manifest_path)
+    if "contributes" in raw:
+        manifests = tuple(_parse_package_contributions(manifest_path, raw))
+        name = raw["name"]
+        version = raw.get("version", "")
+        description = raw.get("description", "")
+    else:
+        manifest = _parse_manifest(manifest_path)
+        manifests = (manifest,)
+        name = manifest.name
+        version = manifest.version
+        description = manifest.description
+
+    for manifest in manifests:
+        _validate_static_entry(manifest)
+    return PackageInspection(
+        name=name,
+        version=version,
+        description=description,
+        directory=package_dir,
+        manifests=manifests,
+    )
+
+
+def _validate_static_entry(manifest: PluginManifest) -> None:
+    """校验入口文件存在且位于插件目录内，但不导入模块、不执行工厂。"""
+    where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
+    entry = manifest.entry
+    if manifest.type in {
+        "hook",
+        "tool",
+        "model",
+        "session",
+        "memory",
+        "embedding",
+        "listener",
+    }:
+        module_rel = entry.get("module")
+        factory_name = entry.get("factory")
+        _expect(
+            isinstance(module_rel, str) and module_rel.strip(),
+            where,
+            f"{manifest.type} 插件必须在 entry 里声明非空 'module'",
+        )
+        _expect(
+            isinstance(factory_name, str) and factory_name.strip(),
+            where,
+            f"{manifest.type} 插件必须在 entry 里声明非空 'factory'",
+        )
+        module_path = _resolve_inside(manifest.directory, module_rel, where)
+        _expect(module_path.is_file(), where, f"入口模块不存在: {module_path}")
+    elif manifest.type == "skill":
+        content_rel = entry.get("content", "SKILL.md")
+        _expect(
+            isinstance(content_rel, str) and content_rel.strip(),
+            where,
+            "skill 插件必须在 entry 里声明非空 'content'",
+        )
+        content_path = _resolve_inside(manifest.directory, content_rel, where)
+        _expect(content_path.is_file(), where, f"正文文件不存在: {content_path}")
+    elif manifest.type == "mcp":
+        transport = entry.get("transport", "stdio")
+        _expect(transport == "stdio", where, f"不支持的 transport: {transport}")
+        command = entry.get("command")
+        _expect(isinstance(command, str) and command.strip(), where, "缺少非空 'command'")
+        args = entry.get("args", [])
+        _expect(
+            isinstance(args, list) and all(isinstance(item, str) for item in args),
+            where,
+            "'args' 必须是字符串数组",
+        )
+
+
+def _resolve_inside(base: Path, relative: str, where: str) -> Path:
+    path = (base / relative).resolve()
+    try:
+        path.relative_to(base.resolve())
+    except ValueError as exc:
+        raise ValueError(f"{where}: 入口路径越出插件目录: {relative}") from exc
+    return path
+
+
+def discover_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+) -> list[PluginManifest]:
     """Backward-compatible projection: return normalized contribution manifests."""
     return [contribution.manifest for contribution in discover_contributions(root)]
 
@@ -828,7 +947,7 @@ def _resolve_arg(plugin_dir: Path, arg: str) -> str:
 
 
 def load_hook_plugins(
-    root: str | Path | None = None,
+    root: str | Path | Sequence[str | Path] | None = None,
 ) -> list[tuple[PluginManifest, LifecycleHooks]]:
     """加载插件目录里全部启用的钩子插件，返回 (清单, 实例) 列表。"""
     hooks: list[tuple[PluginManifest, LifecycleHooks]] = []
@@ -841,7 +960,9 @@ def load_hook_plugins(
     return sorted(hooks, key=lambda pair: (pair[0].priority, pair[0].name))
 
 
-def load_mcp_plugins(root: str | Path | None = None) -> list[McpPluginSpec]:
+def load_mcp_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+) -> list[McpPluginSpec]:
     """加载插件目录里全部启用的 MCP 插件，产出可直接连接的规格。"""
     specs: list[McpPluginSpec] = []
     for manifest in discover_plugins(root):
@@ -853,7 +974,7 @@ def load_mcp_plugins(root: str | Path | None = None) -> list[McpPluginSpec]:
 
 
 def load_tool_plugins(
-    root: str | Path | None = None,
+    root: str | Path | Sequence[str | Path] | None = None,
 ) -> list[tuple[PluginManifest, list[Tool]]]:
     """加载插件目录里全部启用的本地工具插件，返回 (清单, 工具列表)。"""
     plugins: list[tuple[PluginManifest, list[Tool]]] = []
@@ -865,7 +986,9 @@ def load_tool_plugins(
     return sorted(plugins, key=lambda pair: pair[0].name)
 
 
-def load_model_plugins(root: str | Path | None = None) -> list[ModelPlugin]:
+def load_model_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+) -> list[ModelPlugin]:
     """加载插件目录里全部启用的模型插件，返回惰性规格（不实例化）。"""
     plugins: list[ModelPlugin] = []
     for manifest in discover_plugins(root):
@@ -876,7 +999,9 @@ def load_model_plugins(root: str | Path | None = None) -> list[ModelPlugin]:
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
-def load_skill_plugins(root: str | Path | None = None) -> list[SkillPlugin]:
+def load_skill_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+) -> list[SkillPlugin]:
     """加载插件目录里全部启用的技能插件（零副作用：不读正文、不执行）。"""
     plugins: list[SkillPlugin] = []
     for manifest in discover_plugins(root):
@@ -887,7 +1012,9 @@ def load_skill_plugins(root: str | Path | None = None) -> list[SkillPlugin]:
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
-def load_session_plugins(root: str | Path | None = None) -> list[SessionPlugin]:
+def load_session_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+) -> list[SessionPlugin]:
     """加载插件目录里全部启用的会话存储插件（惰性，不实例化）。"""
     plugins: list[SessionPlugin] = []
     for manifest in discover_plugins(root):
@@ -898,7 +1025,9 @@ def load_session_plugins(root: str | Path | None = None) -> list[SessionPlugin]:
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
-def load_memory_plugins(root: str | Path | None = None) -> list[MemoryPlugin]:
+def load_memory_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+) -> list[MemoryPlugin]:
     """加载插件目录里全部启用的长期记忆插件（惰性，不实例化）。"""
     plugins: list[MemoryPlugin] = []
     for manifest in discover_plugins(root):
@@ -909,7 +1038,9 @@ def load_memory_plugins(root: str | Path | None = None) -> list[MemoryPlugin]:
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
-def load_embedding_plugins(root: str | Path | None = None) -> list[EmbeddingPlugin]:
+def load_embedding_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+) -> list[EmbeddingPlugin]:
     """加载插件目录里全部启用的嵌入提供方插件（惰性，不实例化）。"""
     plugins: list[EmbeddingPlugin] = []
     for manifest in discover_plugins(root):
@@ -920,7 +1051,9 @@ def load_embedding_plugins(root: str | Path | None = None) -> list[EmbeddingPlug
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
-def load_listener_plugins(root: str | Path | None = None) -> list[ListenerPlugin]:
+def load_listener_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+) -> list[ListenerPlugin]:
     """加载插件目录里全部启用的 listener 插件（惰性，不实例化）。"""
     plugins: list[ListenerPlugin] = []
     for manifest in discover_plugins(root):
@@ -1025,7 +1158,9 @@ def attach_listener_plugins(
     return tokens
 
 
-def assemble_plugins(root: str | Path | None = None) -> PluginAssembly:
+def assemble_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+) -> PluginAssembly:
     """扫描目录并把全部 enabled contribution 按 kind 装配成 PluginAssembly。
 
     这是 Harness 启动器的统一装配入口；main.py 不感知具体插件类别。

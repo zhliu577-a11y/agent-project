@@ -14,6 +14,7 @@ from plugins.loader import (
     assemble_plugins,
     discover_contributions,
     discover_plugins,
+    inspect_package,
     load_embedding_plugins,
     load_hook_plugins,
     load_mcp_plugins,
@@ -841,6 +842,66 @@ def test_disabled_package_is_validated_but_not_returned(tmp_path) -> None:
         {"SKILL.md": "# lint\n"},
     )
     assert discover_contributions(tmp_path) == []
+
+
+def test_inspect_package_validates_entries_without_importing_code(tmp_path) -> None:
+    package_dir = _write_package(
+        tmp_path,
+        "quality",
+        {
+            "apiVersion": "1",
+            "name": "quality",
+            "version": "1.0.0",
+            "contributes": [
+                {
+                    "id": "lint",
+                    "kind": "skill",
+                    "entry": {"content": "SKILL.md"},
+                }
+            ],
+        },
+        {"SKILL.md": "# lint\n"},
+    )
+
+    inspection = inspect_package(package_dir)
+
+    assert inspection.name == "quality"
+    assert inspection.version == "1.0.0"
+    assert [manifest.name for manifest in inspection.manifests] == ["quality--lint"]
+    assert [item.contribution_id for item in inspection.contributions] == ["lint"]
+
+
+def test_inspect_package_rejects_entry_outside_package(tmp_path) -> None:
+    package_dir = _write_package(
+        tmp_path,
+        "escape",
+        {
+            "apiVersion": "1",
+            "name": "escape",
+            "contributes": [
+                {
+                    "id": "lint",
+                    "kind": "skill",
+                    "entry": {"content": "../outside.md"},
+                }
+            ],
+        },
+        {},
+    )
+
+    with pytest.raises(ValueError, match="越出插件目录"):
+        inspect_package(package_dir)
+
+
+def test_discover_accepts_multiple_plugin_roots(tmp_path) -> None:
+    first = tmp_path / "builtins"
+    second = tmp_path / "installed"
+    _write_plugin(first, "mcp", "time", _mcp_manifest())
+    _write_plugin(second, "mcp", "math", _mcp_manifest(name="math"))
+
+    manifests = discover_plugins([first, second])
+
+    assert [manifest.name for manifest in manifests] == ["math", "time"]
 
 
 def test_package_rejects_unknown_contribution_kind_even_when_disabled(tmp_path) -> None:

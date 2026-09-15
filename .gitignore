@@ -10,4 +10,6 @@ __pycache__/
 .memory/
 .events/
 timeline.jsonl
+data/plugin-registry.json
+data/plugin-store/
 .env

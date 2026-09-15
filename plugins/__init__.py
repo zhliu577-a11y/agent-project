@@ -17,6 +17,7 @@ from plugins.loader import (
     MemoryPlugin,
     ModelPlugin,
     NamespacedTool,
+    PackageInspection,
     PluginAssembly,
     PluginContribution,
     PluginManifest,
@@ -26,6 +27,7 @@ from plugins.loader import (
     attach_listener_plugins,
     discover_contributions,
     discover_plugins,
+    inspect_package,
     load_embedding_plugin,
     load_embedding_plugins,
     load_hook_plugin,
@@ -46,6 +48,8 @@ from plugins.loader import (
     register_kind,
     registered_kinds,
 )
+from plugins.manager import PluginManager
+from plugins.registry import PluginRecord, PluginRegistry
 
 __all__ = [
     "DEFAULT_PLUGINS_DIR",
@@ -58,15 +62,20 @@ __all__ = [
     "MemoryPlugin",
     "ModelPlugin",
     "NamespacedTool",
+    "PackageInspection",
     "PluginAssembly",
     "PluginContribution",
     "PluginManifest",
+    "PluginManager",
+    "PluginRecord",
+    "PluginRegistry",
     "SessionPlugin",
     "SkillPlugin",
     "assemble_plugins",
     "attach_listener_plugins",
     "discover_contributions",
     "discover_plugins",
+    "inspect_package",
     "load_embedding_plugin",
     "load_embedding_plugins",
     "load_hook_plugin",

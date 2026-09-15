@@ -1,6 +1,6 @@
 # core/prompt.py —— Prompt 模板管理：系统提示词由目录数据统一组装
 #
-# CLI（main.py）与 FastAPI（api/main.py）共用本函数，避免两份提示词漂移。
+# CLI（main.py）调用本函数；未来其他前端共用同一提示词组装逻辑。
 
 
 def build_system_prompt(

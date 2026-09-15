@@ -33,8 +33,10 @@
   `remember / recall / forget` 主动读写
 - **上下文模块**：token 估算 + 每轮自动裁剪（`CONTEXT_MAX_TOKENS`），
   历史只增不减的问题有解
-- **FastAPI 接口**：无头 Harness（chat / 会话历史 / 记忆 / 插件概览），
-  给前端和其它客户端调用
+- **插件包生命周期**：外部目录或 zip 包经过静态检查、staging、摘要计算后原子安装；
+  安装后默认禁用，启停状态由 `data/plugin-registry.json` 管理
+- **CLI**：`python -m cli plugin ...` 提供 validate / install / enable / disable /
+  remove / list；后续网页前端复用同一套 `PluginManager`
 - 按需挂载：模型通过 `use_plugin` 让网关挂载插件，避免无谓的进程与上下文开销
 - 权限钩子插件示例：`allow / ask / deny` 策略随插件文件夹走，支持通配符
 - 配置文件带 schema 校验：写错清单/策略启动即报错，绝不静默出错
@@ -61,7 +63,8 @@
 └──────────────────────┘   └────────────────────────────────────────────┘
 ```
 
-运行链路：启动时扫描 `plugins/` → 钩子插件实例化进 `HookGateway`、本地工具
+运行链路：启动时扫描 `plugins/` 与 registry 中已启用的外部包 →
+钩子插件实例化进 `HookGateway`、本地工具
 直接注册进 `ToolRegistry`、MCP 插件只读清单 → 本地工具第一轮即可调用；MCP
 工具由模型决定调 `use_plugin` → 网关连接对应 MCP 插件并注册命名空间工具
 （都先过权限钩子闸门）→ 结果回填 → 模型给出最终回答。
@@ -185,8 +188,31 @@ plugins/
 `<包名>--<contribution-id>`，例如 `code-quality--lint`。`kind` 必须来自
 受信任核心代码注册的 kind；插件清单不能自行注册新的执行阶段。
 
-`GET /plugins` 会同时返回 `packages`、展开后的 `contributions`，以及按 kind
-归类的 `kinds` 视图。
+### 安装、启停与生命周期
+
+`plugin.json` 只描述插件包，不保存宿主的安装状态。外部插件包通过 CLI 安装：
+
+```powershell
+.venv\Scripts\python.exe -m cli plugin validate .\code-quality.zip
+.venv\Scripts\python.exe -m cli plugin install .\code-quality.zip
+.venv\Scripts\python.exe -m cli plugin enable code-quality
+.venv\Scripts\python.exe -m cli plugin list
+```
+
+宿主状态保存在 `data/plugin-registry.json`，包文件保存在
+`data/plugin-store/installed/<name>/<version>/`。安装流程为：
+
+```text
+validate -> staging -> 静态入口检查 -> sha256 -> 原子移动 -> registry
+```
+
+安装后默认 `disabled`；`enable / disable` 只修改 registry，不重写插件自带的
+`plugin.json`。第一版不做热加载，启停后需要重启或重建 Runtime 才生效。
+`remove` 先把目录移动到 `data/plugin-store/trash/`，便于后续审计或恢复。
+
+当前只接受目录和 zip。zip 解压会拒绝路径穿越和符号链接，并限制文件数量与
+总大小；入口路径也不能逃出插件包根目录。插件代码仍属于可信执行边界，这些
+检查不是沙箱，也不会自动安装插件依赖。
 
 ### MCP 插件（`type: "mcp"`）
 
@@ -324,20 +350,10 @@ plugins/
 
 它们和普通工具一样过权限/审计钩子。
 
-### 上下文模块与 HTTP 接口
+### 上下文模块
 
 - 上下文预算：`CONTEXT_MAX_TOKENS`（默认 20000），每轮请求前按
-  “丢最旧、保最近”裁剪历史，裁剪数量会打日志；
-- HTTP 接口（FastAPI）：
-
-```powershell
-.venv\Scripts\python.exe -m api.main   # 默认 http://127.0.0.1:8000，文档在 /docs
-```
-
-主要端点：`POST /chat`、`GET /sessions/{id}/history`、
-`DELETE /sessions/{id}`、`GET /context/{id}`、记忆 CRUD
-（`/memory/notes`）、`GET /plugins` 概览。Web 模式没有交互弹窗，
-权限 `ask` 默认按拒绝处理。
+  “丢最旧、保最近”裁剪历史，裁剪数量会打日志。
 
 ### 错误分类与重试（边界翻译）
 
@@ -350,9 +366,8 @@ plugins/
 - 映射规则：超时 / 连接错误 / 408 / 429 / 5xx → `RetryableError`；
   其它 HTTP 状态 → `ModelError`；`sqlite3.Error` → `ToolError`；
   `OSError` → `PluginError`；
-- 消费方：`retry_async`（重试判定）、loop（工具失败反馈会带上错误类别，
-  瞬时错误提示模型可稍后重试）、FastAPI（按类别映射 HTTP 状态码并返回
-  `category` 字段：400/502/503/500）。
+- 消费方：`retry_async`（重试判定）和 loop（工具失败反馈会带上错误类别，
+  瞬时错误提示模型可稍后重试）。
 
 **插件错误契约（声明式）**：插件可在 `plugin.json` 里声明已知错误，让调用方
 （尤其是模型）知道“会报什么、该怎么办”：
@@ -460,19 +475,16 @@ plugins/
 | `VECTOR_TOP_K` | `3` | 语义检索最多返回条数 |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI 嵌入模型名 |
 | `CONTEXT_MAX_TOKENS` | `20000` | 单轮模型上下文预算（超出丢最旧历史） |
-| `API_HOST` / `API_PORT` | `127.0.0.1` / `8000` | FastAPI 监听地址/端口 |
 | `MCP_CONNECT_TIMEOUT` | `20` | MCP 插件连接超时（秒） |
 | `MCP_CALL_TIMEOUT` | `30` | 单次 MCP 工具调用超时（秒） |
 | `MCP_CONNECT_RETRIES` | `0` | MCP 连接失败额外重试次数（指数退避，默认不重试） |
 
 ### 日志追踪与状态快照（tracing / checkpoint）
 
-- **tracing**：日志行带 `[trace=xxxx]`——CLI 每轮对话一个 trace id，
-  FastAPI 每个请求一个（可用 `X-Trace-Id` 请求头传入，响应会回传同名头），
+- **tracing**：日志行带 `[trace=xxxx]`，CLI 每轮对话一个 trace id，
   便于把散落的日志串成一条链路；
 - **checkpoint**：每轮结束把运行状态（`turn / stop_reason / state`）写入
-  `<SESSION_ID>.checkpoint.json`；API 用 `GET /sessions/{id}/checkpoint` 查看，
-  `DELETE /sessions/{id}` 清空会话时一并删除。它只存状态元数据，不含消息历史
+  `<SESSION_ID>.checkpoint.json`。它只存状态元数据，不含消息历史
   （历史在 `<SESSION_ID>.jsonl`）；
 - **重试**：MCP 连接失败按 `MCP_CONNECT_RETRIES` 做指数退避；错误类别、插件
   声明的错误码与重试判定见上文“错误分类与重试（边界翻译）”。
@@ -493,7 +505,7 @@ plugins/
 - `HookGateway.attach(bus)` 订阅观察事件并扇出给现有 hook 插件（**旧插件零迁移**），
   决策类 `tool.before` 仍由 HookGateway 直接承担；
 - `MemoryGateway` 发布 `memory.write / memory.update / memory.delete`；
-- CLI/API 发布 `session.start / session.end`，并在每轮输入前用
+- CLI 发布 `session.start / session.end`，并在每轮输入前用
   `user_prompt.submit` 决策事件（返回 `deny` 即拒绝本轮）；
 - 设置 `EVENT_LOG=<path>` 时自动订阅 `*`，把事件写成 JSONL 时间线。
 
@@ -541,6 +553,8 @@ bus.subscribe("tool.after", lambda event: print(event.name, event.payload["ok"])
 
 - **插件即信任边界**：MCP 插件可以是任意命令（python / node / npx / docker），
   钩子插件是任意 Python 代码；只应安装可信来源的插件；
+- **安装前受控检查**：zip 路径穿越、符号链接、包大小与入口逃逸会被拒绝；
+  这些检查降低误装风险，但不把插件变成沙箱内代码；
 - **按需挂载**：启动时只读清单、不连接任何服务器；模型通过 `use_plugin`
   触发连接，避免无谓的进程与上下文开销；
 - **工具级权限闸门**：loop 在每次工具执行前走 `tool_before`，任一钩子返回
@@ -572,6 +586,8 @@ lint + format 检查 + 全部测试。
 
 ## Roadmap
 
+- 网页前端：拖入目录/zip 后调用同一个 `PluginManager`，展示校验结果与启停状态
+- 插件更新与热重载：版本替换、运行时卸载与错误回滚
 - 远程 HTTP MCP 插件（`transport: "http"` + URL + 服务器级信任）
 - 钩子事件扩展（用户输入提交前、会话开始/结束等，对齐 Codex/Claude Code 拦截点）
 - 长期记忆插件（`type: "memory"`：跨会话语义笔记 + recall 注入）
