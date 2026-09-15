@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from config import AppConfig
 from core.hooks import LifecycleHooks
 from plugins import loader as plugin_loader
 from plugins.loader import (
@@ -741,6 +742,161 @@ def test_load_skill_plugins_rejects_bad_preload_type(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="preload"):
         load_skill_plugins(tmp_path)
+
+
+def test_load_skill_plugins_rejects_content_path_outside_plugin_dir(tmp_path) -> None:
+    secret = tmp_path / "skills" / "secret.md"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("secret", encoding="utf-8")
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "escape",
+        _skill_manifest(name="escape", entry={"content": "../secret.md"}),
+    )
+
+    with pytest.raises(ValueError, match="越出插件目录"):
+        load_skill_plugins(tmp_path)
+
+
+def test_load_skill_plugins_validates_resources_inside_plugin_dir(tmp_path) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path,
+        "skills",
+        "with-resource",
+        _skill_manifest(
+            name="with-resource",
+            entry={
+                "content": "SKILL.md",
+                "resources": [
+                    {"path": "references/api.md", "description": "API 参考"},
+                ],
+            },
+        ),
+        files={"SKILL.md": "# skill\n", "references/api.md": "# API\n"},
+    )
+
+    plugin = load_skill_plugins(tmp_path)[0]
+
+    assert len(plugin.resources) == 1
+    assert plugin.resources[0].path == "references/api.md"
+    assert plugin.resources[0].description == "API 参考"
+    assert plugin.resources[0].resolved_path == plugin_dir / "references" / "api.md"
+
+
+def test_load_skill_plugins_rejects_resource_path_outside_plugin_dir(tmp_path) -> None:
+    secret = tmp_path / "skills" / "secret.md"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("secret", encoding="utf-8")
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "escape",
+        _skill_manifest(
+            name="escape",
+            entry={
+                "content": "SKILL.md",
+                "resources": [{"path": "../secret.md"}],
+            },
+        ),
+        files={"SKILL.md": "# skill\n"},
+    )
+
+    with pytest.raises(ValueError, match="越出插件目录"):
+        load_skill_plugins(tmp_path)
+
+
+def test_load_skill_plugins_enforces_content_budget(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "large",
+        _skill_manifest(name="large"),
+        files={"SKILL.md": "12345"},
+    )
+
+    with pytest.raises(ValueError, match="正文超过大小预算"):
+        load_skill_plugins(tmp_path, AppConfig(skill_max_content_bytes=4))
+
+
+def test_load_skill_plugins_enforces_resource_budgets(tmp_path) -> None:
+    manifest = _skill_manifest(
+        name="large-resource",
+        entry={
+            "content": "SKILL.md",
+            "resources": [{"path": "references/api.md"}],
+        },
+    )
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "large-resource",
+        manifest,
+        files={"SKILL.md": "# skill\n", "references/api.md": "12345"},
+    )
+
+    with pytest.raises(ValueError, match="单文件大小预算"):
+        load_skill_plugins(tmp_path, AppConfig(skill_max_resource_bytes=4))
+
+
+def test_load_skill_plugins_enforces_resource_count_budget(tmp_path) -> None:
+    manifest = _skill_manifest(
+        name="many-resources",
+        entry={
+            "content": "SKILL.md",
+            "resources": [
+                {"path": "references/one.md"},
+                {"path": "references/two.md"},
+            ],
+        },
+    )
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "many-resources",
+        manifest,
+        files={
+            "SKILL.md": "# skill\n",
+            "references/one.md": "1",
+            "references/two.md": "2",
+        },
+    )
+
+    with pytest.raises(ValueError, match="资源数量超过预算"):
+        load_skill_plugins(tmp_path, AppConfig(skill_max_resources=1))
+
+
+def test_load_skill_plugins_enforces_resource_total_budget(tmp_path) -> None:
+    manifest = _skill_manifest(
+        name="total-resource",
+        entry={
+            "content": "SKILL.md",
+            "resources": [
+                {"path": "references/one.md"},
+                {"path": "references/two.md"},
+            ],
+        },
+    )
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "total-resource",
+        manifest,
+        files={
+            "SKILL.md": "# skill\n",
+            "references/one.md": "123",
+            "references/two.md": "456",
+        },
+    )
+
+    with pytest.raises(ValueError, match="资源总大小超过预算"):
+        load_skill_plugins(
+            tmp_path,
+            AppConfig(
+                skill_max_resource_bytes=3,
+                skill_max_resource_total_bytes=5,
+            ),
+        )
 
 
 _SESSION_MODULE = """

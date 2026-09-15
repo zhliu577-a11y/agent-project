@@ -3,13 +3,14 @@ from pathlib import Path
 
 import pytest
 
+from core.events import Event, EventBus
 from core.hooks import HookGateway
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
 from core.types import ModelResponse, ToolCall
 from gateways.skill_gateway import SkillGateway, UseSkill
 from loop import run_agent
-from plugins.loader import PluginManifest, SkillPlugin, load_skill_plugins
+from plugins.loader import PluginManifest, SkillPlugin, SkillResource, load_skill_plugins
 
 
 def _skill(
@@ -18,11 +19,30 @@ def _skill(
     description: str,
     content: str,
     preload: bool = False,
+    resources: tuple[tuple[str, str], ...] = (),
 ) -> SkillPlugin:
     plugin_dir = base / name
     plugin_dir.mkdir(parents=True, exist_ok=True)
     content_path = plugin_dir / "SKILL.md"
     content_path.write_text(content, encoding="utf-8")
+    raw_resources: list[dict[str, str]] = []
+    parsed_resources: list[SkillResource] = []
+    for resource_path, description in resources:
+        path = plugin_dir / resource_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {resource_path}\n", encoding="utf-8")
+        raw_resources.append({"path": resource_path, "description": description})
+        parsed_resources.append(
+            SkillResource(
+                path=resource_path,
+                description=description,
+                resolved_path=path,
+            )
+        )
+
+    entry: dict[str, object] = {"content": "SKILL.md", "preload": preload}
+    if raw_resources:
+        entry["resources"] = raw_resources
     manifest = PluginManifest(
         name=name,
         type="skill",
@@ -30,9 +50,14 @@ def _skill(
         description=description,
         enabled=True,
         directory=plugin_dir,
-        entry={"content": "SKILL.md", "preload": preload},
+        entry=entry,
     )
-    return SkillPlugin(manifest=manifest, content_path=content_path, preload=preload)
+    return SkillPlugin(
+        manifest=manifest,
+        content_path=content_path,
+        preload=preload,
+        resources=tuple(parsed_resources),
+    )
 
 
 def test_catalog_lists_name_and_description(tmp_path) -> None:
@@ -68,6 +93,110 @@ def test_get_unknown_skill_raises(tmp_path) -> None:
     gateway = SkillGateway([_skill(tmp_path, "review", "评审规范", "# 正文")])
     with pytest.raises(KeyError, match="未知技能"):
         gateway.get("missing")
+
+
+def test_get_enforces_content_budget(tmp_path) -> None:
+    gateway = SkillGateway(
+        [_skill(tmp_path, "review", "评审规范", "12345")],
+        max_content_bytes=4,
+    )
+
+    with pytest.raises(ValueError, match="超过大小预算"):
+        gateway.get("review")
+    assert gateway.error("review") is not None
+    assert gateway.is_loaded("review") is False
+
+
+def test_get_rechecks_content_path_boundary(tmp_path) -> None:
+    skill = _skill(tmp_path, "review", "评审规范", "# 正文")
+    outside = tmp_path / "secret.md"
+    outside.write_text("secret", encoding="utf-8")
+    escaped = SkillPlugin(
+        manifest=skill.manifest,
+        content_path=outside,
+        preload=False,
+    )
+    gateway = SkillGateway([escaped])
+
+    with pytest.raises(ValueError, match="越出插件目录"):
+        gateway.get("review")
+    assert gateway.error("review") is not None
+
+
+@pytest.mark.asyncio
+async def test_use_skill_enforces_resource_total_budget(tmp_path) -> None:
+    gateway = SkillGateway(
+        [
+            _skill(
+                tmp_path,
+                "review",
+                "评审规范",
+                "# 评审正文",
+                resources=(("references/security.md", "安全检查"),),
+            )
+        ],
+        max_resource_total_bytes=1,
+    )
+
+    result = await UseSkill(gateway).execute(
+        name="review",
+        resource="references/security.md",
+    )
+
+    assert "资源总大小超过预算" in result
+    assert gateway.error("review") is not None
+
+
+@pytest.mark.asyncio
+async def test_use_skill_lists_and_reads_resources(tmp_path) -> None:
+    gateway = SkillGateway(
+        [
+            _skill(
+                tmp_path,
+                "review",
+                "评审规范",
+                "# 评审正文",
+                resources=(("references/security.md", "安全检查"),),
+            )
+        ]
+    )
+    tool = UseSkill(gateway)
+
+    content = await tool.execute(name="review")
+    assert "references/security.md" in content
+    resource = await tool.execute(name="review", resource="references/security.md")
+    assert "# references/security.md" in resource
+    assert gateway.loaded_bytes("review") > 0
+
+
+@pytest.mark.asyncio
+async def test_use_skill_publishes_load_events(tmp_path) -> None:
+    gateway = SkillGateway(
+        [
+            _skill(
+                tmp_path,
+                "review",
+                "评审规范",
+                "# 评审正文",
+                resources=(("references/security.md", "安全检查"),),
+            )
+        ]
+    )
+    bus = EventBus()
+    events: list[Event] = []
+    bus.subscribe("*", events.append)
+    tool = UseSkill(gateway, events=bus)
+
+    await tool.execute(name="review")
+    await tool.execute(name="review")
+    await tool.execute(name="review", resource="references/security.md")
+    await tool.execute(name="review", resource="references/security.md")
+
+    assert [event.name for event in events] == [
+        "skill.loaded",
+        "skill.resource_loaded",
+    ]
+    assert events[0].payload["bytes"] == len("# 评审正文".encode())
 
 
 @pytest.mark.asyncio

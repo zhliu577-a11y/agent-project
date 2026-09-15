@@ -482,18 +482,30 @@ input items，并把 `response.output_text.delta` 与 function-call 事件解析
 {
   "name": "code-review",
   "type": "skill",
-  "entry": { "content": "SKILL.md", "preload": false }
+  "entry": {
+    "content": "SKILL.md",
+    "resources": [
+      { "path": "references/security.md", "description": "安全检查参考" }
+    ]
+  }
 }
 ```
 
-技能是**纯内容插件**：不执行代码、不注册工具，只是一份 Markdown 操作说明。
+技能是**纯内容插件**：不执行代码、不注册工具，只是一份 Markdown 操作说明
+和可选附属资料。
 渐进披露规则：
 
 - 启动时系统提示词里只有“目录条目”（技能名 + 一句话描述）；
 - 模型需要某技能时调用 `use_skill(name)`，网关才读取该插件正文并回填
   （惰性读取 + 缓存），`use_skill` 同样过权限/审计钩子；
-- 全局规则类技能可显式 `"preload": true` 在启动时注入系统提示词，
-  但默认关闭，避免上下文膨胀。
+- 附属资源默认只展示清单，模型通过 `use_skill(name, resource=path)` 按需读取；
+- 正文、资源和预载总量都有字节预算，超限明确失败，不做静默截断；
+- 全局规则类技能只能由宿主在 `config/skill.json` 的 `preload` 列表中选择，
+  旧清单字段 `entry.preload` 会被忽略。
+
+读取成功会发布 `skill.loaded` / `skill.resource_loaded`，启动预载发布
+`skill.preloaded`；`RuntimeSnapshot.skills` 暴露 `status / preload / loaded /
+bytes / error`。
 
 完整示例见 `plugins/skills/code-review/`。
 
@@ -665,7 +677,7 @@ $env:CONTEXT_STRATEGY="summary-window"
 ### `config/`（中心配置，随仓库提交）
 
 `config/config.json` 承载共享默认值，`config/<section>.json` 承载模型、会话、
-记忆、嵌入、上下文和 MCP 等分域配置，`config/plugins/<kind>/<name>.json`
+记忆、嵌入、上下文、MCP 和 Skill 等分域配置，`config/plugins/<kind>/<name>.json`
 承载单个插件的私有配置。优先级为
 **环境变量 > 分域/单插件配置 > config/config.json > 内置默认**；
 密钥与数据目录仍只放 `.env`。
@@ -683,6 +695,7 @@ $env:CONTEXT_STRATEGY="summary-window"
 对应字段写错启动即报错（根目录 `config.py` 校验）；想临时换后端，用环境变量
 覆盖即可（例如 `SESSION_STORE=inmemory`）。MCP 预加载列表由
 `config/mcp.json` 管理，CLI 的 `mcp preload add/remove` 会更新该文件。
+Skill 的宿主预载和内容预算由 `config/skill.json` 管理。
 
 ### `.env`（密钥与环境，已 gitignore，绝不提交）
 
@@ -718,6 +731,12 @@ $env:CONTEXT_STRATEGY="summary-window"
 | `MCP_CALL_TIMEOUT` | `30` | 单次 MCP 工具调用超时（秒） |
 | `MCP_CONNECT_RETRIES` | `0` | MCP 连接失败额外重试次数（指数退避，默认不重试） |
 | `MCP_PRELOAD` | 无 | Runtime 启动时预加载的 MCP 插件名，逗号分隔；覆盖 `mcp.preload` |
+| `SKILL_PRELOAD` | 无 | Runtime 启动时注入系统提示词的 Skill 名，逗号分隔；覆盖 `skill.preload` |
+| `SKILL_MAX_CONTENT_BYTES` | `262144` | 单个 Skill 正文最大 UTF-8 字节数 |
+| `SKILL_MAX_PRELOAD_BYTES` | `524288` | 所有预载 Skill 正文合计最大字节数 |
+| `SKILL_MAX_RESOURCES` | `32` | 单个 Skill 最多声明的资源数 |
+| `SKILL_MAX_RESOURCE_BYTES` | `262144` | 单个 Skill 资源最大字节数 |
+| `SKILL_MAX_RESOURCE_TOTAL_BYTES` | `1048576` | 单个 Skill 全部资源合计最大字节数 |
 
 ### 日志追踪与状态快照（tracing / checkpoint）
 

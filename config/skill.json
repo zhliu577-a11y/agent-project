@@ -1,0 +1,8 @@
+{
+  "preload": [],
+  "maxContentBytes": 262144,
+  "maxPreloadBytes": 524288,
+  "maxResources": 32,
+  "maxResourceBytes": 262144,
+  "maxResourceTotalBytes": 1048576
+}

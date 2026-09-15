@@ -72,6 +72,47 @@
         }
       }
     },
+    "skillResource": {
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path relative to the plugin directory."
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "skillEntry": {
+      "type": "object",
+      "required": [
+        "content"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to the main Skill document, relative to the plugin directory."
+        },
+        "preload": {
+          "type": "boolean",
+          "description": "Deprecated compatibility field. Host preload is selected in config/skill.json."
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/skillResource"
+          }
+        }
+      }
+    },
     "singlePlugin": {
       "type": "object",
       "required": [
@@ -120,7 +161,28 @@
         "model": {
           "$ref": "#/$defs/modelMetadata"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "skill"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "entry": {
+                "$ref": "#/$defs/skillEntry"
+              }
+            }
+          }
+        }
+      ]
     },
     "pluginPackage": {
       "type": "object",
@@ -185,7 +247,28 @@
                 "$ref": "#/$defs/modelMetadata"
               }
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "const": "skill"
+                  }
+                },
+                "required": [
+                  "kind"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "entry": {
+                    "$ref": "#/$defs/skillEntry"
+                  }
+                }
+              }
+            }
+          ]
         }
       }
     }

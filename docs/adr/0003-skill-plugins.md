@@ -1,6 +1,6 @@
 # ADR 0003：Skills 型插件与渐进披露（M3 设计）
 
-- 状态：已采纳（M3 已完成）
+- 状态：已采纳（M3 已完成；2026-09-15 完成边界、预算、宿主预载与资源协议强化）
 - 日期：2026-09-05
 - 前置：ADR 0002（kind 注册表 + PluginAssembly）已落地
 
@@ -37,22 +37,35 @@ plugins/skills/<name>/
   "enabled": true,
   "entry": {
     "content": "SKILL.md",
-    "preload": false
+    "resources": [
+      {
+        "path": "references/security.md",
+        "description": "安全检查参考"
+      }
+    ]
   }
 }
 ```
 
 - `entry.content`：正文文件，相对插件目录；缺省 `SKILL.md`；
-- `entry.preload`：是否把正文预载进系统提示词，默认 `false`（见第 3 节）；
+- `entry.resources`：可选的只读附属文档；每项包含相对 `path` 和可选
+  `description`，模型通过 `use_skill(name, resource=path)` 按需读取；
+- `entry.preload`：旧兼容字段，宿主不再直接信任；实际预载只由
+  `config/skill.json` 的 `preload` 列表决定；
 - 不引入 YAML frontmatter——元数据统一放 `plugin.json`，保持单一事实来源；
 - skill 只允许模型通过专用工具读取，不放进 ToolRegistry（它不是可执行工具）。
 
 ### 2. 加载与目录语义
 
-- loader：`SUPPORTED_KINDS` 增加 `skill`；装配时只做**零副作用校验**——
-  校验清单结构、`content` 文件存在且可读；不读取正文、不执行任何代码；
-- 产物：`SkillPlugin { manifest, content_path }` 放进 `PluginAssembly.skills`；
+- loader：`SUPPORTED_KINDS` 增加 `skill`；装配时做**零副作用校验**——
+  校验清单结构、正文与资源路径必须位于插件目录内、文件存在且满足大小预算；
+  不读取正文内容、不执行任何代码；
+- 产物：`SkillPlugin { manifest, content_path, resources }` 放进
+  `PluginAssembly.skills`；
 - 正文采用**惰性读取**：模型请求时才读文件并缓存，启动成本与插件数量解耦。
+
+正文、单资源、单技能资源总量、启动预载总量均有明确预算。超限时启动或读取
+直接报错，不做静默截断；运行时读取会再次检查文件大小，防止装配后文件变化。
 
 ### 3. 目录工具读什么、默认全量读吗
 
@@ -68,17 +81,22 @@ plugins/skills/<name>/
   `SKILL.md` 全文，作为工具结果回填给模型；
 - `use_skill` 的参数枚举所有可用技能名；未知技能返回“未知 + 可用列表”；
 - 正文读取后缓存，重复调用不重复读盘；
-- 特殊情况：全局规则类技能可显式 `"preload": true` 在启动时注入系统提示词，
-  但默认关闭，并在文档里提示尽量少用。
+- 附属资源默认只展示清单，不返回内容；模型需要时再次调用
+  `use_skill(name, resource=path)`；
+- 全局规则类技能可由宿主在 `config/skill.json` 的 `preload` 列表中选择，
+  启动时注入系统提示词。插件清单不能自行开启预载；未知名称或总量超预算时启动失败。
 
 ### 4. 装配与归属
 
-- `SkillGateway` 持有技能目录：`available()`、`get(name)`、缓存与错误提示；
+- `SkillGateway` 持有技能目录：`available()`、`get(name)`、`get_resource()`、
+  缓存与错误提示；
   `UseSkill` 是暴露给模型的内核工具（与 `UsePlugin` 同级）；
 - main 装配顺序：assembly 完成后创建 SkillGateway → 注册 UseSkill →
   组装目录段落 → 进入 loop；loop 零改动；
 - `use_skill` 与其它工具一视同仁，过 `tool_before / tool_after`
-  权限与审计钩子（permission 规则可直接写 `use_skill`）。
+  权限与审计钩子（permission 规则可直接写 `use_skill`）；
+- 成功读取会发布 `skill.loaded` / `skill.resource_loaded`，启动预载发布
+  `skill.preloaded`；`RuntimeSnapshot.skills` 提供 loaded、bytes、error 等状态。
 
 ### 5. 顺带修正提示词组装
 
@@ -95,7 +113,7 @@ name/description，模型直接可见，重复描述只会浪费上下文。
 ### A. SKILL.md 默认全量注入系统提示词
 
 最简单，但 N 个技能 × 长正文会在每次请求里重复占用上下文，违背渐进披露
-目标。拒绝作为默认；仅 `preload: true` 的全局规则可显式注入。
+目标。拒绝作为默认；仅宿主显式选择的全局规则可注入。
 
 ### B. skill 里放可执行代码
 
@@ -116,8 +134,8 @@ Harness 的 skill 本质是文档；可执行能力应由 tool / mcp / hook 插�
 
 代价/待办：
 
-- 技能正文质量依赖插件作者自控篇幅（文档给出建议长度，暂无硬截断）；
-- 预载技能过多会重新引入上下文膨胀，需在文档与示例中约束；
+- 技能正文和资源受宿主预算约束，超限明确失败而不是截断；
+- 预载技能过多仍会占用上下文，因此必须由宿主在中心配置中显式选择；
 - `use_skill` 返回的正文是一次性工具结果；若任务跨多轮，模型需自行在
   后续请求中携带要点（与现有工具结果一致，不做特殊注入）。
 

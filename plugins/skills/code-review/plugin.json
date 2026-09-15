@@ -8,7 +8,6 @@
   "description": "代码评审规范与检查清单（改代码前按此自检）",
   "enabled": true,
   "entry": {
-    "content": "SKILL.md",
-    "preload": false
+    "content": "SKILL.md"
   }
 }

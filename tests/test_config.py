@@ -15,6 +15,12 @@ _CONFIG_KEYS = (
     "CONTEXT_MAX_TOKENS",
     "CONTEXT_STRATEGY",
     "MCP_PRELOAD",
+    "SKILL_PRELOAD",
+    "SKILL_MAX_CONTENT_BYTES",
+    "SKILL_MAX_PRELOAD_BYTES",
+    "SKILL_MAX_RESOURCES",
+    "SKILL_MAX_RESOURCE_BYTES",
+    "SKILL_MAX_RESOURCE_TOTAL_BYTES",
     "MODEL_FALLBACK",
     "MODEL_KEEP_WARM",
     "MODEL_ROUTER",
@@ -47,6 +53,7 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
             "embedding": {"provider": "debug"},
             "context": {"maxTokens": 1000, "strategy": "tail-window"},
             "mcp": {"preload": ["time"]},
+            "skill": {"preload": ["code-review"]},
         },
     )
     _write(config_dir / "model.json", {"model": "openai"})
@@ -55,6 +62,17 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     _write(config_dir / "embedding.json", {"provider": "openai-embedding"})
     _write(config_dir / "context.json", {"maxTokens": 12345, "strategy": "compact"})
     _write(config_dir / "mcp.json", {"preload": ["time", "math"]})
+    _write(
+        config_dir / "skill.json",
+        {
+            "preload": ["code-review"],
+            "maxContentBytes": 1000,
+            "maxPreloadBytes": 2000,
+            "maxResources": 4,
+            "maxResourceBytes": 500,
+            "maxResourceTotalBytes": 1500,
+        },
+    )
 
     config = AppConfig.load(config_dir)
 
@@ -66,15 +84,25 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     assert config.context_max_tokens == 12345
     assert config.context_strategy == "compact"
     assert config.mcp_preload == ("time", "math")
+    assert config.skill_preload == ("code-review",)
+    assert config.skill_max_content_bytes == 1000
+    assert config.skill_max_preload_bytes == 2000
+    assert config.skill_max_resources == 4
+    assert config.skill_max_resource_bytes == 500
+    assert config.skill_max_resource_total_bytes == 1500
     assert config.config_dir == config_dir.resolve()
 
     monkeypatch.setenv("AGENT_MODEL", "deepseek")
     monkeypatch.setenv("CONTEXT_STRATEGY", "tail-window")
     monkeypatch.setenv("MCP_PRELOAD", "filesystem")
+    monkeypatch.setenv("SKILL_PRELOAD", "commit-message")
+    monkeypatch.setenv("SKILL_MAX_CONTENT_BYTES", "3000")
     config = AppConfig.load(config_dir)
     assert config.model == "deepseek"
     assert config.context_strategy == "tail-window"
     assert config.mcp_preload == ("filesystem",)
+    assert config.skill_preload == ("commit-message",)
+    assert config.skill_max_content_bytes == 3000
 
 
 def test_plugin_config_is_loaded_by_kind_and_name(tmp_path) -> None:
@@ -150,6 +178,12 @@ def test_config_missing_file_uses_defaults(tmp_path, monkeypatch) -> None:
     assert config.context_max_tokens == 20000
     assert config.context_strategy == "tail-window"
     assert config.mcp_preload == ()
+    assert config.skill_preload == ()
+    assert config.skill_max_content_bytes == 262144
+    assert config.skill_max_preload_bytes == 524288
+    assert config.skill_max_resources == 32
+    assert config.skill_max_resource_bytes == 262144
+    assert config.skill_max_resource_total_bytes == 1048576
 
 
 def test_config_invalid_type_fails_fast(tmp_path) -> None:
@@ -182,4 +216,31 @@ def test_config_rejects_invalid_mcp_preload(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MCP_PRELOAD", "time,,math")
     _write(config_dir / "config.json", {"mcp": {"preload": ["time"]}})
     with pytest.raises(ValueError, match="MCP_PRELOAD"):
+        AppConfig.load(config_dir)
+
+
+def test_config_rejects_invalid_skill_preload_and_budgets(tmp_path, monkeypatch) -> None:
+    _clean_env(monkeypatch)
+    config_dir = tmp_path / "config"
+
+    _write(config_dir / "config.json", {"skill": {"preload": "code-review"}})
+    with pytest.raises(ValueError, match="skill.preload"):
+        AppConfig.load(config_dir)
+
+    _write(config_dir / "config.json", {"skill": {"preload": ["bad name"]}})
+    with pytest.raises(ValueError, match="invalid skill plugin name"):
+        AppConfig.load(config_dir)
+
+    _write(config_dir / "config.json", {"skill": {"preload": ["one", "one"]}})
+    with pytest.raises(ValueError, match="duplicate skill plugin name"):
+        AppConfig.load(config_dir)
+
+    monkeypatch.setenv("SKILL_PRELOAD", "one,,two")
+    _write(config_dir / "config.json", {"skill": {"preload": ["one"]}})
+    with pytest.raises(ValueError, match="SKILL_PRELOAD"):
+        AppConfig.load(config_dir)
+
+    monkeypatch.delenv("SKILL_PRELOAD")
+    _write(config_dir / "config.json", {"skill": {"maxContentBytes": 0}})
+    with pytest.raises(ValueError, match="maxContentBytes"):
         AppConfig.load(config_dir)

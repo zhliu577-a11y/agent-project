@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from config import AppConfig
+from core.events import Event
 from plugins.manager import PluginManager
 from runtime import HarnessRuntime, RuntimeStartupError
 
@@ -254,6 +255,8 @@ def _manager(tmp_path: Path) -> PluginManager:
 def _config(
     *,
     mcp_preload: tuple[str, ...] = (),
+    skill_preload: tuple[str, ...] = (),
+    skill_max_preload_bytes: int = 524288,
     model_router: str | None = None,
 ) -> AppConfig:
     return AppConfig(
@@ -265,11 +268,13 @@ def _config(
         context_max_tokens=20000,
         context_strategy="tail-window",
         mcp_preload=mcp_preload,
+        skill_preload=skill_preload,
+        skill_max_preload_bytes=skill_max_preload_bytes,
         model_router=model_router,
     )
 
 
-def _write_skill_package(root: Path) -> Path:
+def _write_skill_package(root: Path, *, legacy_preload: bool = False) -> Path:
     package = root / "quality"
     _write_json(
         package / "plugin.json",
@@ -281,7 +286,10 @@ def _write_skill_package(root: Path) -> Path:
                 {
                     "id": "lint",
                     "kind": "skill",
-                    "entry": {"content": "SKILL.md"},
+                    "entry": {
+                        "content": "SKILL.md",
+                        "preload": legacy_preload,
+                    },
                 }
             ],
         },
@@ -324,11 +332,89 @@ async def test_runtime_loads_enabled_package_and_records_status(tmp_path, monkey
         assert states["quality"].status == "active"
         assert states["quality"].contributions == ("skill:quality--lint",)
         assert "use_skill" in snapshot.tools
+        skill_status = next(status for status in snapshot.skills if status.name == "quality--lint")
+        assert skill_status.status == "ready"
+        assert skill_status.loaded is False
         assert "external__echo" in snapshot.tools
         assert type(runtime.context_policy).__name__ == "TailWindowPolicy"
         assert manager.list_installed()[0].runtime_status == "active"
 
     assert manager.list_installed()[0].runtime_status == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_runtime_preloads_only_host_selected_skills(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+    manager = _manager(tmp_path)
+    manager.install(_write_skill_package(tmp_path / "source", legacy_preload=True))
+    manager.enable("quality")
+    runtime = HarnessRuntime(
+        _config(skill_preload=("quality--lint",)),
+        plugin_manager=manager,
+    )
+    events: list[Event] = []
+    runtime.events.subscribe("*", events.append)
+
+    async with runtime:
+        snapshot = runtime.snapshot()
+        status = next(item for item in snapshot.skills if item.name == "quality--lint")
+
+        assert status.status == "loaded"
+        assert status.preload is True
+        assert status.loaded is True
+        assert status.bytes > 0
+        assert "# lint" in runtime.system_prompt
+        assert [event.name for event in events] == ["skill.preloaded"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_ignores_legacy_manifest_preload_without_host_selection(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+    manager = _manager(tmp_path)
+    manager.install(_write_skill_package(tmp_path / "source", legacy_preload=True))
+    manager.enable("quality")
+    runtime = HarnessRuntime(_config(), plugin_manager=manager)
+
+    async with runtime:
+        status = next(item for item in runtime.snapshot().skills if item.name == "quality--lint")
+        assert status.preload is False
+        assert status.loaded is False
+        assert "# lint" not in runtime.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_unknown_skill_preload(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+    runtime = HarnessRuntime(
+        _config(skill_preload=("missing",)),
+        plugin_manager=_manager(tmp_path),
+    )
+
+    with pytest.raises(RuntimeStartupError, match="未知的 Skill 预加载插件"):
+        await runtime.start()
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_enforces_skill_preload_budget(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+    manager = _manager(tmp_path)
+    manager.install(_write_skill_package(tmp_path / "source"))
+    manager.enable("quality")
+    runtime = HarnessRuntime(
+        _config(
+            skill_preload=("quality--lint",),
+            skill_max_preload_bytes=3,
+        ),
+        plugin_manager=manager,
+    )
+
+    with pytest.raises(RuntimeStartupError, match="预加载总大小超过预算"):
+        await runtime.start()
+    await runtime.close()
 
 
 @pytest.mark.asyncio

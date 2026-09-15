@@ -55,10 +55,17 @@
 #     由 Harness 选定激活插件后惰性创建）。
 #
 # 技能插件 entry（type: "skill"，纯内容，不执行代码）：
-#   { "content": "SKILL.md", "preload": false }
+#   {
+#     "content": "SKILL.md",
+#     "resources": [
+#       { "path": "references/api.md", "description": "API 参考" }
+#     ]
+#   }
 #   - content 为正文文件（相对插件目录，默认 SKILL.md），装配时校验存在；
-#   - preload=false（默认）表示正文只在模型调用 use_skill 时读取（渐进披露）；
-#     preload=true 表示启动时把正文注入系统提示词（仅限全局规则，尽量少用）。
+#   - resources 是随技能附带的只读文档，模型按需通过 use_skill(..., resource=...)
+#     读取；所有路径必须位于插件目录内，并受数量与大小预算约束；
+#   - 旧 entry.preload 字段只保留兼容解析，实际预载由宿主 config/skill.json
+#     的 preload 列表决定。
 #
 # 可选字段 priority（整数，默认 0）：钩子插件的执行顺序，越小越先执行；
 # 相同 priority 时按插件名排序，保证跨启动稳定。
@@ -77,7 +84,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from config import AppConfig
+from config import (
+    DEFAULT_SKILL_MAX_CONTENT_BYTES,
+    DEFAULT_SKILL_MAX_RESOURCE_BYTES,
+    DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES,
+    DEFAULT_SKILL_MAX_RESOURCES,
+    AppConfig,
+)
 from core.context import ContextPolicy
 from core.embedding import EmbeddingProvider
 from core.errors import AGENT_CATEGORIES, resolve_declared_error
@@ -351,12 +364,22 @@ class ContextPlugin:
 
 
 @dataclass(frozen=True)
+class SkillResource:
+    """One validated, read-only document shipped with a Skill."""
+
+    path: str
+    description: str
+    resolved_path: Path
+
+
+@dataclass(frozen=True)
 class SkillPlugin:
-    """技能插件：纯内容目录（不执行代码），正文文件由网关惰性读取。"""
+    """技能插件：纯内容目录（不执行代码），正文和资源由网关惰性读取。"""
 
     manifest: PluginManifest
     content_path: Path
     preload: bool
+    resources: tuple[SkillResource, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1005,6 +1028,52 @@ def inspect_package(root: str | Path) -> PackageInspection:
     )
 
 
+def _parse_skill_resources(manifest: PluginManifest) -> tuple[SkillResource, ...]:
+    """Validate Skill resource declarations without reading their contents."""
+    where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
+    raw_resources = manifest.entry.get("resources", [])
+    _expect(isinstance(raw_resources, list), where, "entry.resources 必须是数组")
+
+    resources: list[SkillResource] = []
+    seen_paths: set[Path] = set()
+    for index, item in enumerate(raw_resources, start=1):
+        item_where = f"{where} entry.resources[{index}]"
+        _expect(isinstance(item, dict), item_where, "资源声明必须是对象")
+
+        resource_rel = item.get("path")
+        _expect(
+            isinstance(resource_rel, str) and resource_rel.strip(),
+            item_where,
+            "资源声明必须包含非空 'path'",
+        )
+        description = item.get("description", "")
+        _expect(isinstance(description, str), item_where, "'description' 必须是字符串")
+
+        resource_path = _resolve_inside(manifest.directory, resource_rel, item_where)
+        _expect(resource_path.is_file(), item_where, f"资源文件不存在: {resource_path}")
+        _expect(
+            resource_path not in seen_paths,
+            item_where,
+            f"资源路径重复: {resource_rel}",
+        )
+        resources.append(
+            SkillResource(
+                path=resource_rel,
+                description=description,
+                resolved_path=resource_path,
+            )
+        )
+        seen_paths.add(resource_path)
+    return tuple(resources)
+
+
+def _skill_file_size(path: Path, where: str) -> int:
+    try:
+        return path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"{where}: 无法读取文件大小: {path}: {exc}") from exc
+
+
 def _validate_static_entry(manifest: PluginManifest) -> None:
     """校验入口文件存在且位于插件目录内，但不导入模块、不执行工厂。"""
     if manifest.type == "tool":
@@ -1041,6 +1110,7 @@ def _validate_static_entry(manifest: PluginManifest) -> None:
         )
         content_path = _resolve_inside(manifest.directory, content_rel, where)
         _expect(content_path.is_file(), where, f"正文文件不存在: {content_path}")
+        _parse_skill_resources(manifest)
     elif manifest.type == "mcp":
         where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
         entry = manifest.entry
@@ -1429,7 +1499,7 @@ def load_skill_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
 ) -> SkillPlugin:
-    """校验单个技能插件：只检查清单与正文文件存在，不读取、不执行。"""
+    """校验单个技能插件、目录边界和内容预算，但不读取正文。"""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
     entry = manifest.entry
     content_rel = entry.get("content", "SKILL.md")
@@ -1441,9 +1511,62 @@ def load_skill_plugin(
     preload = entry.get("preload", False)
     _expect(isinstance(preload, bool), where, "'preload' 必须是布尔值")
 
-    content_path = manifest.directory / content_rel
+    content_path = _resolve_inside(manifest.directory, content_rel, where)
     _expect(content_path.is_file(), where, f"正文文件不存在: {content_path}")
-    return SkillPlugin(manifest=manifest, content_path=content_path, preload=preload)
+    resources = _parse_skill_resources(manifest)
+
+    max_content_bytes = (
+        config.skill_max_content_bytes if config is not None else DEFAULT_SKILL_MAX_CONTENT_BYTES
+    )
+    max_resources = (
+        config.skill_max_resources if config is not None else DEFAULT_SKILL_MAX_RESOURCES
+    )
+    max_resource_bytes = (
+        config.skill_max_resource_bytes if config is not None else DEFAULT_SKILL_MAX_RESOURCE_BYTES
+    )
+    max_resource_total_bytes = (
+        config.skill_max_resource_total_bytes
+        if config is not None
+        else DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES
+    )
+
+    content_size = _skill_file_size(content_path, where)
+    _expect(
+        content_size <= max_content_bytes,
+        where,
+        f"正文超过大小预算: {content_size} > {max_content_bytes} bytes",
+    )
+    _expect(
+        len(resources) <= max_resources,
+        where,
+        f"资源数量超过预算: {len(resources)} > {max_resources}",
+    )
+
+    total_resource_bytes = 0
+    for resource in resources:
+        resource_size = _skill_file_size(
+            resource.resolved_path,
+            f"{where} resource '{resource.path}'",
+        )
+        _expect(
+            resource_size <= max_resource_bytes,
+            where,
+            f"资源 {resource.path} 超过单文件大小预算: "
+            f"{resource_size} > {max_resource_bytes} bytes",
+        )
+        total_resource_bytes += resource_size
+    _expect(
+        total_resource_bytes <= max_resource_total_bytes,
+        where,
+        f"资源总大小超过预算: {total_resource_bytes} > {max_resource_total_bytes} bytes",
+    )
+
+    return SkillPlugin(
+        manifest=manifest,
+        content_path=content_path,
+        preload=preload,
+        resources=resources,
+    )
 
 
 def load_session_plugin(

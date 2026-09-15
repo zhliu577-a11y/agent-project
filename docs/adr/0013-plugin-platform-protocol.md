@@ -117,6 +117,7 @@ config/
 ├── embedding.json
 ├── context.json
 ├── mcp.json
+├── skill.json
 └── plugins/
     ├── hook/permission.json # 单插件私有配置
     ├── tool/<name>.json

@@ -8,6 +8,7 @@
 #   config/embedding.json
 #   config/context.json
 #   config/mcp.json
+#   config/skill.json
 #   config/plugins/<kind>/<name>.json
 #
 # Merge order: environment variables > individual config files >
@@ -24,6 +25,11 @@ DEFAULT_CONFIG_DIR = PROJECT_ROOT / "config"
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.json"
 
 _PLUGIN_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+DEFAULT_SKILL_MAX_CONTENT_BYTES = 256 * 1024
+DEFAULT_SKILL_MAX_PRELOAD_BYTES = 512 * 1024
+DEFAULT_SKILL_MAX_RESOURCES = 32
+DEFAULT_SKILL_MAX_RESOURCE_BYTES = 256 * 1024
+DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES = 1024 * 1024
 _SECTION_FILES = {
     "model": "model.json",
     "session": "session.json",
@@ -31,6 +37,7 @@ _SECTION_FILES = {
     "embedding": "embedding.json",
     "context": "context.json",
     "mcp": "mcp.json",
+    "skill": "skill.json",
 }
 
 
@@ -48,6 +55,12 @@ class AppConfig:
     context_max_tokens: int = 20000
     context_strategy: str = "tail-window"
     mcp_preload: tuple[str, ...] = ()
+    skill_preload: tuple[str, ...] = ()
+    skill_max_content_bytes: int = DEFAULT_SKILL_MAX_CONTENT_BYTES
+    skill_max_preload_bytes: int = DEFAULT_SKILL_MAX_PRELOAD_BYTES
+    skill_max_resources: int = DEFAULT_SKILL_MAX_RESOURCES
+    skill_max_resource_bytes: int = DEFAULT_SKILL_MAX_RESOURCE_BYTES
+    skill_max_resource_total_bytes: int = DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES
     config_dir: Path | None = None
 
     @classmethod
@@ -63,6 +76,7 @@ class AppConfig:
         embedding = cls._nested(raw, "embedding")
         context = cls._nested(raw, "context")
         mcp = cls._nested(raw, "mcp")
+        skill = cls._nested(raw, "skill")
         model_options = cls._nested(raw, "_model_options")
 
         return cls(
@@ -109,6 +123,38 @@ class AppConfig:
                 _expect_str(context.get("strategy", "tail-window"), "context.strategy"),
             ),
             mcp_preload=_load_mcp_preload(mcp.get("preload", []), os.getenv("MCP_PRELOAD")),
+            skill_preload=_load_skill_preload(
+                skill.get("preload", []),
+                os.getenv("SKILL_PRELOAD"),
+            ),
+            skill_max_content_bytes=_load_positive_int(
+                skill.get("maxContentBytes", DEFAULT_SKILL_MAX_CONTENT_BYTES),
+                os.getenv("SKILL_MAX_CONTENT_BYTES"),
+                "skill.maxContentBytes",
+            ),
+            skill_max_preload_bytes=_load_positive_int(
+                skill.get("maxPreloadBytes", DEFAULT_SKILL_MAX_PRELOAD_BYTES),
+                os.getenv("SKILL_MAX_PRELOAD_BYTES"),
+                "skill.maxPreloadBytes",
+            ),
+            skill_max_resources=_load_positive_int(
+                skill.get("maxResources", DEFAULT_SKILL_MAX_RESOURCES),
+                os.getenv("SKILL_MAX_RESOURCES"),
+                "skill.maxResources",
+            ),
+            skill_max_resource_bytes=_load_positive_int(
+                skill.get("maxResourceBytes", DEFAULT_SKILL_MAX_RESOURCE_BYTES),
+                os.getenv("SKILL_MAX_RESOURCE_BYTES"),
+                "skill.maxResourceBytes",
+            ),
+            skill_max_resource_total_bytes=_load_positive_int(
+                skill.get(
+                    "maxResourceTotalBytes",
+                    DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES,
+                ),
+                os.getenv("SKILL_MAX_RESOURCE_TOTAL_BYTES"),
+                "skill.maxResourceTotalBytes",
+            ),
             config_dir=config_path.parent.resolve(),
         )
 
@@ -231,6 +277,43 @@ def _load_mcp_preload(configured: Any, env_value: str | None) -> tuple[str, ...]
             raise ValueError(f"{key}: duplicate MCP plugin name: {name}")
         names.append(name)
     return tuple(names)
+
+
+def _load_skill_preload(configured: Any, env_value: str | None) -> tuple[str, ...]:
+    """Load and validate the host-selected Skill startup list."""
+    if env_value is not None:
+        if not env_value.strip():
+            return ()
+        raw_names = env_value.split(",")
+    else:
+        if not isinstance(configured, list):
+            raise ValueError("config: 'skill.preload' must be a string array")
+        raw_names = configured
+
+    names: list[str] = []
+    for index, value in enumerate(raw_names, start=1):
+        key = f"skill.preload[{index}]" if env_value is None else "SKILL_PRELOAD"
+        if not isinstance(value, str):
+            raise ValueError(f"{key}: skill plugin name must be a string")
+        name = value.strip()
+        if not name or not _PLUGIN_NAME_RE.fullmatch(name):
+            raise ValueError(f"{key}: invalid skill plugin name: {value!r}")
+        if name in names:
+            raise ValueError(f"{key}: duplicate skill plugin name: {name}")
+        names.append(name)
+    return tuple(names)
+
+
+def _load_positive_int(configured: Any, env_value: str | None, key: str) -> int:
+    raw = env_value if env_value is not None else configured
+    if isinstance(raw, str) and env_value is not None:
+        try:
+            raw = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"config: '{key}' must be an integer") from exc
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raise ValueError(f"config: '{key}' must be a positive integer")
+    return raw
 
 
 def _load_model_name_list(

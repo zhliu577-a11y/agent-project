@@ -6,7 +6,7 @@ from typing import Any
 
 from config import AppConfig
 from core.context import ContextPolicy
-from core.events import EventBus, jsonl_sink
+from core.events import Event, EventBus, jsonl_sink
 from core.hooks import HookGateway
 from core.model import ModelAdapter, ModelRouter
 from core.prompt import build_system_prompt
@@ -66,6 +66,16 @@ class ModelRuntimeStatus:
 
 
 @dataclass(frozen=True)
+class SkillRuntimeStatus:
+    name: str
+    status: str
+    preload: bool
+    loaded: bool
+    bytes: int
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class RuntimeSnapshot:
     """JSON-safe view of the runtime without exposing live gateway objects."""
 
@@ -74,6 +84,7 @@ class RuntimeSnapshot:
     tools: tuple[str, ...]
     mcp: tuple[McpRuntimeStatus, ...]
     models: tuple[ModelRuntimeStatus, ...]
+    skills: tuple[SkillRuntimeStatus, ...]
 
 
 class HarnessRuntime:
@@ -144,7 +155,7 @@ class HarnessRuntime:
             self.tools.register(self._use_plugin)
             await self._preload_mcp_plugins()
             await self._lifecycle.start_all()
-            self._build_system_prompt()
+            await self._build_system_prompt()
             self._ready = True
             logger.info(
                 "Runtime 已就绪：插件包 %d 个，工具 %d 个，MCP 插件 %d 个",
@@ -236,6 +247,27 @@ class HarnessRuntime:
                     for name, status in sorted(self.models.status().items())
                 )
                 if self.models is not None
+                else ()
+            ),
+            skills=(
+                tuple(
+                    SkillRuntimeStatus(
+                        name=name,
+                        status=(
+                            "error"
+                            if self.skills.error(name) is not None
+                            else "loaded"
+                            if self.skills.is_loaded(name)
+                            else "ready"
+                        ),
+                        preload=name in self.config.skill_preload,
+                        loaded=self.skills.is_loaded(name),
+                        bytes=self.skills.loaded_bytes(name),
+                        error=self.skills.error(name),
+                    )
+                    for name in self.skills.available()
+                )
+                if self.skills is not None
                 else ()
             ),
         )
@@ -490,8 +522,13 @@ class HarnessRuntime:
             for tool in tools:
                 self._track_plugin(manifest, tool)
 
-        self.skills = SkillGateway(self._assembly.skills)
-        self.tools.register(UseSkill(self.skills))
+        self.skills = SkillGateway(
+            self._assembly.skills,
+            max_content_bytes=self.config.skill_max_content_bytes,
+            max_resource_bytes=self.config.skill_max_resource_bytes,
+            max_resource_total_bytes=self.config.skill_max_resource_total_bytes,
+        )
+        self.tools.register(UseSkill(self.skills, events=self.events))
         if self.memory is None:
             raise RuntimeStartupError("长期记忆网关未初始化")
         self.tools.register(RememberTool(self.memory))
@@ -522,17 +559,50 @@ class HarnessRuntime:
                     message,
                 )
 
-    def _build_system_prompt(self) -> None:
+    async def _build_system_prompt(self) -> None:
         if self.skills is None:
             raise RuntimeStartupError("技能网关未初始化")
-        preloads: list[tuple[str, str]] = []
+
+        available = set(self.skills.available())
+        unknown = [name for name in self.config.skill_preload if name not in available]
+        if unknown:
+            raise RuntimeStartupError(
+                f"未知的 Skill 预加载插件: {unknown}，可选: {self.skills.available()}"
+            )
+
+        selected = set(self.config.skill_preload)
         for skill in self._assembly.skills:
-            if not skill.preload:
-                continue
+            if skill.preload and skill.manifest.name not in selected:
+                logger.warning(
+                    "技能 %s 的 entry.preload 已忽略；请在 config/skill.json 的 preload 中显式选择",
+                    skill.manifest.name,
+                )
+
+        preloads: list[tuple[str, str]] = []
+        total_bytes = 0
+        for name in self.config.skill_preload:
             try:
-                preloads.append((skill.manifest.name, self.skills.get(skill.manifest.name)))
+                content = self.skills.get(name)
             except ValueError as exc:
-                logger.warning("预载技能 %s 读取失败，已跳过: %s", skill.manifest.name, exc)
+                raise RuntimeStartupError(f"Skill 预加载失败 {name}: {exc}") from exc
+            size = len(content.encode("utf-8"))
+            total_bytes += size
+            if total_bytes > self.config.skill_max_preload_bytes:
+                raise RuntimeStartupError(
+                    "Skill 预加载总大小超过预算: "
+                    f"{total_bytes} > {self.config.skill_max_preload_bytes} bytes"
+                )
+            preloads.append((name, content))
+            await self.events.publish(
+                Event(
+                    "skill.preloaded",
+                    {
+                        "name": name,
+                        "bytes": size,
+                    },
+                )
+            )
+
         self.system_prompt = build_system_prompt(
             mcp=[(spec.manifest.name, spec.manifest.description) for spec in self._assembly.mcp],
             skills=self.skills.catalog(),
