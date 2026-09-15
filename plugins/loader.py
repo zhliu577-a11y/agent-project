@@ -4,7 +4,7 @@
 # 单插件清单使用 type + entry：
 # {
 #   "name": "time",            # 唯一名（字母/数字/下划线/连字符）
-#   "type": "mcp",             # 插件类别：mcp | hook | tool | model | skill
+#   "type": "mcp",             # 插件类别：受 KindHandler 注册表控制
 #   "version": "1.0.0",        # 可选
 #   "description": "…",        # 可选
 #   "enabled": true,           # 可选，默认 true
@@ -35,10 +35,14 @@
 #   { "module": "hook.py", "factory": "create_hook" }
 #   - 调用 factory(plugin_dir) 得到 LifecycleHooks 实例。
 #
-# 本地工具插件 entry（type: "tool"）：
-#   { "module": "tool.py", "factory": "create_tools" }
-#   - 调用 factory(plugin_dir) 得到一个 Tool 或 Tool 列表；
-#     工具会被包装成 <插件名>__<工具名>，启动即注册，无需挂载。
+# 工具插件 entry（type: "tool"）：
+#   Python 进程内：
+#     { "runtime": "python", "module": "tool.py", "factory": "create_tools" }
+#   外部进程（可由 Node/TypeScript 等实现）：
+#     { "runtime": "node", "protocol": "jsonrpc-stdio",
+#       "command": ["node", "dist/index.js"], "tools": [ ... ] }
+#   - 工具会被包装成 <插件名>__<工具名>，启动即注册，无需挂载；
+#   - 外部进程首次调用时启动，Runtime 关闭时统一回收。
 #
 # 模型插件 entry（type: "model"）：
 #   { "module": "model.py", "factory": "create_model" }
@@ -67,6 +71,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.context import ContextPolicy
 from core.embedding import EmbeddingProvider
 from core.errors import AGENT_CATEGORIES, resolve_declared_error
 from core.events import EventBus, Subscription, coerce_subscriptions
@@ -75,6 +80,7 @@ from core.memory import MemoryStore
 from core.model import ModelAdapter
 from core.session import SessionStore
 from core.tool import Tool
+from plugins.external import ExternalTool, ExternalToolDefinition, StdioJsonRpcHost
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +88,7 @@ DEFAULT_PLUGINS_DIR = Path(__file__).resolve().parent
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CODE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _EVENT_RE = re.compile(r"^(\*|[A-Za-z0-9_.-]+)$")
+_EXTERNAL_RUNTIMES = frozenset({"node", "process"})
 
 
 @dataclass(frozen=True)
@@ -184,6 +191,18 @@ class McpPluginSpec:
     args: list[str]
 
 
+@dataclass(frozen=True)
+class StdioToolSpec:
+    """Validated external tool process configuration."""
+
+    manifest: PluginManifest
+    protocol: str
+    command: str
+    args: list[str]
+    timeout: float
+    tools: tuple[ExternalToolDefinition, ...]
+
+
 class NamespacedTool(Tool):
     """给本地工具包上 <插件名>__<工具名> 前缀，并按其声明补全错误语义。"""
 
@@ -218,6 +237,12 @@ class NamespacedTool(Tool):
                 raise
             raise resolved from exc
 
+    async def close(self) -> None:
+        """Delegate lifecycle cleanup when the wrapped tool owns a process."""
+        close = getattr(self._tool, "close", None)
+        if callable(close):
+            await close()
+
 
 @dataclass(frozen=True)
 class ModelPlugin:
@@ -239,6 +264,28 @@ class ModelPlugin:
             f"模型工厂必须返回 ModelAdapter 实例，实际是 {type(model).__name__}",
         )
         return model
+
+
+@dataclass(frozen=True)
+class ContextPlugin:
+    """A context policy plugin selected by the runtime for each conversation."""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> ContextPolicy:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            policy = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: context factory failed: {exc}") from exc
+        _expect(
+            isinstance(policy, ContextPolicy),
+            where,
+            "context factory must return a ContextPolicy with an async prepare() method, "
+            f"got {type(policy).__name__}",
+        )
+        return policy
 
 
 @dataclass(frozen=True)
@@ -718,32 +765,31 @@ def inspect_package(root: str | Path) -> PackageInspection:
 
 def _validate_static_entry(manifest: PluginManifest) -> None:
     """校验入口文件存在且位于插件目录内，但不导入模块、不执行工厂。"""
-    where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
-    entry = manifest.entry
+    if manifest.type == "tool":
+        runtime = manifest.entry.get("runtime", "python")
+        if runtime in _EXTERNAL_RUNTIMES:
+            _parse_stdio_tool_spec(manifest)
+            return
+        _expect(
+            runtime == "python",
+            f"{manifest.directory / 'plugin.json'} ('{manifest.name}')",
+            f"不支持的 tool runtime '{runtime}'；可选: python, node, process",
+        )
+
     if manifest.type in {
         "hook",
         "tool",
         "model",
+        "context",
         "session",
         "memory",
         "embedding",
         "listener",
     }:
-        module_rel = entry.get("module")
-        factory_name = entry.get("factory")
-        _expect(
-            isinstance(module_rel, str) and module_rel.strip(),
-            where,
-            f"{manifest.type} 插件必须在 entry 里声明非空 'module'",
-        )
-        _expect(
-            isinstance(factory_name, str) and factory_name.strip(),
-            where,
-            f"{manifest.type} 插件必须在 entry 里声明非空 'factory'",
-        )
-        module_path = _resolve_inside(manifest.directory, module_rel, where)
-        _expect(module_path.is_file(), where, f"入口模块不存在: {module_path}")
+        _validate_python_module_entry(manifest)
     elif manifest.type == "skill":
+        where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
+        entry = manifest.entry
         content_rel = entry.get("content", "SKILL.md")
         _expect(
             isinstance(content_rel, str) and content_rel.strip(),
@@ -753,6 +799,8 @@ def _validate_static_entry(manifest: PluginManifest) -> None:
         content_path = _resolve_inside(manifest.directory, content_rel, where)
         _expect(content_path.is_file(), where, f"正文文件不存在: {content_path}")
     elif manifest.type == "mcp":
+        where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
+        entry = manifest.entry
         transport = entry.get("transport", "stdio")
         _expect(transport == "stdio", where, f"不支持的 transport: {transport}")
         command = entry.get("command")
@@ -763,6 +811,124 @@ def _validate_static_entry(manifest: PluginManifest) -> None:
             where,
             "'args' 必须是字符串数组",
         )
+
+
+def _validate_python_module_entry(manifest: PluginManifest) -> None:
+    where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
+    entry = manifest.entry
+    runtime = entry.get("runtime", "python")
+    _expect(
+        runtime == "python",
+        where,
+        f"{manifest.type} 插件的进程内入口只支持 runtime 'python'，实际是 '{runtime}'",
+    )
+    module_rel = entry.get("module")
+    factory_name = entry.get("factory")
+    _expect(
+        isinstance(module_rel, str) and module_rel.strip(),
+        where,
+        f"{manifest.type} 插件必须在 entry 里声明非空 'module'",
+    )
+    _expect(
+        isinstance(factory_name, str) and factory_name.strip(),
+        where,
+        f"{manifest.type} 插件必须在 entry 里声明非空 'factory'",
+    )
+    module_path = _resolve_inside(manifest.directory, module_rel, where)
+    _expect(module_path.is_file(), where, f"入口模块不存在: {module_path}")
+
+
+def _parse_stdio_tool_spec(manifest: PluginManifest) -> StdioToolSpec:
+    """Parse a static external tool catalog and process launch configuration."""
+    where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
+    entry = manifest.entry
+
+    runtime = entry.get("runtime")
+    _expect(
+        runtime in _EXTERNAL_RUNTIMES,
+        where,
+        f"外部 tool runtime 必须是 {sorted(_EXTERNAL_RUNTIMES)} 之一",
+    )
+    protocol = entry.get("protocol")
+    _expect(
+        protocol == "jsonrpc-stdio",
+        where,
+        "外部 tool 目前只支持 protocol 'jsonrpc-stdio'",
+    )
+
+    raw_command = entry.get("command")
+    raw_args = entry.get("args", [])
+    _expect(
+        isinstance(raw_args, list) and all(isinstance(arg, str) for arg in raw_args),
+        where,
+        "'args' 必须是字符串数组",
+    )
+    if isinstance(raw_command, str):
+        command_parts = [raw_command, *raw_args]
+    elif isinstance(raw_command, list):
+        _expect(
+            all(isinstance(part, str) for part in raw_command),
+            where,
+            "'command' 数组必须全部是字符串",
+        )
+        command_parts = [*raw_command, *raw_args]
+    else:
+        raise ValueError(f"{where}: 外部 tool 必须声明字符串或字符串数组 'command'")
+
+    _expect(bool(command_parts), where, "'command' 不能为空")
+    command = sys.executable if command_parts[0] == "python" else command_parts[0]
+    args = [_resolve_arg(manifest.directory, arg) for arg in command_parts[1:]]
+
+    timeout = entry.get("timeout", 30.0)
+    _expect(
+        isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0,
+        where,
+        "'timeout' 必须是正数",
+    )
+
+    raw_tools = entry.get("tools")
+    _expect(
+        isinstance(raw_tools, list) and bool(raw_tools),
+        where,
+        "外部 tool 必须在 entry.tools 声明非空工具目录",
+    )
+    definitions: list[ExternalToolDefinition] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(raw_tools, start=1):
+        item_where = f"{where} tools[{index}]"
+        _expect(isinstance(item, dict), item_where, "工具声明必须是对象")
+
+        name = item.get("name")
+        _expect(
+            isinstance(name, str) and bool(_NAME_RE.fullmatch(name)),
+            item_where,
+            "缺少合法的 'name'",
+        )
+        _expect(name not in seen_names, item_where, f"工具名重复: {name}")
+
+        description = item.get("description", "")
+        _expect(isinstance(description, str), item_where, "'description' 必须是字符串")
+
+        parameters = item.get("parameters", {"type": "object", "properties": {}})
+        _expect(isinstance(parameters, dict), item_where, "'parameters' 必须是 JSON Schema 对象")
+
+        definitions.append(
+            ExternalToolDefinition(
+                name=name,
+                description=description,
+                parameters=parameters,
+            )
+        )
+        seen_names.add(name)
+
+    return StdioToolSpec(
+        manifest=manifest,
+        protocol=protocol,
+        command=command,
+        args=args,
+        timeout=float(timeout),
+        tools=tuple(definitions),
+    )
 
 
 def _resolve_inside(base: Path, relative: str, where: str) -> Path:
@@ -801,6 +967,12 @@ def _load_entry_factory(manifest: PluginManifest, kind_label: str) -> Callable[[
     """解析 hook/tool 类插件的 module + factory 入口，返回工厂函数。"""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
     entry = manifest.entry
+    runtime = entry.get("runtime", "python")
+    _expect(
+        runtime == "python",
+        where,
+        f"{kind_label} 插件的进程内入口只支持 runtime 'python'，实际是 '{runtime}'",
+    )
     module_rel = entry.get("module")
     factory_name = entry.get("factory")
     _expect(
@@ -880,14 +1052,26 @@ def _coerce_tools(value: Any, where: str) -> list[Tool]:
 
 
 def load_tool_plugin(manifest: PluginManifest) -> list[Tool]:
-    """加载单个本地工具插件：工厂返回的每个 Tool 都包上插件命名空间。"""
+    """加载单个工具插件，并把每个工具包上插件命名空间。"""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
-    factory = _load_entry_factory(manifest, "tool")
-    try:
-        produced = factory(manifest.directory)
-    except Exception as exc:
-        raise ValueError(f"{where}: 工厂执行失败: {exc}") from exc
-    tools = _coerce_tools(produced, where)
+    runtime = manifest.entry.get("runtime", "python")
+    if runtime in _EXTERNAL_RUNTIMES:
+        spec = _parse_stdio_tool_spec(manifest)
+        host = StdioJsonRpcHost(
+            plugin_name=manifest.name,
+            plugin_dir=manifest.directory,
+            command=spec.command,
+            args=spec.args,
+            timeout=spec.timeout,
+        )
+        tools: list[Tool] = [ExternalTool(host, definition) for definition in spec.tools]
+    else:
+        factory = _load_entry_factory(manifest, "tool")
+        try:
+            produced = factory(manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: 工厂执行失败: {exc}") from exc
+        tools = _coerce_tools(produced, where)
     declarations = {declared.code: declared for declared in manifest.errors}
     return [NamespacedTool(manifest.name, tool, declarations=declarations) for tool in tools]
 
@@ -896,6 +1080,12 @@ def load_model_plugin(manifest: PluginManifest) -> ModelPlugin:
     """校验单个模型插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "model")
     return ModelPlugin(manifest=manifest, factory=factory)
+
+
+def load_context_plugin(manifest: PluginManifest) -> ContextPlugin:
+    """Validate a context policy plugin and keep its factory lazy."""
+    factory = _load_entry_factory(manifest, "context")
+    return ContextPlugin(manifest=manifest, factory=factory)
 
 
 def load_skill_plugin(manifest: PluginManifest) -> SkillPlugin:
@@ -1004,6 +1194,19 @@ def load_model_plugins(
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
+def load_context_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+) -> list[ContextPlugin]:
+    """Load enabled context policy plugins without instantiating them."""
+    plugins: list[ContextPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "context":
+            continue
+        plugins.append(load_context_plugin(manifest))
+        logger.info("上下文策略插件已发现: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
 def load_skill_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
 ) -> list[SkillPlugin]:
@@ -1080,6 +1283,7 @@ class PluginAssembly:
     mcp: list[McpPluginSpec] = field(default_factory=list)
     tools: list[tuple[PluginManifest, list[Tool]]] = field(default_factory=list)
     models: list[ModelPlugin] = field(default_factory=list)
+    contexts: list[ContextPlugin] = field(default_factory=list)
     skills: list[SkillPlugin] = field(default_factory=list)
     sessions: list[SessionPlugin] = field(default_factory=list)
     memories: list[MemoryPlugin] = field(default_factory=list)
@@ -1102,6 +1306,12 @@ def _apply_tool(assembly: PluginAssembly, manifest: PluginManifest, tools: list[
 
 def _apply_model(assembly: PluginAssembly, manifest: PluginManifest, plugin: ModelPlugin) -> None:
     assembly.models.append(plugin)
+
+
+def _apply_context(
+    assembly: PluginAssembly, manifest: PluginManifest, plugin: ContextPlugin
+) -> None:
+    assembly.contexts.append(plugin)
 
 
 def _apply_skill(assembly: PluginAssembly, manifest: PluginManifest, plugin: SkillPlugin) -> None:
@@ -1136,6 +1346,7 @@ register_kind(KindHandler("hook", load_hook_plugin, _apply_hook))
 register_kind(KindHandler("mcp", load_mcp_plugin, _apply_mcp))
 register_kind(KindHandler("tool", load_tool_plugin, _apply_tool))
 register_kind(KindHandler("model", load_model_plugin, _apply_model))
+register_kind(KindHandler("context", load_context_plugin, _apply_context))
 register_kind(KindHandler("skill", load_skill_plugin, _apply_skill))
 register_kind(KindHandler("session", load_session_plugin, _apply_session))
 register_kind(KindHandler("memory", load_memory_plugin, _apply_memory))

@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from core.config import AppConfig
+from core.context import ContextPolicy
 from core.events import EventBus, jsonl_sink
 from core.hooks import HookGateway
 from core.prompt import build_system_prompt
@@ -96,6 +97,7 @@ class HarnessRuntime:
         self.events = EventBus()
         self.tools = ToolRegistry()
         self.model: Any = None
+        self.context_policy: ContextPolicy | None = None
         self.session: SessionGateway | None = None
         self.memory: MemoryGateway | None = None
         self.skills: SkillGateway | None = None
@@ -118,6 +120,7 @@ class HarnessRuntime:
             self._assembly = self._assemble_plugins()
             self._setup_events()
             self._create_model()
+            self._create_context_policy()
             await self._create_session()
             self._create_memory()
             self._register_tools()
@@ -142,6 +145,7 @@ class HarnessRuntime:
         self._ready = False
         if self.mcp_gateway is not None:
             await self.mcp_gateway.close()
+        await self._close_external_tools()
         for key, state in list(self._plugin_states.items()):
             if key[0] == "external" and state.status == "active":
                 self.plugin_manager.record_runtime_status(state.name, "stopped")
@@ -155,6 +159,18 @@ class HarnessRuntime:
 
     async def __aexit__(self, *_exc: object) -> None:
         await self.close()
+
+    async def _close_external_tools(self) -> None:
+        """Close process-backed tools owned by this assembly."""
+        for _manifest, tools in self._assembly.tools:
+            for tool in tools:
+                close = getattr(tool, "close", None)
+                if not callable(close):
+                    continue
+                try:
+                    await close()
+                except Exception:
+                    logger.exception("external tool cleanup failed: %s", tool.name)
 
     def snapshot(self) -> RuntimeSnapshot:
         tool_names = tuple(
@@ -306,6 +322,28 @@ class HarnessRuntime:
             self._mark_manifest_error(plugin.manifest, exc)
             raise RuntimeStartupError(f"模型插件 {self.config.model} 初始化失败: {exc}") from exc
 
+    def _create_context_policy(self) -> None:
+        plugin = next(
+            (
+                candidate
+                for candidate in self._assembly.contexts
+                if candidate.manifest.name == self.config.context_strategy
+            ),
+            None,
+        )
+        if plugin is None:
+            raise RuntimeStartupError(
+                f"未知的上下文策略插件: {self.config.context_strategy}，可选: "
+                f"{[candidate.manifest.name for candidate in self._assembly.contexts]}"
+            )
+        try:
+            self.context_policy = plugin.create()
+        except Exception as exc:
+            self._mark_manifest_error(plugin.manifest, exc)
+            raise RuntimeStartupError(
+                f"上下文策略插件 {self.config.context_strategy} 初始化失败: {exc}"
+            ) from exc
+
     async def _create_session(self) -> None:
         plugin = next(
             (
@@ -405,6 +443,7 @@ def _merge_assemblies(target: PluginAssembly, source: PluginAssembly) -> None:
     target.mcp.extend(source.mcp)
     target.tools.extend(source.tools)
     target.models.extend(source.models)
+    target.contexts.extend(source.contexts)
     target.skills.extend(source.skills)
     target.sessions.extend(source.sessions)
     target.memories.extend(source.memories)

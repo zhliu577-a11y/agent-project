@@ -3,6 +3,14 @@ import asyncio
 import logging
 from collections.abc import Callable
 
+from core.context import (
+    ContextPolicy,
+    ContextRequest,
+    ContextResult,
+    TailWindowPolicy,
+    request_tokens,
+    valid_tool_call_sequence,
+)
 from core.errors import RetryableError, classify_error
 from core.events import Event, EventBus
 from core.hooks import ConfirmFn, HookGateway
@@ -15,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 # 同一工具连续失败达到该次数后，自动禁用，防止模型死循环重试
 FAIL_LIMIT = 3
+_DEFAULT_CONTEXT_POLICY = TailWindowPolicy()
 
 
 async def run_agent(
@@ -28,6 +37,9 @@ async def run_agent(
     history: list[Message] | None = None,
     confirm: ConfirmFn | None = None,
     events: EventBus | None = None,
+    context_policy: ContextPolicy | None = None,
+    max_context_tokens: int = 20000,
+    session_id: str | None = None,
 ) -> TurnContext:
     """执行固定循环：调模型 → 执行工具 → 回填 → 直到模型不再请求工具。
 
@@ -57,6 +69,48 @@ async def run_agent(
         else:
             await _emit("turn.end", ctx=ctx)
 
+    active_context_policy = context_policy or _DEFAULT_CONTEXT_POLICY
+
+    async def _prepare_model_messages(
+        tool_schemas: list[dict],
+    ) -> list[Message]:
+        request = ContextRequest(
+            messages=list(ctx.messages),
+            tools=tool_schemas,
+            max_tokens=max_context_tokens,
+            session_id=session_id,
+            turn=ctx.turn,
+            state=ctx.state,
+        )
+        try:
+            result = await active_context_policy.prepare(request)
+            if not isinstance(result, ContextResult):
+                raise TypeError(
+                    f"context policy must return ContextResult, got {type(result).__name__}"
+                )
+            if not result.messages:
+                raise ValueError("context policy returned no messages")
+            if not all(isinstance(message, Message) for message in result.messages):
+                raise TypeError("context policy returned a non-Message value")
+            if result.messages[0].role != "system":
+                raise ValueError("context policy must preserve system instructions")
+            if not valid_tool_call_sequence(result.messages):
+                raise ValueError("context policy returned orphaned tool call messages")
+            if request_tokens(result.messages, tool_schemas) > max_context_tokens:
+                raise ValueError("context policy exceeded the token budget")
+            return result.messages
+        except Exception as exc:
+            logger.warning(
+                "上下文策略 %s 失败，回退到 tail-window: %s",
+                type(active_context_policy).__name__,
+                exc,
+            )
+
+        fallback = await _DEFAULT_CONTEXT_POLICY.prepare(request)
+        if request_tokens(fallback.messages, tool_schemas) > max_context_tokens:
+            logger.warning("tail-window 仍无法容纳当前请求；将保留最新消息并交由模型处理")
+        return fallback.messages
+
     while ctx.turn < ctx.max_turns:
         if events is None:
             await hooks.turn_start(ctx)
@@ -65,8 +119,13 @@ async def run_agent(
 
         try:
             schemas = tools.list_schemas()
+            model_messages = await _prepare_model_messages(schemas)
             await _emit("model.request", ctx=ctx, tools=len(schemas))
-            resp: ModelResponse = await model.complete(ctx.messages, schemas, on_token=on_token)
+            resp: ModelResponse = await model.complete(
+                model_messages,
+                schemas,
+                on_token=on_token,
+            )
         except Exception as exc:
             error = classify_error(exc)
             category = getattr(error, "category", type(error).__name__)

@@ -15,6 +15,7 @@ from plugins.loader import (
     discover_contributions,
     discover_plugins,
     inspect_package,
+    load_context_plugins,
     load_embedding_plugins,
     load_hook_plugins,
     load_mcp_plugins,
@@ -431,6 +432,13 @@ def test_assemble_plugins_groups_by_kind(tmp_path) -> None:
     )
     _write_plugin(
         tmp_path,
+        "context",
+        "tail-window",
+        _context_manifest(),
+        files={"policy.py": _CONTEXT_MODULE},
+    )
+    _write_plugin(
+        tmp_path,
         "skills",
         "code-review",
         {
@@ -480,6 +488,7 @@ def test_assemble_plugins_groups_by_kind(tmp_path) -> None:
     assert [spec.manifest.name for spec in assembly.mcp] == ["time"]
     assert [manifest.name for manifest, _ in assembly.tools] == ["text"]
     assert [plugin.manifest.name for plugin in assembly.models] == ["deepseek"]
+    assert [plugin.manifest.name for plugin in assembly.contexts] == ["tail-window"]
     assert [plugin.manifest.name for plugin in assembly.skills] == ["code-review"]
     assert [plugin.manifest.name for plugin in assembly.sessions] == ["jsonl"]
     assert [plugin.manifest.name for plugin in assembly.memories] == ["jsonl"]
@@ -544,6 +553,60 @@ def test_model_plugin_create_rejects_bad_factory_return(tmp_path) -> None:
     )
     plugin = load_model_plugins(tmp_path)[0]
     with pytest.raises(ValueError, match="ModelAdapter"):
+        plugin.create()
+
+
+_CONTEXT_MODULE = """
+from core.context import ContextResult, TailWindowPolicy
+
+
+class FakeContextPolicy(TailWindowPolicy):
+    async def prepare(self, request):
+        result = await super().prepare(request)
+        return ContextResult(
+            messages=result.messages,
+            dropped_count=result.dropped_count,
+            metadata={"strategy": "fake"},
+        )
+
+
+def create_policy(plugin_dir):
+    return FakeContextPolicy()
+"""
+
+
+def _context_manifest(name: str = "tail-window") -> dict:
+    return {
+        "name": name,
+        "type": "context",
+        "entry": {"module": "policy.py", "factory": "create_policy"},
+    }
+
+
+def test_load_context_plugins_is_lazy_and_create_returns_policy(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "context",
+        "tail-window",
+        _context_manifest(),
+        files={"policy.py": _CONTEXT_MODULE},
+    )
+    plugins = load_context_plugins(tmp_path)
+    assert len(plugins) == 1
+    policy = plugins[0].create()
+    assert type(policy).__name__ == "FakeContextPolicy"
+
+
+def test_context_plugin_create_rejects_bad_factory_return(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "context",
+        "bad",
+        _context_manifest(name="bad"),
+        files={"policy.py": "def create_policy(plugin_dir):\n    return 42\n"},
+    )
+    plugin = load_context_plugins(tmp_path)[0]
+    with pytest.raises(ValueError, match="ContextPolicy"):
         plugin.create()
 
 
@@ -1051,3 +1114,11 @@ def test_assemble_plugins_uses_kinds_registered_after_import(tmp_path, monkeypat
 
     assert seen == [("demo", "demo")]
     assert [(c.kind, c.manifest.name) for c in assembly.contributions] == [("test-kind", "demo")]
+
+
+def test_repository_context_strategies_are_loadable() -> None:
+    context_root = Path(__file__).resolve().parents[1] / "plugins" / "context"
+    plugins = load_context_plugins(context_root)
+
+    assert [plugin.manifest.name for plugin in plugins] == ["summary-window", "tail-window"]
+    assert all(callable(plugin.create().prepare) for plugin in plugins)

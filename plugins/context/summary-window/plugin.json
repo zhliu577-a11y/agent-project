@@ -1,0 +1,10 @@
+{
+  "name": "summary-window",
+  "type": "context",
+  "version": "1.0.0",
+  "description": "Summarize older messages and retain the newest atomic conversation groups.",
+  "entry": {
+    "module": "policy.py",
+    "factory": "create_policy"
+  }
+}

@@ -71,6 +71,26 @@ def create_store(plugin_dir):
     return FakeMemory()
 """
 
+_CONTEXT_MODULE = """
+from core.context import TailWindowPolicy
+
+
+def create_policy(plugin_dir):
+    return TailWindowPolicy()
+"""
+
+_EXTERNAL_TOOL_SERVER = r"""
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    params = request.get("params", {})
+    text = params.get("arguments", {}).get("text", "")
+    result = {"content": [{"type": "text", "text": f"external:{text}"}]}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"""
+
 
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,6 +147,44 @@ def _write_builtins(root: Path) -> None:
         },
         {"store.py": _MEMORY_MODULE},
     )
+    _write_builtin(
+        root,
+        "context",
+        "tail-window",
+        {
+            "name": "tail-window",
+            "type": "context",
+            "entry": {"module": "policy.py", "factory": "create_policy"},
+        },
+        {"policy.py": _CONTEXT_MODULE},
+    )
+    _write_builtin(
+        root,
+        "tools",
+        "external",
+        {
+            "name": "external",
+            "type": "tool",
+            "entry": {
+                "runtime": "process",
+                "protocol": "jsonrpc-stdio",
+                "command": "python",
+                "args": ["server.py"],
+                "tools": [
+                    {
+                        "name": "echo",
+                        "description": "External echo.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                        },
+                    }
+                ],
+            },
+        },
+        {"server.py": _EXTERNAL_TOOL_SERVER},
+    )
 
 
 def _manager(tmp_path: Path) -> PluginManager:
@@ -147,6 +205,7 @@ def _config() -> AppConfig:
         memory_store="memory",
         embedding_provider="debug",
         context_max_tokens=20000,
+        context_strategy="tail-window",
     )
 
 
@@ -205,9 +264,21 @@ async def test_runtime_loads_enabled_package_and_records_status(tmp_path, monkey
         assert states["quality"].status == "active"
         assert states["quality"].contributions == ("skill:quality--lint",)
         assert "use_skill" in snapshot.tools
+        assert "external__echo" in snapshot.tools
+        assert type(runtime.context_policy).__name__ == "TailWindowPolicy"
         assert manager.list_installed()[0].runtime_status == "active"
 
     assert manager.list_installed()[0].runtime_status == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_runtime_executes_and_closes_external_tool(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+    manager = _manager(tmp_path)
+    runtime = HarnessRuntime(_config(), plugin_manager=manager)
+
+    async with runtime:
+        assert await runtime.tools.execute("external__echo", {"text": "hello"}) == "external:hello"
 
 
 @pytest.mark.asyncio

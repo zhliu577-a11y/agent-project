@@ -1,0 +1,10 @@
+{
+  "name": "tail-window",
+  "type": "context",
+  "version": "1.0.0",
+  "description": "Keep system instructions and the newest atomic conversation groups.",
+  "entry": {
+    "module": "policy.py",
+    "factory": "create_policy"
+  }
+}

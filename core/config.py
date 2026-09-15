@@ -20,6 +20,7 @@ class AppConfig:
     memory_store: str = "sqlite"
     embedding_provider: str = "debug"
     context_max_tokens: int = 20000
+    context_strategy: str = "tail-window"
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":
@@ -54,6 +55,10 @@ class AppConfig:
                     "CONTEXT_MAX_TOKENS",
                     _expect_int(context.get("maxTokens", 20000), "context.maxTokens"),
                 )
+            ),
+            context_strategy=os.getenv(
+                "CONTEXT_STRATEGY",
+                _expect_str(context.get("strategy", "tail-window"), "context.strategy"),
             ),
         )
 

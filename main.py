@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 
 from core.config import AppConfig
-from core.context import trim_history
+from core.context import ContextPolicy
 from core.events import Event, EventBus
 from core.state import capture
 from core.tracing import begin_trace, setup_logging
@@ -27,6 +27,7 @@ async def chat(
     session: SessionGateway | None = None,
     max_context_tokens: int = 20000,
     events: EventBus | None = None,
+    context_policy: ContextPolicy | None = None,
 ) -> list[Message]:
     """交互循环；返回本会话最终历史（不含 system），供持久化/恢复。"""
     logger.info("对话已启动，输入 exit / quit / 退出 结束。")
@@ -67,13 +68,6 @@ async def chat(
                 logger.warning("用户输入被事件总线策略拦截: %s", decision)
                 print(f"[bus] 本轮输入被策略拦截({decision})")
                 continue
-        history, dropped = trim_history(history, max_context_tokens)
-        if dropped:
-            logger.warning(
-                "上下文超出预算，已裁剪 %d 条最早消息（剩余 %d 条）",
-                dropped,
-                len(history),
-            )
         ctx = await run_agent(
             model,
             tools,
@@ -83,6 +77,9 @@ async def chat(
             on_token=on_token,
             history=history,
             events=events,
+            context_policy=context_policy,
+            max_context_tokens=max_context_tokens,
+            session_id=session_id,
         )
         history = ctx.messages[1:]  # 去掉 system，其余全部进入下一轮上下文
         if session is not None:
@@ -125,6 +122,7 @@ async def main() -> None:
             session=runtime.session,
             max_context_tokens=config.context_max_tokens,
             events=runtime.events,
+            context_policy=runtime.context_policy,
         )
     finally:
         await runtime.close()

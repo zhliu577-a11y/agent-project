@@ -3,11 +3,12 @@ import asyncio
 
 import pytest
 
+from core.context import ContextResult
 from core.hooks import HookGateway
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
 from core.tool import Tool
-from core.types import ModelResponse, ToolCall
+from core.types import Message, ModelResponse, ToolCall
 from loop import run_agent
 
 pytestmark = pytest.mark.asyncio
@@ -89,6 +90,68 @@ async def test_loop_streams_final_answer_tokens() -> None:
     )
     assert received == ["你好世界"]
     assert ctx.stop_reason == "done"
+
+
+class RecordingContextPolicy:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def prepare(self, request):
+        self.requests.append(request)
+        return ContextResult(messages=list(request.messages))
+
+
+class BrokenContextPolicy:
+    async def prepare(self, request):
+        return ContextResult(
+            messages=[
+                request.messages[0],
+                Message(role="tool", content="orphan", tool_call_id="missing"),
+            ]
+        )
+
+
+async def test_loop_runs_context_policy_before_every_model_call() -> None:
+    model = FakeModel(
+        [
+            ModelResponse(
+                content="",
+                tool_calls=[ToolCall(id="1", name="get_time", arguments={})],
+            ),
+            ModelResponse(content="完成", tool_calls=[]),
+        ]
+    )
+    tools = ToolRegistry()
+    tools.register(GetTime())
+    policy = RecordingContextPolicy()
+
+    ctx = await run_agent(
+        model,
+        tools,
+        HookGateway(),
+        "你是助手",
+        "现在几点",
+        context_policy=policy,
+    )
+
+    assert len(policy.requests) == 2
+    assert any(message.role == "tool" for message in ctx.messages)
+    assert policy.requests[0].messages[-1].role == "user"
+
+
+async def test_loop_falls_back_when_context_policy_breaks_tool_pairing() -> None:
+    model = FakeModel([ModelResponse(content="fallback ok", tool_calls=[])])
+    ctx = await run_agent(
+        model,
+        ToolRegistry(),
+        HookGateway(),
+        "你是助手",
+        "你好",
+        context_policy=BrokenContextPolicy(),
+    )
+
+    assert ctx.stop_reason == "done"
+    assert ctx.messages[-1].content == "fallback ok"
 
 
 class PauseTool(Tool):

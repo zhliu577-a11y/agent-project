@@ -11,6 +11,7 @@
     "provider": "debug"
   },
   "context": {
-    "maxTokens": 20000
+    "maxTokens": 20000,
+    "strategy": "tail-window"
   }
 }

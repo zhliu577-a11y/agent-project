@@ -14,7 +14,7 @@
 - 固定异步 agent loop（调模型 → 执行工具 → 回填 → 判断结束），支持流式输出与多个工具的并行执行
 - **插件目录（drop-in）**：`plugins/` 下每个插件是一个自包含目录 + `plugin.json`，
   拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model`、`skill`、
-  `session`、`memory`、`embedding`、`listener` 九类
+  `session`、`memory`、`embedding`、`listener`、`context` 十类
 - **功能包**：一个包可用 `contributes[]` 同时提供 skill、hook、tool 等能力，
   发现阶段统一展开为 contribution 后按受控 kind 注册表装配
 - **MCP 网关**：Agent 只面向网关这一个通道；网关统一维护各 MCP 插件的连接、
@@ -23,6 +23,9 @@
   tool_before / tool_after / turn_end`），内核只面向 `HookGateway`
 - **本地工具插件**：高频轻量能力以进程内 Python 函数提供（`plugins/tools/*`），
   启动即注册，无子进程、无挂载步骤
+- **外部工具运行时**：`tool` 插件也可声明 `runtime: node | process` 和
+  `protocol: jsonrpc-stdio`，用 TypeScript/Node 或其它语言实现；进程首次调用时
+  启动，Runtime 关闭时统一回收
 - **模型插件**：LLM 适配器来自 `plugins/model/*`（当前 deepseek 为默认），
   `AGENT_MODEL` 环境变量即可切换模型提供方
 - **技能插件**：纯内容插件（`plugins/skills/*`）按需注入操作说明——启动只放
@@ -31,8 +34,8 @@
   自动延续，退出后按 `SESSION_ID` 恢复
 - **长期记忆插件**：跨会话语义笔记（`plugins/memory/*`），模型通过
   `remember / recall / forget` 主动读写
-- **上下文模块**：token 估算 + 每轮自动裁剪（`CONTEXT_MAX_TOKENS`），
-  历史只增不减的问题有解
+- **上下文策略插件**：完整历史由 Session 保存，模型请求前由可替换的
+  `context` 插件生成上下文视图；`CONTEXT_STRATEGY` 可切换策略
 - **插件包生命周期**：外部目录或 zip 包经过静态检查、staging、摘要计算后原子安装；
   安装后默认禁用，启停状态由 `data/plugin-registry.json` 管理
 - **HarnessRuntime**：统一装配插件、网关、模型、会话和工具；启动成功、加载失败
@@ -101,10 +104,10 @@ plugins/
 │   │   └── server.py           #   插件自带代码/配置
 │   ├── math/
 │   └── filesystem/             #   也可以是外部 MCP（npx 等）的启动配置
-├── tools/                      # 本地工具插件（进程内，启动即注册）
+├── tools/                      # 工具插件（Python 进程内或外部进程）
 │   ├── text/                   #   文本工具示例（slugify / count_words）
 │   └── json/                   #   JSON 处理（format / get）
-│       ├── plugin.json
+│       ├── plugin.json         #   默认 runtime=python
 │       └── tool.py             #   实现 Tool 的类 + create_tools 工厂
 ├── model/                      # 模型适配器插件
 │   ├── deepseek/               #   DeepSeek（默认）
@@ -133,6 +136,9 @@ plugins/
 ├── embedding/                  # 嵌入提供方插件（向量记忆后端使用）
 │   ├── debug/                  #   确定性哈希（离线开发/测试）
 │   └── openai-embedding/       #   OpenAI API（真实语义，需 OPENAI_API_KEY）
+├── context/                    # 上下文策略插件（可切换模型请求视图）
+│   ├── tail-window/            #   默认：保留 system 与最新完整消息组
+│   └── summary-window/         #   旧消息抽取摘要 + 保留最新完整消息组
 ├── listeners/                  # 事件订阅者插件（接入事件总线）
 │   └── timeline/               #   把事件写成 JSONL 时间线（示例）
 └── hooks/                      # 生命周期钩子插件
@@ -156,7 +162,8 @@ plugins/
 ```
 
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
-`mcp` / `hook` / `tool` / `model` / `skill` / `session` / `memory` / `embedding` / `listener`；
+`mcp` / `hook` / `tool` / `model` / `skill` / `session` / `memory` / `embedding` /
+`listener` / `context`；
 `enabled: false` 的插件
 结构仍会校验但不会加载。可选字段 `priority`（整数，默认 `0`）决定钩子插件的
 执行顺序：**越小越先执行**；可选字段 `errors` 声明插件已知的领域错误
@@ -269,13 +276,80 @@ validate -> staging -> 静态入口检查 -> sha256 -> 原子移动 -> registry
 
 | 场景 | 用 `tool` | 用 `mcp` |
 |---|---|---|
-| 高频轻量、纯函数、内部逻辑 | 是（零成本） | 偏重 |
-| 需要现成生态（npx / node / docker） | 否 | 是 |
-| 需要独立进程/沙箱隔离 | 否 | 是 |
+| 高频轻量、纯函数、内部逻辑 | Python 进程内（零成本） | 偏重 |
+| TypeScript/Node 生态、需要独立进程 | 外部 `runtime` 工具 | 也可以 |
+| 已有 npx / CLI / docker 能力且只需内部使用 | 外部 `runtime` 工具 | 也可以 |
 | 将来要让别的 MCP 客户端复用 | 否 | 是 |
 
-两种工具在模型侧无差别：都是 `<插件名>__<工具名>`，都过同一套权限/审计钩子；
+这些工具在模型侧无差别：都是 `<插件名>__<工具名>`，都过同一套权限/审计钩子；
 区别只在“能力怎么托管”。
+
+### 外部进程工具插件（Node / TypeScript 等）
+
+不改变现有的 Python 工具插件写法；需要 TypeScript/Node 或独立进程时，在
+`entry` 中改用 `runtime` + `protocol`：
+
+```json
+{
+  "name": "browser-lite",
+  "type": "tool",
+  "entry": {
+    "runtime": "node",
+    "protocol": "jsonrpc-stdio",
+    "command": "node",
+    "args": ["dist/index.js"],
+    "timeout": 30,
+    "tools": [
+      {
+        "name": "open_url",
+        "description": "Open a URL and return the page title.",
+        "parameters": {
+          "type": "object",
+          "properties": { "url": { "type": "string" } },
+          "required": ["url"]
+        }
+      }
+    ]
+  }
+}
+```
+
+- `runtime` 支持 `node` 和 `process`；`process` 用于其它语言，实际执行命令由
+  `command` 决定。`command` 可以是字符串 + `args`，也可以直接写成
+  `["node", "dist/index.js"]`。
+- `protocol` 目前只支持 `jsonrpc-stdio`。进程工作目录固定为插件目录；命令中
+  指向插件目录内真实文件的相对参数会自动转成绝对路径。
+- `entry.tools` 是静态工具目录，启动装配时注册 schema，不需要先启动进程。
+  进程在第一次调用时惰性启动，同一插件的工具共享一个进程。
+- 子进程的 `stdout` 必须只输出一行一个 JSON-RPC 响应；普通日志写
+  `stderr`，宿主会带插件名转发到日志。
+- Runtime 关闭时会 terminate 外部进程。当前一个插件进程内的调用按顺序执行。
+
+对应 TypeScript 侧只需要处理 `tools/call`：
+
+```typescript
+import * as readline from "node:readline";
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method !== "tools/call") return;
+
+  const { name, arguments: args } = request.params;
+  const result =
+    name === "open_url"
+      ? { content: [{ type: "text", text: `opened ${args.url}` }] }
+      : { content: [{ type: "text", text: `unknown tool: ${name}` }] };
+
+  process.stdout.write(
+    JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\n",
+  );
+});
+```
+
+JSON-RPC `error.code` 是字符串且命中该插件 `errors` 声明时，会按统一规则翻译成
+`DeclaredPluginError`；其它错误会成为普通 `ToolError`。协议同一时刻只处理一个
+请求，宿主会对同一插件的调用做串行化。
 
 ### 模型插件（`type: "model"`）
 
@@ -367,10 +441,41 @@ validate -> staging -> 静态入口检查 -> sha256 -> 原子移动 -> registry
 
 它们和普通工具一样过权限/审计钩子。
 
-### 上下文模块
+### 上下文策略插件（`type: "context"`）
 
-- 上下文预算：`CONTEXT_MAX_TOKENS`（默认 20000），每轮请求前按
-  “丢最旧、保最近”裁剪历史，裁剪数量会打日志。
+```json
+{
+  "name": "tail-window",
+  "type": "context",
+  "entry": { "module": "policy.py", "factory": "create_policy" }
+}
+```
+
+上下文策略实现 `core.context.ContextPolicy`：
+
+```python
+async def prepare(request: ContextRequest) -> ContextResult: ...
+```
+
+- `CONTEXT_STRATEGY`（默认 `tail-window`）选择当前策略；
+- 策略在每次模型调用前执行，包括同一个 agent turn 内的工具循环；
+- `ContextRequest` 提供完整消息、工具 schema、token 预算、会话与 turn 状态；
+- `ContextResult` 只作为“本次发给模型的视图”，不会覆盖 Session 中的完整历史；
+- 默认 `tail-window` 会计算 system prompt 与工具 schema，保留最新完整消息组，
+  不会拆开 `assistant(tool_calls)` 与对应的 `tool` 结果；
+- `summary-window` 额外预留 25% 上下文预算，把较早消息抽取成有限长度摘要并
+  并入 system prompt，再原样保留最新完整消息组；
+- 策略异常、返回非法 tool-call 序列或仍超预算时，loop 回退到 `tail-window`，
+  保证模型调用边界仍可用。
+
+`CONTEXT_MAX_TOKENS`（默认 20000）是该视图的估算预算。摘要类策略必须在
+插件内部使用独立预算，不能递归进入完整 agent loop。
+
+切换内置策略：
+
+```powershell
+$env:CONTEXT_STRATEGY="summary-window"
+```
 
 ### 错误分类与重试（边界翻译）
 
@@ -400,6 +505,8 @@ validate -> staging -> 静态入口检查 -> sha256 -> 原子移动 -> registry
 
 - `code` 唯一、`category` 必须来自内核固定集合、`retryable` 需与 category 自洽；
 - 进程内插件抛 `DeclaredPluginError(code, message)`，由包装层按声明补全；
+- 外部进程工具返回 JSON-RPC `error.code` 字符串时，按同一份声明补全；MCP 和
+  外部工具都把未声明的错误退化为普通 `ToolError`；
 - MCP 插件返回 `isError` 且文本以 `[code] …` 或 `code: …` 开头时按声明匹配，
   匹配不到则退化为通用 `ToolError`；
 - 工具失败回填给模型时会带上 `错误类别 + code + hint`，例如
@@ -463,7 +570,7 @@ validate -> staging -> 静态入口检查 -> sha256 -> 原子移动 -> registry
   "session": { "store": "jsonl", "id": "default" },
   "memory": { "store": "sqlite" },
   "embedding": { "provider": "debug" },
-  "context": { "maxTokens": 20000 }
+  "context": { "maxTokens": 20000, "strategy": "tail-window" }
 }
 ```
 
@@ -491,7 +598,8 @@ validate -> staging -> 静态入口检查 -> sha256 -> 原子移动 -> registry
 | `VECTOR_SIMILARITY_THRESHOLD` | `0.2` | 低于该相似度则回退字面搜索 |
 | `VECTOR_TOP_K` | `3` | 语义检索最多返回条数 |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI 嵌入模型名 |
-| `CONTEXT_MAX_TOKENS` | `20000` | 单轮模型上下文预算（超出丢最旧历史） |
+| `CONTEXT_MAX_TOKENS` | `20000` | 单次模型请求上下文的估算预算 |
+| `CONTEXT_STRATEGY` | `tail-window` | 激活的上下文策略插件（plugins/context/* 里选） |
 | `MCP_CONNECT_TIMEOUT` | `20` | MCP 插件连接超时（秒） |
 | `MCP_CALL_TIMEOUT` | `30` | 单次 MCP 工具调用超时（秒） |
 | `MCP_CONNECT_RETRIES` | `0` | MCP 连接失败额外重试次数（指数退避，默认不重试） |
@@ -569,7 +677,8 @@ bus.subscribe("tool.after", lambda event: print(event.name, event.payload["ok"])
 ## 权限与安全模型
 
 - **插件即信任边界**：MCP 插件可以是任意命令（python / node / npx / docker），
-  钩子插件是任意 Python 代码；只应安装可信来源的插件；
+  外部 `tool` runtime 同样可以执行任意命令，钩子插件是任意 Python 代码；
+  只应安装可信来源的插件；
 - **安装前受控检查**：zip 路径穿越、符号链接、包大小与入口逃逸会被拒绝；
   这些检查降低误装风险，但不把插件变成沙箱内代码；
 - **按需挂载**：启动时只读清单、不连接任何服务器；模型通过 `use_plugin`
@@ -608,5 +717,4 @@ lint + format 检查 + 全部测试。
 - 远程 HTTP MCP 插件（`transport: "http"` + URL + 服务器级信任）
 - 钩子事件扩展（用户输入提交前、会话开始/结束等，对齐 Codex/Claude Code 拦截点）
 - 长期记忆插件（`type: "memory"`：跨会话语义笔记 + recall 注入）
-- 上下文预算 hook（对话过长时自动截断/摘要）
 - MCP 网关进程化：把 `McpGateway` 换成独立代理进程/远程网关客户端（同一窄接口）

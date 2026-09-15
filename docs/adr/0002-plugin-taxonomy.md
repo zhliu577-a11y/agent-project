@@ -52,6 +52,7 @@ PLUGIN_KINDS: dict[str, KindLoader] = {
 | `mcp` | 进程外/外部工具 | McpGateway（懒挂载） | 已落地 |
 | `tool` | 进程内轻量工具 | ToolRegistry（启动即注册） | 已落地（M1） |
 | `model` | LLM 适配器 | 当前激活的模型实例（AGENT_MODEL 选定） | 已落地（M2） |
+| `context` | 模型请求上下文策略 | 每次模型调用前的消息视图（CONTEXT_STRATEGY 选定） | 已落地 |
 | `skill` | 按需注入的操作指令 | SkillGateway + use_skill（渐进披露） | 已落地（M3） |
 | `session` | 会话持久化/恢复 | SessionGateway + SessionStore | 已落地（M4a） |
 
@@ -88,6 +89,8 @@ PLUGIN_KINDS: dict[str, KindLoader] = {
 `plugins/tools/text|json` 示例）、M2（模型 kind，`plugins/model/deepseek` +
 `AGENT_MODEL` 选择）、M3（技能 kind，`plugins/skills/code-review` + use_skill
 渐进披露）、M4a（会话 kind，`plugins/session/jsonl` + 多轮历史延续）均已完成。
+`tool` kind 进一步支持受控的外部 `jsonrpc-stdio` runtime（ADR 0012），
+TypeScript/Node 工具可以在不改变 kind 与 loop 的前提下接入。
 “除 Agent loop 外万物皆插件”在本仓库闭环：
 模型、工具（本地 + MCP）、行为（hooks）全部来自插件目录。
 

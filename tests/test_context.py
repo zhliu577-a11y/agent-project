@@ -1,5 +1,15 @@
 # tests/test_context.py —— 上下文模块：token 估算与历史裁剪
-from core.context import estimate_tokens, trim_history
+import pytest
+
+from core.context import (
+    ContextRequest,
+    SummaryWindowPolicy,
+    TailWindowPolicy,
+    estimate_tokens,
+    request_tokens,
+    trim_history,
+    valid_tool_call_sequence,
+)
 from core.types import Message, ToolCall
 
 
@@ -43,3 +53,75 @@ def test_trim_nonpositive_budget_drops_all() -> None:
     trimmed, dropped = trim_history(_messages(), max_tokens=0)
     assert trimmed == []
     assert dropped == 5
+
+
+def test_tool_call_sequence_detects_orphans() -> None:
+    assert valid_tool_call_sequence(_messages())
+    assert not valid_tool_call_sequence([Message(role="tool", content="x", tool_call_id="1")])
+    assert not valid_tool_call_sequence(
+        [
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id="1", name="x", arguments={})],
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_tail_window_policy_preserves_system_and_tool_pair() -> None:
+    messages = [Message(role="system", content="system"), *_messages()]
+    result = await TailWindowPolicy().prepare(
+        ContextRequest(
+            messages=messages,
+            tools=[],
+            max_tokens=1,
+        )
+    )
+
+    assert result.messages[0].role == "system"
+    assert result.messages[-1].role == "user"
+    assert valid_tool_call_sequence(result.messages)
+
+
+def test_request_tokens_includes_tool_schemas() -> None:
+    messages = [Message(role="system", content="system")]
+    schemas = [{"type": "function", "function": {"name": "echo"}}]
+    assert request_tokens(messages, schemas) > request_tokens(messages, [])
+
+
+@pytest.mark.asyncio
+async def test_summary_window_policy_summarizes_old_messages_within_budget() -> None:
+    messages = [
+        Message(role="system", content="system"),
+        *[Message(role="user", content=f"old message {index}") for index in range(30)],
+        Message(role="user", content="latest question"),
+    ]
+    result = await SummaryWindowPolicy().prepare(
+        ContextRequest(
+            messages=messages,
+            tools=[],
+            max_tokens=80,
+        )
+    )
+
+    assert result.messages[0].role == "system"
+    assert "Earlier conversation summary:" in result.messages[0].content
+    assert result.messages[-1].content == "latest question"
+    assert result.dropped_count > 0
+    assert result.summary
+    assert request_tokens(result.messages, []) <= 80
+    assert valid_tool_call_sequence(result.messages)
+
+
+@pytest.mark.asyncio
+async def test_summary_window_policy_is_noop_within_budget() -> None:
+    messages = [Message(role="system", content="system"), Message(role="user", content="hello")]
+    result = await SummaryWindowPolicy().prepare(
+        ContextRequest(messages=messages, tools=[], max_tokens=1000)
+    )
+
+    assert result.messages == messages
+    assert result.dropped_count == 0
+    assert result.summary == ""
