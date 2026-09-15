@@ -14,7 +14,7 @@
 - 固定异步 agent loop（调模型 → 执行工具 → 回填 → 判断结束），支持流式输出与多个工具的并行执行
 - **插件目录（drop-in）**：`plugins/` 下每个插件是一个自包含目录 + `plugin.json`，
   拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model`、`skill`、
-  `session`、`memory`、`embedding` 八类
+  `session`、`memory`、`embedding`、`listener` 九类
 - **功能包**：一个包可用 `contributes[]` 同时提供 skill、hook、tool 等能力，
   发现阶段统一展开为 contribution 后按受控 kind 注册表装配
 - **MCP 网关**：Agent 只面向网关这一个通道；网关统一维护各 MCP 插件的连接、
@@ -127,6 +127,8 @@ plugins/
 ├── embedding/                  # 嵌入提供方插件（向量记忆后端使用）
 │   ├── debug/                  #   确定性哈希（离线开发/测试）
 │   └── openai-embedding/       #   OpenAI API（真实语义，需 OPENAI_API_KEY）
+├── listeners/                  # 事件订阅者插件（接入事件总线）
+│   └── timeline/               #   把事件写成 JSONL 时间线（示例）
 └── hooks/                      # 生命周期钩子插件
     └── permission/             #   权限策略示例（allow/ask/deny）
         ├── plugin.json
@@ -148,7 +150,8 @@ plugins/
 ```
 
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
-`mcp` / `hook` / `tool` / `model` / `skill` / `session` / `memory` / `embedding`；`enabled: false` 的插件
+`mcp` / `hook` / `tool` / `model` / `skill` / `session` / `memory` / `embedding` / `listener`；
+`enabled: false` 的插件
 结构仍会校验但不会加载。可选字段 `priority`（整数，默认 `0`）决定钩子插件的
 执行顺序：**越小越先执行**；可选字段 `errors` 声明插件已知的领域错误
 （见下文“错误分类与重试”）。字段写错启动即报错。
@@ -473,6 +476,51 @@ plugins/
   （历史在 `<SESSION_ID>.jsonl`）；
 - **重试**：MCP 连接失败按 `MCP_CONNECT_RETRIES` 做指数退避；错误类别、插件
   声明的错误码与重试判定见上文“错误分类与重试（边界翻译）”。
+
+### 事件总线（UNBOX）
+
+进程内发布/订阅总线（`core/events.py`），两类事件语义严格区分：
+
+| 类型 | API | 规则 |
+|---|---|---|
+| 观察类 | `bus.publish(event)` | 只读广播、异常隔离、支持 `subscribe("*")` |
+| 决策类 | `bus.decide(event)` | 汇总 `allow/ask/deny`，按 `deny > ask > allow` 折叠，异常按 deny |
+
+阶段一（当前）：
+
+- loop 发布 `turn.start / model.request / model.response / model.error /
+  tool.start / tool.after / tool.denied / turn.end`；
+- `HookGateway.attach(bus)` 订阅观察事件并扇出给现有 hook 插件（**旧插件零迁移**），
+  决策类 `tool.before` 仍由 HookGateway 直接承担；
+- `MemoryGateway` 发布 `memory.write / memory.update / memory.delete`；
+- CLI/API 发布 `session.start / session.end`，并在每轮输入前用
+  `user_prompt.submit` 决策事件（返回 `deny` 即拒绝本轮）；
+- 设置 `EVENT_LOG=<path>` 时自动订阅 `*`，把事件写成 JSONL 时间线。
+
+第三方模块接入只需要一次订阅，不用改内核：
+
+```python
+from core.events import Event, EventBus
+
+bus = EventBus()
+bus.subscribe("tool.after", lambda event: print(event.name, event.payload["ok"]))
+```
+
+**listener 插件（`type: "listener"`）**：把“订阅”本身也做成插件——
+
+```json
+{
+  "name": "timeline",
+  "type": "listener",
+  "events": ["*"],
+  "entry": { "module": "listener.py", "factory": "create_listener" }
+}
+```
+
+工厂返回 `core.events.Subscription(event, handler, priority)` 列表，loader 在
+启动时把它们注册进总线（订阅了清单未声明的事件、或订阅决策类事件，启动即报错），
+并返回退订令牌（为将来的热卸载预留）。**决策类事件不允许 listener 订阅**——
+需要影响流程请写 hook 插件。完整示例见 `plugins/listeners/timeline/`。
 
 ### 权限策略（`plugins/hooks/permission/permission.json`）
 

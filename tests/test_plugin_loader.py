@@ -910,6 +910,39 @@ def test_package_rejects_duplicate_package_name(tmp_path) -> None:
         discover_contributions(tmp_path)
 
 
+def test_package_can_contribute_listener_with_inherited_events(tmp_path) -> None:
+    _write_package(
+        tmp_path,
+        "observability",
+        {
+            "apiVersion": "1",
+            "name": "observability",
+            "events": ["tool.after"],
+            "contributes": [
+                {
+                    "id": "timeline",
+                    "kind": "listener",
+                    "entry": {"module": "listener.py", "factory": "create_listener"},
+                }
+            ],
+        },
+        {
+            "listener.py": (
+                "from core.events import Subscription\n\n"
+                "def create_listener(plugin_dir):\n"
+                "    return [Subscription(event='tool.after', handler=lambda event: None)]\n"
+            )
+        },
+    )
+
+    assembly = assemble_plugins(tmp_path)
+
+    assert [plugin.manifest.name for plugin in assembly.listeners] == ["observability--timeline"]
+    assert assembly.listeners[0].manifest.events == ("tool.after",)
+    assert assembly.listeners[0].create()[0].event == "tool.after"
+    assert assembly.contributions[0].package_name == "observability"
+
+
 def test_assemble_plugins_uses_kinds_registered_after_import(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(plugin_loader, "_KIND_REGISTRY", dict(plugin_loader._KIND_REGISTRY))
     monkeypatch.setattr(plugin_loader, "SUPPORTED_KINDS", plugin_loader.SUPPORTED_KINDS)

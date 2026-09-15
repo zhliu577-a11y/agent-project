@@ -69,6 +69,7 @@ from typing import Any
 
 from core.embedding import EmbeddingProvider
 from core.errors import AGENT_CATEGORIES, resolve_declared_error
+from core.events import EventBus, Subscription, coerce_subscriptions
 from core.hooks import LifecycleHooks
 from core.memory import MemoryStore
 from core.model import ModelAdapter
@@ -80,6 +81,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_PLUGINS_DIR = Path(__file__).resolve().parent
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CODE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_EVENT_RE = re.compile(r"^(\*|[A-Za-z0-9_.-]+)$")
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,7 @@ class PluginManifest:
     entry: dict[str, Any]
     priority: int = 0
     errors: tuple[DeclaredError, ...] = ()
+    events: tuple[str, ...] = ()
     package_name: str | None = None
     contribution_id: str | None = None
 
@@ -288,6 +291,31 @@ class EmbeddingPlugin:
         return provider
 
 
+@dataclass(frozen=True)
+class ListenerPlugin:
+    """事件订阅者插件：清单 + 惰性工厂，返回 Subscription 列表接入事件总线。"""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> tuple[Subscription, ...]:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            value = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: listener 工厂执行失败: {exc}") from exc
+        subscriptions = coerce_subscriptions(value, where)
+        if self.manifest.events:
+            declared = set(self.manifest.events)
+            for subscription in subscriptions:
+                if subscription.event not in declared:
+                    raise ValueError(
+                        f"{where}: 订阅了未声明的事件 '{subscription.event}'，"
+                        f"清单声明: {sorted(declared)}"
+                    )
+        return subscriptions
+
+
 def _expect(condition: bool, where: str, message: str) -> None:
     if not condition:
         raise ValueError(f"{where}: {message}")
@@ -333,6 +361,7 @@ def _parse_manifest(path: Path) -> PluginManifest:
     )
 
     errors = _parse_declared_errors(raw, where)
+    events = _parse_declared_events(raw, where)
 
     return PluginManifest(
         name=name,
@@ -344,7 +373,25 @@ def _parse_manifest(path: Path) -> PluginManifest:
         entry=entry,
         priority=priority,
         errors=errors,
+        events=events,
     )
+
+
+def _parse_declared_events(raw: dict[str, Any], where: str) -> tuple[str, ...]:
+    """校验 listener 插件的 events 声明（事件名列表，支持 "*"）。"""
+    items = raw.get("events", [])
+    _expect(isinstance(items, list), where, "'events' 必须是数组")
+    declared: list[str] = []
+    for index, item in enumerate(items, start=1):
+        item_where = f"{where} 第 {index} 个事件声明"
+        _expect(
+            isinstance(item, str) and bool(_EVENT_RE.fullmatch(item)),
+            item_where,
+            "事件名必须形如 'tool.after'，或为 '*'",
+        )
+        _expect(item not in declared, item_where, f"事件重复声明: {item}")
+        declared.append(item)
+    return tuple(declared)
 
 
 def _parse_declared_errors(raw: dict[str, Any], where: str) -> tuple[DeclaredError, ...]:
@@ -413,6 +460,20 @@ def _merge_declared_errors(
     return tuple(merged)
 
 
+def _merge_declared_events(
+    defaults: tuple[str, ...],
+    extra: tuple[str, ...],
+    where: str,
+) -> tuple[str, ...]:
+    merged = list(defaults)
+    seen = set(defaults)
+    for event in extra:
+        _expect(event not in seen, where, f"duplicate event declaration: {event}")
+        merged.append(event)
+        seen.add(event)
+    return tuple(merged)
+
+
 def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[PluginManifest]:
     """Expand a package manifest into one normalized manifest per contribution."""
     where = f"{path}"
@@ -443,6 +504,7 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
     )
 
     package_errors = _parse_declared_errors(raw, where)
+    package_events = _parse_declared_events(raw, where)
     items = raw.get("contributes")
     _expect(
         isinstance(items, list) and bool(items),
@@ -500,6 +562,8 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
 
         item_errors = _parse_declared_errors(item, item_where)
         errors = _merge_declared_errors(package_errors, item_errors, item_where)
+        item_events = _parse_declared_events(item, item_where)
+        events = _merge_declared_events(package_events, item_events, item_where)
         contributions.append(
             PluginManifest(
                 name=f"{package_name}--{contribution_id}",
@@ -511,6 +575,7 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
                 entry=entry,
                 priority=item_priority,
                 errors=errors,
+                events=events,
                 package_name=package_name,
                 contribution_id=contribution_id,
             )
@@ -745,6 +810,12 @@ def load_embedding_plugin(manifest: PluginManifest) -> EmbeddingPlugin:
     return EmbeddingPlugin(manifest=manifest, factory=factory)
 
 
+def load_listener_plugin(manifest: PluginManifest) -> ListenerPlugin:
+    """校验单个 listener 插件并返回惰性工厂（不在此处实例化）。"""
+    factory = _load_entry_factory(manifest, "listener")
+    return ListenerPlugin(manifest=manifest, factory=factory)
+
+
 def _resolve_arg(plugin_dir: Path, arg: str) -> str:
     """插件目录下真实存在的相对路径参数 -> 绝对路径；其余参数原样保留。"""
     path = Path(arg)
@@ -849,6 +920,17 @@ def load_embedding_plugins(root: str | Path | None = None) -> list[EmbeddingPlug
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
+def load_listener_plugins(root: str | Path | None = None) -> list[ListenerPlugin]:
+    """加载插件目录里全部启用的 listener 插件（惰性，不实例化）。"""
+    plugins: list[ListenerPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "listener":
+            continue
+        plugins.append(load_listener_plugin(manifest))
+        logger.info("listener 插件已发现: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
 # ---------- kind 注册表与统一装配 ----------
 
 
@@ -864,6 +946,7 @@ class PluginAssembly:
     sessions: list[SessionPlugin] = field(default_factory=list)
     memories: list[MemoryPlugin] = field(default_factory=list)
     embeddings: list[EmbeddingPlugin] = field(default_factory=list)
+    listeners: list[ListenerPlugin] = field(default_factory=list)
     contributions: list[PluginContribution] = field(default_factory=list)
 
 
@@ -903,6 +986,12 @@ def _apply_embedding(
     assembly.embeddings.append(plugin)
 
 
+def _apply_listener(
+    assembly: PluginAssembly, manifest: PluginManifest, plugin: ListenerPlugin
+) -> None:
+    assembly.listeners.append(plugin)
+
+
 # kind 注册表：受信任的核心代码在这里声明每类 contribution 的
 # load/apply 契约。普通插件清单只能引用已注册的 kind。
 register_kind(KindHandler("hook", load_hook_plugin, _apply_hook))
@@ -913,8 +1002,27 @@ register_kind(KindHandler("skill", load_skill_plugin, _apply_skill))
 register_kind(KindHandler("session", load_session_plugin, _apply_session))
 register_kind(KindHandler("memory", load_memory_plugin, _apply_memory))
 register_kind(KindHandler("embedding", load_embedding_plugin, _apply_embedding))
+register_kind(KindHandler("listener", load_listener_plugin, _apply_listener))
 
 SUPPORTED_KINDS = registered_kinds()
+
+
+def attach_listener_plugins(
+    bus: EventBus, listeners: list[ListenerPlugin]
+) -> list[Callable[[], None]]:
+    """把 listener 插件订阅到事件总线，返回退订函数列表（热卸载预留）。"""
+    tokens: list[Callable[[], None]] = []
+    for plugin in listeners:
+        for subscription in plugin.create():
+            tokens.append(
+                bus.subscribe(
+                    subscription.event,
+                    subscription.handler,
+                    priority=subscription.priority,
+                )
+            )
+        logger.info("listener 插件已接入事件总线: %s", plugin.manifest.name)
+    return tokens
 
 
 def assemble_plugins(root: str | Path | None = None) -> PluginAssembly:

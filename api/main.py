@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from core.config import AppConfig
 from core.context import history_tokens, trim_history
 from core.errors import AgentError
+from core.events import Event, EventBus, jsonl_sink
 from core.hooks import HookGateway
 from core.model import ModelAdapter
 from core.prompt import build_system_prompt
@@ -38,7 +39,12 @@ from gateways.memory_gateway import (
 from gateways.session_gateway import SessionGateway
 from gateways.skill_gateway import SkillGateway, UseSkill
 from loop import run_agent
-from plugins.loader import PluginAssembly, assemble_plugins, registered_kinds
+from plugins.loader import (
+    PluginAssembly,
+    assemble_plugins,
+    attach_listener_plugins,
+    registered_kinds,
+)
 
 logger = logging.getLogger("api")
 
@@ -80,6 +86,7 @@ class NoteOut(BaseModel):
 @dataclass
 class Runtime:
     assembly: PluginAssembly
+    events: EventBus
     hooks: HookGateway
     model: ModelAdapter
     tools: ToolRegistry
@@ -115,6 +122,14 @@ async def build_runtime(
     for _, hook in assembly.hooks:
         hooks.add(hook)
 
+    bus = EventBus()
+    event_log = os.getenv("EVENT_LOG")
+    if event_log:
+        bus.subscribe("*", jsonl_sink(event_log))
+        logger.info("事件总线日志已启用: %s", event_log)
+    hooks.attach(bus)
+    attach_listener_plugins(bus, assembly.listeners)
+
     model_plugin = _select_plugin(assembly.models, "模型", config.model)
     model = model_plugin.create()
 
@@ -122,7 +137,7 @@ async def build_runtime(
     session_store = session_plugin.create()
 
     memory_plugin = _select_plugin(assembly.memories, "长期记忆", config.memory_store)
-    memory_gateway = MemoryGateway(memory_plugin.create())
+    memory_gateway = MemoryGateway(memory_plugin.create(), events=bus)
 
     tools = ToolRegistry()
     local_tool_names: list[str] = []
@@ -143,6 +158,7 @@ async def build_runtime(
 
     runtime = Runtime(
         assembly=assembly,
+        events=bus,
         hooks=hooks,
         model=model,
         tools=tools,
@@ -243,6 +259,19 @@ async def chat_endpoint(req: ChatRequest) -> ChatResponse:
     runtime = app.state.runtime
     session = _session(app, req.session_id)
     history = await session.load_history()
+    if not history:
+        await runtime.events.publish(Event("session.start", {"session_id": req.session_id}))
+    decision = await runtime.events.decide(
+        Event("user_prompt.submit", {"session_id": req.session_id, "text": req.message})
+    )
+    if decision != "allow":
+        logger.warning("用户输入被事件总线策略拦截: %s", decision)
+        return ChatResponse(
+            session_id=req.session_id,
+            reply=f"本轮输入被策略拦截（{decision}）",
+            stop_reason="denied",
+            history_len=len(history),
+        )
     max_tokens = req.max_context_tokens or app.state.config.context_max_tokens
     trimmed, dropped = trim_history(history, max_tokens)
     if dropped:
@@ -257,6 +286,7 @@ async def chat_endpoint(req: ChatRequest) -> ChatResponse:
             req.message,
             history=trimmed,
             confirm=_web_confirm,
+            events=runtime.events,
         )
     except Exception as exc:
         logger.exception("chat 执行失败: %s", exc)

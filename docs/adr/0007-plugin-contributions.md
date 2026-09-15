@@ -1,4 +1,4 @@
-# ADR 0006：功能包 contribution 与受控 kind 注册
+# ADR 0007：功能包 contribution 与受控 kind 注册
 
 - 状态：已采纳
 - 日期：2026-09-15

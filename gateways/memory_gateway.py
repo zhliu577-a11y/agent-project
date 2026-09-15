@@ -5,19 +5,31 @@
 from typing import Any
 
 from core.errors import ToolError, boundary
+from core.events import Event, EventBus
 from core.memory import MemoryNote, MemoryStore
 from core.tool import Tool
+from core.tracing import current_trace_id
 
 
 class MemoryGateway:
     """长期记忆网关：跨会话语义笔记的增删查。"""
 
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryStore, events: EventBus | None = None) -> None:
         self._store = store
+        self._events = events
+
+    async def _emit(self, name: str, **payload: object) -> None:
+        if self._events is None:
+            return
+        await self._events.publish(
+            Event(name=name, payload=dict(payload), trace_id=current_trace_id())
+        )
 
     @boundary("写入长期记忆失败", fallback=ToolError)
     async def remember(self, content: str, tags: list[str] | None = None) -> MemoryNote:
-        return await self._store.add_note(content, tags or [])
+        note = await self._store.add_note(content, tags or [])
+        await self._emit("memory.write", note_id=note.id, tags=note.tags)
+        return note
 
     @boundary("检索长期记忆失败", fallback=ToolError)
     async def recall(self, query: str = "") -> list[MemoryNote]:
@@ -25,7 +37,10 @@ class MemoryGateway:
 
     @boundary("删除长期记忆失败", fallback=ToolError)
     async def forget(self, note_id: str) -> bool:
-        return await self._store.delete_note(note_id)
+        removed = await self._store.delete_note(note_id)
+        if removed:
+            await self._emit("memory.delete", note_id=note_id)
+        return removed
 
     @boundary("更新长期记忆失败", fallback=ToolError)
     async def update(
@@ -34,7 +49,10 @@ class MemoryGateway:
         content: str | None = None,
         tags: list[str] | None = None,
     ) -> MemoryNote | None:
-        return await self._store.update_note(note_id, content, tags)
+        note = await self._store.update_note(note_id, content, tags)
+        if note is not None:
+            await self._emit("memory.update", note_id=note.id, tags=note.tags)
+        return note
 
 
 def _tags_schema() -> dict[str, Any]:
