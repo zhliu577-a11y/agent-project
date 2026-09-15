@@ -3,8 +3,11 @@
 # 每个插件是一个自包含的目录，目录内必须有 plugin.json 清单。
 # 单插件清单使用 type + entry：
 # {
+#   "apiVersion": "1",         # manifest schema 版本
+#   "protocolVersion": 1,      # 插件执行协议版本
 #   "name": "time",            # 唯一名（字母/数字/下划线/连字符）
 #   "type": "mcp",             # 插件类别：受 KindHandler 注册表控制
+#   "contract": "mcp.v1",      # 能力契约，必须与 type/protocolVersion 一致
 #   "version": "1.0.0",        # 可选
 #   "description": "…",        # 可选
 #   "enabled": true,           # 可选，默认 true
@@ -14,11 +17,13 @@
 # 功能包清单使用 apiVersion + contributes[]，一次声明多个能力：
 # {
 #   "apiVersion": "1",
+#   "protocolVersion": 1,
 #   "name": "quality",
 #   "contributes": [
 #     { "id": "lint", "kind": "skill",
-#       "entry": { "content": "skills/lint/SKILL.md" } },
+#       "contract": "skill.v1", "entry": { "content": "skills/lint/SKILL.md" } },
 #     { "id": "text-tools", "kind": "tool",
+#       "contract": "tool.v1",
 #       "entry": { "module": "tool.py", "factory": "create_tools" } }
 #   ]
 # }
@@ -62,6 +67,7 @@
 # kind，不能通过配置新增核心执行阶段。
 import hashlib
 import importlib.util
+import inspect
 import json
 import logging
 import re
@@ -71,16 +77,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from config import AppConfig
 from core.context import ContextPolicy
 from core.embedding import EmbeddingProvider
 from core.errors import AGENT_CATEGORIES, resolve_declared_error
 from core.events import EventBus, Subscription, coerce_subscriptions
-from core.hooks import LifecycleHooks
+from core.hooks import HOOK_EVENTS, HookSpec, LifecycleHooks
 from core.memory import MemoryStore
-from core.model import ModelAdapter
+from core.model import ModelAdapter, ModelMetadata, ModelRouter
 from core.session import SessionStore
 from core.tool import Tool
+from plugins.context import PluginContext
 from plugins.external import ExternalTool, ExternalToolDefinition, StdioJsonRpcHost
+from plugins.protocol import (
+    MANIFEST_API_VERSION,
+    PLUGIN_PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    capability_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +131,11 @@ class PluginManifest:
     events: tuple[str, ...] = ()
     package_name: str | None = None
     contribution_id: str | None = None
+    hook: HookSpec | None = None
+    model: ModelMetadata | None = None
+    api_version: str = MANIFEST_API_VERSION
+    protocol_version: int = PLUGIN_PROTOCOL_VERSION
+    contract: str = ""
 
 
 @dataclass(frozen=True)
@@ -159,8 +178,9 @@ class KindHandler:
     """Trusted load/apply contract for one contribution kind."""
 
     kind: str
-    load: Callable[[PluginManifest], Any]
+    load: Callable[..., Any]
     apply: Callable[["PluginAssembly", PluginManifest, Any], None]
+    protocol_version: int = PLUGIN_PROTOCOL_VERSION
 
 
 _KIND_REGISTRY: dict[str, KindHandler] = {}
@@ -171,6 +191,10 @@ def register_kind(handler: KindHandler, *, replace: bool = False) -> None:
     global SUPPORTED_KINDS
     if not _NAME_RE.fullmatch(handler.kind):
         raise ValueError(f"invalid kind name: {handler.kind!r}")
+    if handler.protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
+        raise ValueError(
+            f"unsupported protocolVersion for kind {handler.kind!r}: {handler.protocol_version!r}"
+        )
     if handler.kind in _KIND_REGISTRY and not replace:
         raise ValueError(f"kind already registered: {handler.kind}")
     _KIND_REGISTRY[handler.kind] = handler
@@ -243,6 +267,21 @@ class NamespacedTool(Tool):
         if callable(close):
             await close()
 
+    async def setup(self, context: PluginContext) -> None:
+        setup = getattr(self._tool, "setup", None)
+        if callable(setup):
+            await setup(context)
+
+    async def start(self) -> None:
+        start = getattr(self._tool, "start", None)
+        if callable(start):
+            await start()
+
+    async def stop(self) -> None:
+        stop = getattr(self._tool, "stop", None)
+        if callable(stop):
+            await stop()
+
 
 @dataclass(frozen=True)
 class ModelPlugin:
@@ -250,6 +289,7 @@ class ModelPlugin:
 
     manifest: PluginManifest
     factory: Callable[[Path], Any]
+    context: PluginContext | None = None
 
     def create(self) -> ModelAdapter:
         """实例化模型适配器；工厂错误或返回类型错误都会明确报错。"""
@@ -264,6 +304,28 @@ class ModelPlugin:
             f"模型工厂必须返回 ModelAdapter 实例，实际是 {type(model).__name__}",
         )
         return model
+
+
+@dataclass(frozen=True)
+class ModelRouterPlugin:
+    """A model routing policy validated against the model-router.v1 contract."""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+    context: PluginContext | None = None
+
+    def create(self) -> ModelRouter:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            router = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: model router factory failed: {exc}") from exc
+        _expect(
+            isinstance(router, ModelRouter),
+            where,
+            f"model router factory must return ModelRouter, got {type(router).__name__}",
+        )
+        return router
 
 
 @dataclass(frozen=True)
@@ -410,6 +472,17 @@ def _parse_manifest(path: Path) -> PluginManifest:
         f"非法的 'type' '{kind}'，当前支持: {', '.join(SUPPORTED_KINDS)}",
     )
 
+    api_version = raw.get("apiVersion", MANIFEST_API_VERSION)
+    _expect(
+        isinstance(api_version, str) and api_version == MANIFEST_API_VERSION,
+        where,
+        f"unsupported 'apiVersion' {api_version!r}; supported: '{MANIFEST_API_VERSION}'",
+    )
+
+    protocol_version = _parse_protocol_version(raw.get("protocolVersion"), where)
+    contract = capability_contract(kind, protocol_version).name
+    _validate_declared_contract(raw.get("contract"), contract, where)
+
     version = raw.get("version", "")
     _expect(isinstance(version, str), where, "'version' 必须是字符串")
 
@@ -431,6 +504,8 @@ def _parse_manifest(path: Path) -> PluginManifest:
 
     errors = _parse_declared_errors(raw, where)
     events = _parse_declared_events(raw, where)
+    hook = _parse_hook_spec(raw, where) if kind == "hook" else None
+    model = _parse_model_metadata(raw, where) if kind == "model" else None
 
     return PluginManifest(
         name=name,
@@ -443,6 +518,154 @@ def _parse_manifest(path: Path) -> PluginManifest:
         priority=priority,
         errors=errors,
         events=events,
+        hook=hook,
+        model=model,
+        api_version=api_version,
+        protocol_version=protocol_version,
+        contract=contract,
+    )
+
+
+def _parse_model_metadata(raw: dict[str, Any], where: str) -> ModelMetadata:
+    """Parse optional provider capability metadata for routing decisions."""
+    value = raw.get("model", {})
+    _expect(isinstance(value, dict), where, "'model' must be an object")
+
+    roles = _parse_string_list(value.get("roles", []), f"{where} model.roles")
+    capabilities = _parse_string_list(
+        value.get("capabilities", []),
+        f"{where} model.capabilities",
+    )
+
+    context_window = value.get("contextWindow")
+    if context_window is not None:
+        _expect(
+            isinstance(context_window, int)
+            and not isinstance(context_window, bool)
+            and context_window > 0,
+            where,
+            "'model.contextWindow' must be a positive integer",
+        )
+
+    supports_tools = value.get("supportsTools", True)
+    supports_streaming = value.get("supportsStreaming", True)
+    _expect(isinstance(supports_tools, bool), where, "'model.supportsTools' must be bool")
+    _expect(isinstance(supports_streaming, bool), where, "'model.supportsStreaming' must be bool")
+
+    cost_tier = value.get("costTier", "unknown")
+    latency_tier = value.get("latencyTier", "unknown")
+    _expect(isinstance(cost_tier, str), where, "'model.costTier' must be a string")
+    _expect(isinstance(latency_tier, str), where, "'model.latencyTier' must be a string")
+
+    return ModelMetadata(
+        roles=roles,
+        capabilities=capabilities,
+        context_window=context_window,
+        supports_tools=supports_tools,
+        supports_streaming=supports_streaming,
+        cost_tier=cost_tier,
+        latency_tier=latency_tier,
+    )
+
+
+def _parse_string_list(value: Any, where: str) -> tuple[str, ...]:
+    _expect(isinstance(value, list), where, "must be an array")
+    result: list[str] = []
+    for index, item in enumerate(value, start=1):
+        item_where = f"{where}[{index}]"
+        _expect(
+            isinstance(item, str) and bool(item.strip()),
+            item_where,
+            "must be a non-empty string",
+        )
+        item = item.strip()
+        _expect(item not in result, item_where, f"duplicate value: {item}")
+        result.append(item)
+    return tuple(result)
+
+
+def _parse_protocol_version(value: Any, where: str) -> int:
+    if value is None:
+        return PLUGIN_PROTOCOL_VERSION
+    _expect(
+        isinstance(value, int) and not isinstance(value, bool),
+        where,
+        "'protocolVersion' must be an integer",
+    )
+    _expect(
+        value in SUPPORTED_PROTOCOL_VERSIONS,
+        where,
+        f"unsupported 'protocolVersion' {value!r}; "
+        f"supported: {sorted(SUPPORTED_PROTOCOL_VERSIONS)}",
+    )
+    return value
+
+
+def _validate_declared_contract(value: Any, expected: str, where: str) -> None:
+    if value is None:
+        return
+    _expect(
+        isinstance(value, str) and value == expected,
+        where,
+        f"capability contract mismatch: declared {value!r}, expected '{expected}'",
+    )
+
+
+def _parse_hook_spec(raw: dict[str, Any], where: str) -> HookSpec:
+    value = raw.get("hook", {})
+    _expect(isinstance(value, dict), where, "'hook' must be an object")
+
+    raw_events = value.get("events", list(HOOK_EVENTS))
+    _expect(
+        isinstance(raw_events, list) and bool(raw_events),
+        where,
+        "'hook.events' must be a non-empty array",
+    )
+    events: list[str] = []
+    for index, event in enumerate(raw_events, start=1):
+        event_where = f"{where} hook.events[{index}]"
+        _expect(
+            isinstance(event, str) and event in HOOK_EVENTS,
+            event_where,
+            f"unsupported hook event {event!r}; choose from {list(HOOK_EVENTS)}",
+        )
+        _expect(event not in events, event_where, f"duplicate hook event: {event}")
+        events.append(event)
+
+    matcher = value.get("matcher", "*")
+    _expect(
+        isinstance(matcher, str) and bool(matcher.strip()),
+        where,
+        "'hook.matcher' must be a non-empty string",
+    )
+
+    priority = value.get("priority", raw.get("priority", 0))
+    _expect(
+        isinstance(priority, int) and not isinstance(priority, bool),
+        where,
+        "'hook.priority' must be an integer",
+    )
+
+    timeout = value.get("timeout", 5.0)
+    _expect(
+        isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0,
+        where,
+        "'hook.timeout' must be a positive number",
+    )
+
+    policy = value.get("onError")
+    _expect(
+        policy is None or policy in {"allow", "deny"},
+        where,
+        "'hook.onError' must be 'allow' or 'deny'",
+    )
+
+    return HookSpec(
+        events=tuple(events),
+        matcher=matcher.strip(),
+        priority=priority,
+        timeout=float(timeout),
+        on_error=policy,
     )
 
 
@@ -546,8 +769,13 @@ def _merge_declared_events(
 def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[PluginManifest]:
     """Expand a package manifest into one normalized manifest per contribution."""
     where = f"{path}"
-    _expect(raw.get("apiVersion") == "1", where, "'apiVersion' must be '1'")
+    _expect(
+        raw.get("apiVersion") == MANIFEST_API_VERSION,
+        where,
+        f"'apiVersion' must be '{MANIFEST_API_VERSION}'",
+    )
     _expect("type" not in raw, where, "manifest cannot contain both 'type' and 'contributes'")
+    package_protocol_version = _parse_protocol_version(raw.get("protocolVersion"), where)
 
     package_name = raw.get("name")
     _expect(
@@ -605,6 +833,12 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
             item_where,
             f"invalid 'kind' {kind!r}; supported: {', '.join(registered_kinds())}",
         )
+        item_protocol_version = _parse_protocol_version(
+            item.get("protocolVersion", package_protocol_version),
+            item_where,
+        )
+        item_contract = capability_contract(kind, item_protocol_version).name
+        _validate_declared_contract(item.get("contract"), item_contract, item_where)
 
         entry = item.get("entry")
         _expect(isinstance(entry, dict), item_where, "missing 'entry' object")
@@ -633,6 +867,8 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
         errors = _merge_declared_errors(package_errors, item_errors, item_where)
         item_events = _parse_declared_events(item, item_where)
         events = _merge_declared_events(package_events, item_events, item_where)
+        hook = _parse_hook_spec(item, item_where) if kind == "hook" else None
+        model = _parse_model_metadata(item, item_where) if kind == "model" else None
         contributions.append(
             PluginManifest(
                 name=f"{package_name}--{contribution_id}",
@@ -647,6 +883,11 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
                 events=events,
                 package_name=package_name,
                 contribution_id=contribution_id,
+                hook=hook,
+                model=model,
+                api_version=MANIFEST_API_VERSION,
+                protocol_version=item_protocol_version,
+                contract=item_contract,
             )
         )
         seen_ids.add(contribution_id)
@@ -754,6 +995,7 @@ def inspect_package(root: str | Path) -> PackageInspection:
 
     for manifest in manifests:
         _validate_static_entry(manifest)
+        _validate_capability_contract(manifest)
     return PackageInspection(
         name=name,
         version=version,
@@ -785,6 +1027,7 @@ def _validate_static_entry(manifest: PluginManifest) -> None:
         "memory",
         "embedding",
         "listener",
+        "model-router",
     }:
         _validate_python_module_entry(manifest)
     elif manifest.type == "skill":
@@ -811,6 +1054,25 @@ def _validate_static_entry(manifest: PluginManifest) -> None:
             where,
             "'args' 必须是字符串数组",
         )
+
+
+def _validate_capability_contract(manifest: PluginManifest) -> None:
+    where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
+    handler = _KIND_REGISTRY.get(manifest.type)
+    _expect(handler is not None, where, f"kind '{manifest.type}' is not registered")
+    assert handler is not None
+    _expect(
+        handler.protocol_version == manifest.protocol_version,
+        where,
+        f"protocol mismatch: plugin declares {manifest.protocol_version}, "
+        f"host kind '{manifest.type}' supports {handler.protocol_version}",
+    )
+    expected = capability_contract(manifest.type, handler.protocol_version).name
+    _expect(
+        manifest.contract == expected,
+        where,
+        f"contract mismatch: plugin declares '{manifest.contract}', expected '{expected}'",
+    )
 
 
 def _validate_python_module_entry(manifest: PluginManifest) -> None:
@@ -963,6 +1225,46 @@ def _import_module(manifest: PluginManifest, module_path: Path):
     return module
 
 
+def _plugin_context(manifest: PluginManifest, config: AppConfig | None) -> PluginContext:
+    plugin_config = config.plugin_config(manifest.type, manifest.name) if config is not None else {}
+    return PluginContext.create(
+        name=manifest.name,
+        kind=manifest.type,
+        directory=manifest.directory,
+        config=plugin_config,
+        package_name=manifest.package_name,
+        contribution_id=manifest.contribution_id,
+        protocol_version=manifest.protocol_version,
+        contract=manifest.contract,
+    )
+
+
+def _call_plugin_factory(
+    factory: Callable[..., Any],
+    context: PluginContext,
+) -> Any:
+    """Call old one-argument factories and new context-aware factories."""
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        return factory(context.directory)
+
+    context_parameter = parameters.get("context") or parameters.get("ctx")
+    if context_parameter is not None:
+        positional = [
+            parameter
+            for parameter in parameters.values()
+            if parameter.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        if context_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+            return factory(context)
+        if len(positional) == 1 and positional[0].name in {"context", "ctx"}:
+            return factory(context)
+        return factory(context.directory, context=context)
+    return factory(context.directory)
+
+
 def _load_entry_factory(manifest: PluginManifest, kind_label: str) -> Callable[[Path], Any]:
     """解析 hook/tool 类插件的 module + factory 入口，返回工厂函数。"""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
@@ -998,12 +1300,15 @@ def _load_entry_factory(manifest: PluginManifest, kind_label: str) -> Callable[[
 # ---------- 单个清单加载器：每个 kind 一个 ----------
 
 
-def load_hook_plugin(manifest: PluginManifest) -> LifecycleHooks:
+def load_hook_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> LifecycleHooks:
     """加载单个钩子插件：调用清单声明的 factory(plugin_dir) 得到钩子实例。"""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
     factory = _load_entry_factory(manifest, "hook")
     try:
-        hook = factory(manifest.directory)
+        hook = _call_plugin_factory(factory, _plugin_context(manifest, config))
     except Exception as exc:
         raise ValueError(f"{where}: 工厂执行失败: {exc}") from exc
     _expect(
@@ -1051,7 +1356,10 @@ def _coerce_tools(value: Any, where: str) -> list[Tool]:
     return tools
 
 
-def load_tool_plugin(manifest: PluginManifest) -> list[Tool]:
+def load_tool_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> list[Tool]:
     """加载单个工具插件，并把每个工具包上插件命名空间。"""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
     runtime = manifest.entry.get("runtime", "python")
@@ -1068,7 +1376,7 @@ def load_tool_plugin(manifest: PluginManifest) -> list[Tool]:
     else:
         factory = _load_entry_factory(manifest, "tool")
         try:
-            produced = factory(manifest.directory)
+            produced = _call_plugin_factory(factory, _plugin_context(manifest, config))
         except Exception as exc:
             raise ValueError(f"{where}: 工厂执行失败: {exc}") from exc
         tools = _coerce_tools(produced, where)
@@ -1076,19 +1384,51 @@ def load_tool_plugin(manifest: PluginManifest) -> list[Tool]:
     return [NamespacedTool(manifest.name, tool, declarations=declarations) for tool in tools]
 
 
-def load_model_plugin(manifest: PluginManifest) -> ModelPlugin:
+def load_model_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> ModelPlugin:
     """校验单个模型插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "model")
-    return ModelPlugin(manifest=manifest, factory=factory)
+    context = _plugin_context(manifest, config)
+    return ModelPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+        context=context,
+    )
 
 
-def load_context_plugin(manifest: PluginManifest) -> ContextPlugin:
+def load_model_router_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> ModelRouterPlugin:
+    """Validate one model-router plugin without instantiating its policy."""
+    factory = _load_entry_factory(manifest, "model-router")
+    context = _plugin_context(manifest, config)
+    return ModelRouterPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+        context=context,
+    )
+
+
+def load_context_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> ContextPlugin:
     """Validate a context policy plugin and keep its factory lazy."""
     factory = _load_entry_factory(manifest, "context")
-    return ContextPlugin(manifest=manifest, factory=factory)
+    context = _plugin_context(manifest, config)
+    return ContextPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
 
 
-def load_skill_plugin(manifest: PluginManifest) -> SkillPlugin:
+def load_skill_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> SkillPlugin:
     """校验单个技能插件：只检查清单与正文文件存在，不读取、不执行。"""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
     entry = manifest.entry
@@ -1106,28 +1446,56 @@ def load_skill_plugin(manifest: PluginManifest) -> SkillPlugin:
     return SkillPlugin(manifest=manifest, content_path=content_path, preload=preload)
 
 
-def load_session_plugin(manifest: PluginManifest) -> SessionPlugin:
+def load_session_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> SessionPlugin:
     """校验单个会话存储插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "session")
-    return SessionPlugin(manifest=manifest, factory=factory)
+    context = _plugin_context(manifest, config)
+    return SessionPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
 
 
-def load_memory_plugin(manifest: PluginManifest) -> MemoryPlugin:
+def load_memory_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> MemoryPlugin:
     """校验单个长期记忆插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "memory")
-    return MemoryPlugin(manifest=manifest, factory=factory)
+    context = _plugin_context(manifest, config)
+    return MemoryPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
 
 
-def load_embedding_plugin(manifest: PluginManifest) -> EmbeddingPlugin:
+def load_embedding_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> EmbeddingPlugin:
     """校验单个嵌入提供方插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "embedding")
-    return EmbeddingPlugin(manifest=manifest, factory=factory)
+    context = _plugin_context(manifest, config)
+    return EmbeddingPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
 
 
-def load_listener_plugin(manifest: PluginManifest) -> ListenerPlugin:
+def load_listener_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> ListenerPlugin:
     """校验单个 listener 插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "listener")
-    return ListenerPlugin(manifest=manifest, factory=factory)
+    context = _plugin_context(manifest, config)
+    return ListenerPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
 
 
 def _resolve_arg(plugin_dir: Path, arg: str) -> str:
@@ -1143,13 +1511,14 @@ def _resolve_arg(plugin_dir: Path, arg: str) -> str:
 
 def load_hook_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> list[tuple[PluginManifest, LifecycleHooks]]:
     """加载插件目录里全部启用的钩子插件，返回 (清单, 实例) 列表。"""
     hooks: list[tuple[PluginManifest, LifecycleHooks]] = []
     for manifest in discover_plugins(root):
         if manifest.type != "hook":
             continue
-        hooks.append((manifest, load_hook_plugin(manifest)))
+        hooks.append((manifest, load_hook_plugin(manifest, config)))
         logger.info("钩子插件已加载: %s", manifest.name)
     # 执行顺序在装配阶段就确定：priority 升序，同优先级按名字典序（稳定可预测）
     return sorted(hooks, key=lambda pair: (pair[0].priority, pair[0].name))
@@ -1157,6 +1526,7 @@ def load_hook_plugins(
 
 def load_mcp_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> list[McpPluginSpec]:
     """加载插件目录里全部启用的 MCP 插件，产出可直接连接的规格。"""
     specs: list[McpPluginSpec] = []
@@ -1170,104 +1540,126 @@ def load_mcp_plugins(
 
 def load_tool_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> list[tuple[PluginManifest, list[Tool]]]:
     """加载插件目录里全部启用的本地工具插件，返回 (清单, 工具列表)。"""
     plugins: list[tuple[PluginManifest, list[Tool]]] = []
     for manifest in discover_plugins(root):
         if manifest.type != "tool":
             continue
-        plugins.append((manifest, load_tool_plugin(manifest)))
+        plugins.append((manifest, load_tool_plugin(manifest, config)))
         logger.info("本地工具插件已加载: %s", manifest.name)
     return sorted(plugins, key=lambda pair: pair[0].name)
 
 
 def load_model_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> list[ModelPlugin]:
     """加载插件目录里全部启用的模型插件，返回惰性规格（不实例化）。"""
     plugins: list[ModelPlugin] = []
     for manifest in discover_plugins(root):
         if manifest.type != "model":
             continue
-        plugins.append(load_model_plugin(manifest))
+        plugins.append(load_model_plugin(manifest, config))
         logger.info("模型插件已发现: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
+def load_model_router_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
+) -> list[ModelRouterPlugin]:
+    """Load enabled model-router plugins without instantiating their policies."""
+    plugins: list[ModelRouterPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "model-router":
+            continue
+        plugins.append(load_model_router_plugin(manifest, config))
+        logger.info("model router plugin discovered: %s", manifest.name)
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
 def load_context_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> list[ContextPlugin]:
     """Load enabled context policy plugins without instantiating them."""
     plugins: list[ContextPlugin] = []
     for manifest in discover_plugins(root):
         if manifest.type != "context":
             continue
-        plugins.append(load_context_plugin(manifest))
+        plugins.append(load_context_plugin(manifest, config))
         logger.info("上下文策略插件已发现: %s", manifest.name)
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
 def load_skill_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> list[SkillPlugin]:
     """加载插件目录里全部启用的技能插件（零副作用：不读正文、不执行）。"""
     plugins: list[SkillPlugin] = []
     for manifest in discover_plugins(root):
         if manifest.type != "skill":
             continue
-        plugins.append(load_skill_plugin(manifest))
+        plugins.append(load_skill_plugin(manifest, config))
         logger.info("技能插件已发现: %s", manifest.name)
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
 def load_session_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> list[SessionPlugin]:
     """加载插件目录里全部启用的会话存储插件（惰性，不实例化）。"""
     plugins: list[SessionPlugin] = []
     for manifest in discover_plugins(root):
         if manifest.type != "session":
             continue
-        plugins.append(load_session_plugin(manifest))
+        plugins.append(load_session_plugin(manifest, config))
         logger.info("会话存储插件已发现: %s", manifest.name)
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
 def load_memory_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> list[MemoryPlugin]:
     """加载插件目录里全部启用的长期记忆插件（惰性，不实例化）。"""
     plugins: list[MemoryPlugin] = []
     for manifest in discover_plugins(root):
         if manifest.type != "memory":
             continue
-        plugins.append(load_memory_plugin(manifest))
+        plugins.append(load_memory_plugin(manifest, config))
         logger.info("长期记忆插件已发现: %s", manifest.name)
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
 def load_embedding_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> list[EmbeddingPlugin]:
     """加载插件目录里全部启用的嵌入提供方插件（惰性，不实例化）。"""
     plugins: list[EmbeddingPlugin] = []
     for manifest in discover_plugins(root):
         if manifest.type != "embedding":
             continue
-        plugins.append(load_embedding_plugin(manifest))
+        plugins.append(load_embedding_plugin(manifest, config))
         logger.info("嵌入提供方插件已发现: %s", manifest.name)
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
 def load_listener_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> list[ListenerPlugin]:
     """加载插件目录里全部启用的 listener 插件（惰性，不实例化）。"""
     plugins: list[ListenerPlugin] = []
     for manifest in discover_plugins(root):
         if manifest.type != "listener":
             continue
-        plugins.append(load_listener_plugin(manifest))
+        plugins.append(load_listener_plugin(manifest, config))
         logger.info("listener 插件已发现: %s", manifest.name)
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
@@ -1283,6 +1675,7 @@ class PluginAssembly:
     mcp: list[McpPluginSpec] = field(default_factory=list)
     tools: list[tuple[PluginManifest, list[Tool]]] = field(default_factory=list)
     models: list[ModelPlugin] = field(default_factory=list)
+    model_routers: list[ModelRouterPlugin] = field(default_factory=list)
     contexts: list[ContextPlugin] = field(default_factory=list)
     skills: list[SkillPlugin] = field(default_factory=list)
     sessions: list[SessionPlugin] = field(default_factory=list)
@@ -1306,6 +1699,14 @@ def _apply_tool(assembly: PluginAssembly, manifest: PluginManifest, tools: list[
 
 def _apply_model(assembly: PluginAssembly, manifest: PluginManifest, plugin: ModelPlugin) -> None:
     assembly.models.append(plugin)
+
+
+def _apply_model_router(
+    assembly: PluginAssembly,
+    manifest: PluginManifest,
+    plugin: ModelRouterPlugin,
+) -> None:
+    assembly.model_routers.append(plugin)
 
 
 def _apply_context(
@@ -1346,6 +1747,7 @@ register_kind(KindHandler("hook", load_hook_plugin, _apply_hook))
 register_kind(KindHandler("mcp", load_mcp_plugin, _apply_mcp))
 register_kind(KindHandler("tool", load_tool_plugin, _apply_tool))
 register_kind(KindHandler("model", load_model_plugin, _apply_model))
+register_kind(KindHandler("model-router", load_model_router_plugin, _apply_model_router))
 register_kind(KindHandler("context", load_context_plugin, _apply_context))
 register_kind(KindHandler("skill", load_skill_plugin, _apply_skill))
 register_kind(KindHandler("session", load_session_plugin, _apply_session))
@@ -1376,6 +1778,7 @@ def attach_listener_plugins(
 
 def assemble_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
 ) -> PluginAssembly:
     """扫描目录并把全部 enabled contribution 按 kind 装配成 PluginAssembly。
 
@@ -1387,7 +1790,15 @@ def assemble_plugins(
         handler = _KIND_REGISTRY.get(contribution.kind)
         if handler is None:  # discover 已校验，这里是防御性兜底
             raise ValueError(f"插件类别 {contribution.kind} 尚未注册加载器（{manifest.name}）")
-        payload = handler.load(manifest)
+        _validate_capability_contract(manifest)
+        try:
+            loader_parameters = inspect.signature(handler.load).parameters
+        except (TypeError, ValueError):
+            loader_parameters = {}
+        if "config" in loader_parameters:
+            payload = handler.load(manifest, config=config)
+        else:
+            payload = handler.load(manifest)
         handler.apply(assembly, manifest, payload)
         assembly.contributions.append(contribution)
     assembly.hooks.sort(key=lambda pair: (pair[0].priority, pair[0].name))

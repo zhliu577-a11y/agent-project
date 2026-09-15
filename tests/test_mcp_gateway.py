@@ -166,6 +166,25 @@ async def test_use_plugin_mounts_registers_and_reports() -> None:
 
 
 @pytest.mark.asyncio
+async def test_use_plugin_is_safe_after_runtime_preload() -> None:
+    gateway = FakeGateway([_spec("time")])
+    registry = ToolRegistry()
+    loader_tool = UsePlugin(gateway, registry)
+
+    ok, message = await loader_tool.mount("time")
+    assert ok is True
+    assert "已挂载" in message
+    assert registry.describe("time__get_current_time") is not None
+
+    again = await loader_tool.execute(name="time")
+    assert "已挂载" in again
+    assert gateway.connect_count == 1
+    assert [schema["function"]["name"] for schema in registry.list_schemas()] == [
+        "time__get_current_time"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_mcp_tool_routes_call_with_raw_tool_name() -> None:
     session = FakeSession("time")
     tool = McpTool(session, "time", "get_current_time", "时间", {}, timeout=1.0)

@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "math",
   "type": "mcp",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "mcp.v1",
   "description": "安全计算数学表达式",
   "enabled": true,
   "errors": [

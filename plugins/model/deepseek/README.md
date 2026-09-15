@@ -9,7 +9,7 @@
 
 ## 选择与配置
 
-- 选择：`config.json` 的 `"model": "deepseek"`，或环境变量 `AGENT_MODEL=deepseek`
-  （环境变量优先）；
+- 选择：`config/model.json` 的 `"model": "deepseek"`，或环境变量
+  `AGENT_MODEL=deepseek`（环境变量优先）；
 - 参数（`.env`）：`DEEPSEEK_API_KEY`（必填）、`DEEPSEEK_BASE_URL`、
   `DEEPSEEK_MODEL`、`DEEPSEEK_TIMEOUT`、`DEEPSEEK_MAX_RETRIES`。

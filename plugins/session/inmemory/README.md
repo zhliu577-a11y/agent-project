@@ -6,8 +6,8 @@
 ## 配置
 
 ```text
-config.json: "session": { "store": "inmemory" }
-环境变量:     SESSION_STORE=inmemory
+config/session.json: { "store": "inmemory" }
+环境变量:              SESSION_STORE=inmemory
 ```
 
 接口与 jsonl 后端完全一致（`load/save` + checkpoint 三方法），切换不影响内核。

@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "jsonl",
   "type": "session",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "session.v1",
   "description": "JSONL 文件会话存储：每条消息一行，重启后按 SESSION_ID 恢复",
   "enabled": true,
   "entry": {

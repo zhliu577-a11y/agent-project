@@ -1,9 +1,21 @@
 {
+  "apiVersion": "1",
   "name": "openai",
   "type": "model",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "model.v1",
   "description": "OpenAI 模型适配器（异步 + 流式 + 超时重试）",
   "enabled": true,
+  "model": {
+    "roles": ["general", "coding", "vision"],
+    "capabilities": ["text", "vision", "tools", "streaming"],
+    "contextWindow": 128000,
+    "supportsTools": true,
+    "supportsStreaming": true,
+    "costTier": "high",
+    "latencyTier": "medium"
+  },
   "entry": {
     "module": "model.py",
     "factory": "create_model"

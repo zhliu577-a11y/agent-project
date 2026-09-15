@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "jsonl",
   "type": "memory",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "memory.v1",
   "description": "JSONL 文件长期记忆：语义笔记按行落盘，跨会话保留",
   "enabled": true,
   "entry": {

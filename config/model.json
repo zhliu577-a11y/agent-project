@@ -1,0 +1,20 @@
+{
+  "model": "sub2api",
+  "router": "static",
+  "fallback": [
+    "openai"
+  ],
+  "keepWarm": [
+    "sub2api"
+  ],
+  "routes": {
+    "coding": [
+      "sub2api",
+      "openai"
+    ],
+    "summary": [
+      "sub2api",
+      "openai"
+    ]
+  }
+}

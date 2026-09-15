@@ -4,10 +4,11 @@ import os
 from dataclasses import dataclass, replace
 from typing import Any
 
-from core.config import AppConfig
+from config import AppConfig
 from core.context import ContextPolicy
 from core.events import EventBus, jsonl_sink
 from core.hooks import HookGateway
+from core.model import ModelAdapter, ModelRouter
 from core.prompt import build_system_prompt
 from core.registry import ToolRegistry
 from core.types import Message
@@ -19,8 +20,11 @@ from gateways.memory_gateway import (
     RememberTool,
     UpdateNoteTool,
 )
+from gateways.model_gateway import ModelGateway
 from gateways.session_gateway import SessionGateway
 from gateways.skill_gateway import SkillGateway, UseSkill
+from plugins.context import PluginContext
+from plugins.lifecycle import PluginLifecycleManager
 from plugins.loader import (
     PluginAssembly,
     PluginManifest,
@@ -55,6 +59,13 @@ class McpRuntimeStatus:
 
 
 @dataclass(frozen=True)
+class ModelRuntimeStatus:
+    name: str
+    status: str
+    active: bool
+
+
+@dataclass(frozen=True)
 class RuntimeSnapshot:
     """JSON-safe view of the runtime without exposing live gateway objects."""
 
@@ -62,6 +73,7 @@ class RuntimeSnapshot:
     plugins: tuple[PluginRuntimeStatus, ...]
     tools: tuple[str, ...]
     mcp: tuple[McpRuntimeStatus, ...]
+    models: tuple[ModelRuntimeStatus, ...]
 
 
 class HarnessRuntime:
@@ -89,6 +101,7 @@ class HarnessRuntime:
         }
         self._assembly = PluginAssembly()
         self._listener_tokens: list[Any] = []
+        self._lifecycle = PluginLifecycleManager()
         self._started = False
         self._closed = False
         self._ready = False
@@ -96,12 +109,14 @@ class HarnessRuntime:
         self.hooks = HookGateway()
         self.events = EventBus()
         self.tools = ToolRegistry()
-        self.model: Any = None
+        self.model: ModelAdapter | None = None
+        self.models: ModelGateway | None = None
         self.context_policy: ContextPolicy | None = None
         self.session: SessionGateway | None = None
         self.memory: MemoryGateway | None = None
         self.skills: SkillGateway | None = None
         self.mcp_gateway: McpGateway | None = None
+        self._use_plugin: UsePlugin | None = None
         self.system_prompt = ""
         self.history: list[Message] = []
 
@@ -119,13 +134,16 @@ class HarnessRuntime:
             self._prepare_external_statuses()
             self._assembly = self._assemble_plugins()
             self._setup_events()
-            self._create_model()
+            await self._create_model()
             self._create_context_policy()
             await self._create_session()
             self._create_memory()
             self._register_tools()
             self.mcp_gateway = McpGateway(self._assembly.mcp)
-            self.tools.register(UsePlugin(self.mcp_gateway, self.tools))
+            self._use_plugin = UsePlugin(self.mcp_gateway, self.tools)
+            self.tools.register(self._use_plugin)
+            await self._preload_mcp_plugins()
+            await self._lifecycle.start_all()
             self._build_system_prompt()
             self._ready = True
             logger.info(
@@ -136,6 +154,7 @@ class HarnessRuntime:
             )
         except Exception:
             self._ready = False
+            await self.close()
             raise
 
     async def close(self) -> None:
@@ -143,6 +162,10 @@ class HarnessRuntime:
             return
         self._closed = True
         self._ready = False
+        self._close_listener_subscriptions()
+        await self._lifecycle.stop_all()
+        if self.models is not None:
+            await self.models.close()
         if self.mcp_gateway is not None:
             await self.mcp_gateway.close()
         await self._close_external_tools()
@@ -152,6 +175,14 @@ class HarnessRuntime:
                 self._plugin_states[key] = replace(state, status="stopped")
             elif key[0] == "builtin" and state.status == "active":
                 self._plugin_states[key] = replace(state, status="stopped")
+
+    def _close_listener_subscriptions(self) -> None:
+        for unsubscribe in reversed(self._listener_tokens):
+            try:
+                unsubscribe()
+            except Exception:
+                logger.exception("listener unsubscribe failed")
+        self._listener_tokens.clear()
 
     async def __aenter__(self) -> "HarnessRuntime":
         await self.start()
@@ -195,6 +226,18 @@ class HarnessRuntime:
             ),
             tools=tool_names,
             mcp=mcp,
+            models=(
+                tuple(
+                    ModelRuntimeStatus(
+                        name=name,
+                        status=status,
+                        active=name == self.models.active_model,
+                    )
+                    for name, status in sorted(self.models.status().items())
+                )
+                if self.models is not None
+                else ()
+            ),
         )
 
     def _prepare_external_statuses(self) -> None:
@@ -214,7 +257,7 @@ class HarnessRuntime:
         assembly = PluginAssembly()
         if self.plugin_manager.builtin_dir.is_dir():
             try:
-                builtins = assemble_plugins(self.plugin_manager.builtin_dir)
+                builtins = assemble_plugins(self.plugin_manager.builtin_dir, self.config)
             except Exception as exc:
                 raise RuntimeStartupError(f"内置插件装配失败: {exc}") from exc
             self._record_builtin_states(builtins)
@@ -222,7 +265,10 @@ class HarnessRuntime:
 
         for record in self.plugin_manager.enabled_records():
             try:
-                package = assemble_plugins(self.plugin_manager.plugin_path(record.name))
+                package = assemble_plugins(
+                    self.plugin_manager.plugin_path(record.name),
+                    self.config,
+                )
                 _merge_assemblies(assembly, package)
             except Exception as exc:
                 logger.exception("外部插件 %s 装配失败", record.name)
@@ -294,6 +340,18 @@ class HarnessRuntime:
         if event_log:
             self.events.subscribe("*", jsonl_sink(event_log))
             logger.info("事件总线日志已启用: %s", event_log)
+        for manifest, hook in self._assembly.hooks:
+            try:
+                self.hooks.add(
+                    hook,
+                    priority=manifest.priority,
+                    name=manifest.name,
+                    spec=manifest.hook,
+                )
+                self._track_plugin(manifest, hook)
+            except Exception as exc:
+                logger.exception("hook plugin %s setup failed", manifest.name)
+                self._mark_manifest_error(manifest, exc)
         self.hooks.attach(self.events)
         for listener in self._assembly.listeners:
             try:
@@ -302,25 +360,50 @@ class HarnessRuntime:
                 logger.exception("listener 插件 %s 接入失败", listener.manifest.name)
                 self._mark_manifest_error(listener.manifest, exc)
 
-    def _create_model(self) -> None:
-        plugin = next(
-            (
-                candidate
-                for candidate in self._assembly.models
-                if candidate.manifest.name == self.config.model
-            ),
-            None,
-        )
-        if plugin is None:
-            raise RuntimeStartupError(
-                f"未知的模型插件: {self.config.model}，可选: "
-                f"{[candidate.manifest.name for candidate in self._assembly.models]}"
+    async def _create_model(self) -> None:
+        available = [candidate.manifest.name for candidate in self._assembly.models]
+        if self.config.model not in available:
+            raise RuntimeStartupError(f"未知的模型插件: {self.config.model}，可选: {available}")
+
+        router: ModelRouter | None = None
+        if self.config.model_router is not None:
+            router_plugin = next(
+                (
+                    candidate
+                    for candidate in self._assembly.model_routers
+                    if candidate.manifest.name == self.config.model_router
+                ),
+                None,
             )
+            if router_plugin is None:
+                raise RuntimeStartupError(
+                    f"未知的模型路由插件: {self.config.model_router}，可选: "
+                    f"{[candidate.manifest.name for candidate in self._assembly.model_routers]}"
+                )
+            try:
+                router = router_plugin.create()
+                self._track_plugin(router_plugin.manifest, router)
+            except Exception as exc:
+                self._mark_manifest_error(router_plugin.manifest, exc)
+                raise RuntimeStartupError(
+                    f"模型路由插件 {self.config.model_router} 初始化失败: {exc}"
+                ) from exc
+
         try:
-            self.model = plugin.create()
+            gateway = ModelGateway(
+                self._assembly.models,
+                default_model=self.config.model,
+                fallback=self.config.model_fallback,
+                routes=dict(self.config.model_routes),
+                router=router,
+            )
+            self.models = gateway
+            self.model = gateway
+            await gateway.prewarm(self.config.model)
+            for name in self.config.model_keep_warm:
+                await gateway.prewarm(name)
         except Exception as exc:
-            self._mark_manifest_error(plugin.manifest, exc)
-            raise RuntimeStartupError(f"模型插件 {self.config.model} 初始化失败: {exc}") from exc
+            raise RuntimeStartupError(f"模型网关初始化失败: {exc}") from exc
 
     def _create_context_policy(self) -> None:
         plugin = next(
@@ -338,6 +421,7 @@ class HarnessRuntime:
             )
         try:
             self.context_policy = plugin.create()
+            self._track_plugin(plugin.manifest, self.context_policy)
         except Exception as exc:
             self._mark_manifest_error(plugin.manifest, exc)
             raise RuntimeStartupError(
@@ -360,6 +444,7 @@ class HarnessRuntime:
             )
         try:
             store = plugin.create()
+            self._track_plugin(plugin.manifest, store)
         except Exception as exc:
             self._mark_manifest_error(plugin.manifest, exc)
             raise RuntimeStartupError(
@@ -388,6 +473,7 @@ class HarnessRuntime:
             )
         try:
             store = plugin.create()
+            self._track_plugin(plugin.manifest, store)
         except Exception as exc:
             self._mark_manifest_error(plugin.manifest, exc)
             raise RuntimeStartupError(
@@ -400,6 +486,9 @@ class HarnessRuntime:
         for _, tools in self._assembly.tools:
             for tool in tools:
                 self.tools.register(tool)
+        for manifest, tools in self._assembly.tools:
+            for tool in tools:
+                self._track_plugin(manifest, tool)
 
         self.skills = SkillGateway(self._assembly.skills)
         self.tools.register(UseSkill(self.skills))
@@ -409,6 +498,29 @@ class HarnessRuntime:
         self.tools.register(RecallTool(self.memory))
         self.tools.register(ForgetTool(self.memory))
         self.tools.register(UpdateNoteTool(self.memory))
+
+    async def _preload_mcp_plugins(self) -> None:
+        if self.mcp_gateway is None or self._use_plugin is None:
+            raise RuntimeStartupError("MCP 网关未初始化")
+
+        unknown = [
+            name for name in self.config.mcp_preload if self.mcp_gateway.plugin_spec(name) is None
+        ]
+        if unknown:
+            raise RuntimeStartupError(
+                f"未知的 MCP 预加载插件: {unknown}，可用: {self.mcp_gateway.available()}"
+            )
+
+        for name in self.config.mcp_preload:
+            ok, message = await self._use_plugin.mount(name)
+            if ok:
+                logger.info("MCP 插件已预加载: %s", name)
+            else:
+                logger.warning(
+                    "MCP 插件预加载失败，后续仍可通过 use_plugin 重试: %s (%s)",
+                    name,
+                    message,
+                )
 
     def _build_system_prompt(self) -> None:
         if self.skills is None:
@@ -427,6 +539,19 @@ class HarnessRuntime:
             preloads=preloads,
         )
 
+    def _track_plugin(self, manifest: PluginManifest, instance: object) -> None:
+        context = PluginContext.create(
+            name=manifest.name,
+            kind=manifest.type,
+            directory=manifest.directory,
+            config=self.config.plugin_config(manifest.type, manifest.name),
+            package_name=manifest.package_name,
+            contribution_id=manifest.contribution_id,
+            protocol_version=manifest.protocol_version,
+            contract=manifest.contract,
+        )
+        self._lifecycle.add(context, instance)
+
 
 def _merge_assemblies(target: PluginAssembly, source: PluginAssembly) -> None:
     seen = {
@@ -443,6 +568,7 @@ def _merge_assemblies(target: PluginAssembly, source: PluginAssembly) -> None:
     target.mcp.extend(source.mcp)
     target.tools.extend(source.tools)
     target.models.extend(source.models)
+    target.model_routers.extend(source.model_routers)
     target.contexts.extend(source.contexts)
     target.skills.extend(source.skills)
     target.sessions.extend(source.sessions)

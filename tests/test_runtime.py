@@ -3,9 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from core.config import AppConfig
+from config import AppConfig
 from plugins.manager import PluginManager
-from runtime import HarnessRuntime
+from runtime import HarnessRuntime, RuntimeStartupError
 
 _MODEL_MODULE = """
 from core.model import ModelAdapter
@@ -77,6 +77,37 @@ from core.context import TailWindowPolicy
 
 def create_policy(plugin_dir):
     return TailWindowPolicy()
+"""
+
+_MODEL_ROUTER_MODULE = """
+from core.model import ModelRouteDecision, ModelRouter
+
+
+class StaticRouter(ModelRouter):
+    def route(self, request):
+        candidates = request.routes.get(request.role, (request.default_model,))
+        return ModelRouteDecision(candidates=tuple(candidates) + request.fallback)
+
+
+def create_router(plugin_dir):
+    return StaticRouter()
+"""
+
+_MCP_SERVER = """
+from mcp.server.mcpserver import MCPServer
+
+
+server = MCPServer(name="demo-server")
+
+
+@server.tool()
+def echo(text: str) -> str:
+    \"\"\"Echo text through MCP.\"\"\"
+    return f"mcp:{text}"
+
+
+if __name__ == "__main__":
+    server.run()
 """
 
 _EXTERNAL_TOOL_SERVER = r"""
@@ -160,6 +191,29 @@ def _write_builtins(root: Path) -> None:
     )
     _write_builtin(
         root,
+        "model_routers",
+        "static",
+        {
+            "name": "static",
+            "type": "model-router",
+            "entry": {"module": "router.py", "factory": "create_router"},
+        },
+        {"router.py": _MODEL_ROUTER_MODULE},
+    )
+    _write_builtin(
+        root,
+        "mcp",
+        "demo",
+        {
+            "name": "demo",
+            "type": "mcp",
+            "description": "Demo MCP server.",
+            "entry": {"command": "python", "args": ["server.py"]},
+        },
+        {"server.py": _MCP_SERVER},
+    )
+    _write_builtin(
+        root,
         "tools",
         "external",
         {
@@ -197,7 +251,11 @@ def _manager(tmp_path: Path) -> PluginManager:
     )
 
 
-def _config() -> AppConfig:
+def _config(
+    *,
+    mcp_preload: tuple[str, ...] = (),
+    model_router: str | None = None,
+) -> AppConfig:
     return AppConfig(
         model="fake",
         session_store="memory",
@@ -206,6 +264,8 @@ def _config() -> AppConfig:
         embedding_provider="debug",
         context_max_tokens=20000,
         context_strategy="tail-window",
+        mcp_preload=mcp_preload,
+        model_router=model_router,
     )
 
 
@@ -282,6 +342,22 @@ async def test_runtime_executes_and_closes_external_tool(tmp_path, monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_runtime_owns_model_gateway_with_selected_router(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+    manager = _manager(tmp_path)
+    runtime = HarnessRuntime(
+        _config(model_router="static"),
+        plugin_manager=manager,
+    )
+
+    async with runtime:
+        assert runtime.model is runtime.models
+        status = next(item for item in runtime.snapshot().models if item.name == "fake")
+        assert status.status == "active"
+        assert status.active is True
+
+
+@pytest.mark.asyncio
 async def test_runtime_isolates_failed_external_package(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("EVENT_LOG", raising=False)
     manager = _manager(tmp_path)
@@ -299,3 +375,46 @@ async def test_runtime_isolates_failed_external_package(tmp_path, monkeypatch) -
         assert "Tool" in (state.error or "")
         assert record.runtime_status == "error"
         assert "Tool" in (record.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_runtime_preloads_selected_mcp_before_first_model_call(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+    manager = _manager(tmp_path)
+    runtime = HarnessRuntime(_config(mcp_preload=("demo",)), plugin_manager=manager)
+
+    async with runtime:
+        snapshot = runtime.snapshot()
+        assert snapshot.ready is True
+        assert "use_plugin" in snapshot.tools
+        assert "demo__echo" in snapshot.tools
+        assert await runtime.tools.execute("demo__echo", {"text": "hello"}) == "mcp:hello"
+        assert next(status for status in snapshot.mcp if status.name == "demo").status == "loaded"
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_unknown_mcp_preload(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+    runtime = HarnessRuntime(_config(mcp_preload=("missing",)), plugin_manager=_manager(tmp_path))
+
+    with pytest.raises(RuntimeStartupError, match="未知的 MCP 预加载插件"):
+        await runtime.start()
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_continues_when_mcp_preload_connection_fails(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+
+    async def fail_mount(self, name):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr("gateways.mcp_gateway.McpGateway.mount", fail_mount)
+    manager = _manager(tmp_path)
+    runtime = HarnessRuntime(_config(mcp_preload=("demo",)), plugin_manager=manager)
+
+    async with runtime:
+        snapshot = runtime.snapshot()
+        assert snapshot.ready is True
+        assert "demo__echo" not in snapshot.tools
+        assert "use_plugin" in snapshot.tools

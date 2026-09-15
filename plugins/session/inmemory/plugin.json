@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "inmemory",
   "type": "session",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "session.v1",
   "description": "内存会话存储：不落盘、重启即失（适合测试与演示切换）",
   "enabled": true,
   "entry": {

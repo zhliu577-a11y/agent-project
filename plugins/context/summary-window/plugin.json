@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "summary-window",
   "type": "context",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "context.v1",
   "description": "Summarize older messages and retain the newest atomic conversation groups.",
   "entry": {
     "module": "policy.py",

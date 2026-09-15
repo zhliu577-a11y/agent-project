@@ -38,10 +38,10 @@ class AuditHooks(LifecycleHooks):
         preview = content[:80] + "…" if len(content) > 80 else content
         self._log(f"模型回复: {preview!r} | 请求工具: {calls}")
 
-    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> bool:
+    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> str:
         # 观察点：在这里返回 False 会拒绝该工具调用（拒绝原因由 loop 回填给模型）
         self._log(f"工具调用前: {tool_call.name} 参数: {tool_call.arguments}")
-        return True
+        return "allow"
 
     async def tool_after(
         self, ctx: TurnContext, tool_call: ToolCall, result: object, ok: bool

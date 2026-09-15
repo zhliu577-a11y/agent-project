@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "json",
   "type": "tool",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "tool.v1",
   "description": "JSON 处理：美化格式化、按点路径取值（进程内直接执行）",
   "enabled": true,
   "errors": [

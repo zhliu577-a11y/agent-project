@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "tail-window",
   "type": "context",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "context.v1",
   "description": "Keep system instructions and the newest atomic conversation groups.",
   "entry": {
     "module": "policy.py",

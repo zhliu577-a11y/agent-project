@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "openai-embedding",
   "type": "embedding",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "embedding.v1",
   "description": "OpenAI text-embedding 接口：真实语义向量（需 OPENAI_API_KEY）",
   "enabled": true,
   "entry": {

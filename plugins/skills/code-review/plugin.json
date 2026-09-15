@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "code-review",
   "type": "skill",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "skill.v1",
   "description": "代码评审规范与检查清单（改代码前按此自检）",
   "enabled": true,
   "entry": {

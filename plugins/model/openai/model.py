@@ -13,6 +13,7 @@ from openai import AsyncOpenAI
 from core.model import ModelAdapter
 from core.parser import OpenAICompatibleParser
 from core.types import Message, ModelResponse
+from plugins.context import PluginContext
 
 
 def message_to_payload(msg: Message) -> dict[str, Any]:
@@ -46,13 +47,17 @@ class OpenAIModel(ModelAdapter):
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> None:
         api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("缺少 OPENAI_API_KEY，请在 .env 中配置后再运行")
 
-        timeout = float(os.getenv("OPENAI_TIMEOUT", "60"))
-        max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+        timeout = timeout if timeout is not None else float(os.getenv("OPENAI_TIMEOUT", "60"))
+        max_retries = (
+            max_retries if max_retries is not None else int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+        )
 
         self._client = AsyncOpenAI(
             api_key=api_key,
@@ -82,7 +87,17 @@ class OpenAIModel(ModelAdapter):
             parser.feed(chunk)
         return parser.finalize()
 
+    async def stop(self) -> None:
+        await self._client.close()
 
-def create_model(plugin_dir):
-    """插件工厂：返回模型适配器实例（实例化时读取 OPENAI_* 环境变量）。"""
-    return OpenAIModel()
+
+def create_model(plugin_dir, context: PluginContext | None = None):
+    """Create an adapter using plugin config first and environment as fallback."""
+    config = dict(context.config) if context is not None else {}
+    return OpenAIModel(
+        api_key=config.get("apiKey"),
+        base_url=config.get("baseUrl"),
+        model=config.get("model"),
+        timeout=float(config["timeout"]) if "timeout" in config else None,
+        max_retries=int(config["maxRetries"]) if "maxRetries" in config else None,
+    )

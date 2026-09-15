@@ -1,9 +1,21 @@
 {
+  "apiVersion": "1",
   "name": "deepseek",
   "type": "model",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "model.v1",
   "description": "DeepSeek 模型适配器（OpenAI 兼容协议，异步 + 流式 + 超时重试）",
   "enabled": true,
+  "model": {
+    "roles": ["general", "coding", "reasoning"],
+    "capabilities": ["text", "tools", "streaming"],
+    "contextWindow": 128000,
+    "supportsTools": true,
+    "supportsStreaming": true,
+    "costTier": "low",
+    "latencyTier": "medium"
+  },
   "entry": {
     "module": "model.py",
     "factory": "create_model"

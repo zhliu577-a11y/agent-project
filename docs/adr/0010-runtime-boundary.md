@@ -51,7 +51,7 @@ assemble_plugins(installed/package-b/2.0.0/)
 - loader 仍然只读取 `plugin.json`，不写生命周期状态。
 - Runtime 是唯一持有真实 gateway、连接和工具表的对象。
 - registry 的生命周期写入仍经过 `PluginManager`，Runtime 不直接改 JSON。
-- `python -m cli plugin list` 可以同时展示期望状态和最近运行状态。
+- `python cli.py plugin list` 可以同时展示期望状态和最近运行状态。
 - 第一版不支持热加载；重新启用、升级或卸载后需要重建 Runtime。
 - MCP 连接仍是在模型调用 `use_plugin` 时建立，`active` 表示插件已装配，
   不等价于 MCP 子进程已经连接。

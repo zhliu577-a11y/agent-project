@@ -13,5 +13,8 @@
   "context": {
     "maxTokens": 20000,
     "strategy": "tail-window"
+  },
+  "mcp": {
+    "preload": []
   }
 }

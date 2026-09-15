@@ -7,7 +7,7 @@
 #   deepseek / openai / vLLM 等插件可直接复用；协议不同则另写一个 parser。
 import json
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -103,3 +103,142 @@ class OpenAICompatibleParser(ResponseParser):
 
     def finalize(self) -> ModelResponse:
         return ModelResponse(content="".join(self._content), tool_calls=self._tools.finalize())
+
+
+@dataclass
+class _ResponsesToolCall:
+    call_id: str = ""
+    name: str = ""
+    arguments: str = ""
+    saw_argument_delta: bool = False
+
+
+class OpenAIResponsesParser(ResponseParser):
+    """Parse OpenAI Responses streaming events into the internal response type."""
+
+    def __init__(self, on_token: Callable[[str], None] | None = None) -> None:
+        self._on_token = on_token
+        self._content: list[str] = []
+        self._tools: dict[int, _ResponsesToolCall] = {}
+        self._saw_tool_call = False
+
+    def feed(self, event: Any) -> None:
+        event_type = _value(event, "type", "")
+        if event_type == "response.output_text.delta":
+            delta = _value(event, "delta", "")
+            if not isinstance(delta, str) or not delta:
+                return
+            self._content.append(delta)
+            if self._on_token is not None and not self._saw_tool_call:
+                self._on_token(delta)
+            return
+
+        if event_type == "response.output_item.added":
+            self._feed_item(
+                _value(event, "output_index", 0),
+                _value(event, "item"),
+                final=False,
+            )
+            return
+
+        if event_type == "response.output_item.done":
+            self._feed_item(
+                _value(event, "output_index", 0),
+                _value(event, "item"),
+                final=True,
+            )
+            return
+
+        if event_type == "response.function_call_arguments.delta":
+            self._saw_tool_call = True
+            call = self._tool_call(_value(event, "output_index", 0))
+            delta = _value(event, "delta", "")
+            if isinstance(delta, str):
+                call.arguments += delta
+                call.saw_argument_delta = True
+            return
+
+        if event_type == "response.function_call_arguments.done":
+            self._saw_tool_call = True
+            call = self._tool_call(_value(event, "output_index", 0))
+            arguments = _value(event, "arguments")
+            name = _value(event, "name")
+            if isinstance(arguments, str) and arguments:
+                call.arguments = arguments
+            if isinstance(name, str) and name:
+                call.name = name
+            return
+
+        if event_type == "response.completed":
+            self._feed_completed(_value(event, "response"))
+            return
+
+        if event_type == "error":
+            message = _value(event, "message", "OpenAI Responses stream failed")
+            raise RuntimeError(str(message))
+
+        if event_type == "response.failed":
+            response = _value(event, "response")
+            error = _value(response, "error")
+            message = _value(error, "message", "OpenAI Responses request failed")
+            raise RuntimeError(str(message))
+
+    def finalize(self) -> ModelResponse:
+        tool_calls: list[ToolCall] = []
+        for index, call in sorted(self._tools.items()):
+            if not call.name:
+                continue
+            tool_calls.append(
+                ToolCall(
+                    id=call.call_id or f"call_{index}",
+                    name=call.name,
+                    arguments=json.loads(call.arguments or "{}"),
+                )
+            )
+        return ModelResponse(content="".join(self._content), tool_calls=tool_calls)
+
+    def _feed_item(self, index: int, item: Any, *, final: bool) -> None:
+        if _value(item, "type") != "function_call":
+            return
+        self._saw_tool_call = True
+        call = self._tool_call(index)
+        call_id = _value(item, "call_id") or _value(item, "id")
+        name = _value(item, "name")
+        arguments = _value(item, "arguments")
+        if isinstance(call_id, str) and call_id:
+            call.call_id = call_id
+        if isinstance(name, str) and name:
+            call.name = name
+        if isinstance(arguments, str) and arguments:
+            if final or not call.saw_argument_delta:
+                call.arguments = arguments
+
+    def _feed_completed(self, response: Any) -> None:
+        output = _value(response, "output", ())
+        if not isinstance(output, (list, tuple)):
+            return
+        for index, item in enumerate(output):
+            if _value(item, "type") == "message" and not self._content:
+                content = _value(item, "content", ())
+                if not isinstance(content, (list, tuple)):
+                    continue
+                for part in content:
+                    if _value(part, "type") != "output_text":
+                        continue
+                    text = _value(part, "text", "")
+                    if isinstance(text, str) and text:
+                        self._content.append(text)
+                        if self._on_token is not None and not self._saw_tool_call:
+                            self._on_token(text)
+            else:
+                self._feed_item(index, item, final=True)
+
+    def _tool_call(self, index: Any) -> _ResponsesToolCall:
+        key = index if isinstance(index, int) else 0
+        return self._tools.setdefault(key, _ResponsesToolCall())
+
+
+def _value(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)

@@ -21,6 +21,7 @@ from plugins.loader import (
     load_mcp_plugins,
     load_memory_plugins,
     load_model_plugins,
+    load_model_router_plugins,
     load_session_plugins,
     load_skill_plugins,
     load_tool_plugins,
@@ -510,12 +511,14 @@ def create_model(plugin_dir):
 """
 
 
-def _model_manifest(name: str = "deepseek") -> dict:
-    return {
+def _model_manifest(name: str = "deepseek", **extra) -> dict:
+    manifest = {
         "name": name,
         "type": "model",
         "entry": {"module": "model.py", "factory": "create_model"},
     }
+    manifest.update(extra)
+    return manifest
 
 
 def test_load_model_plugins_is_lazy_and_create_returns_adapter(tmp_path) -> None:
@@ -554,6 +557,86 @@ def test_model_plugin_create_rejects_bad_factory_return(tmp_path) -> None:
     plugin = load_model_plugins(tmp_path)[0]
     with pytest.raises(ValueError, match="ModelAdapter"):
         plugin.create()
+
+
+def test_model_manifest_parses_capability_metadata(tmp_path) -> None:
+    manifest = _model_manifest(
+        name="routed",
+        model={
+            "roles": ["coding", "reasoning"],
+            "capabilities": ["text", "tools"],
+            "contextWindow": 64000,
+            "supportsTools": True,
+            "supportsStreaming": False,
+            "costTier": "low",
+            "latencyTier": "high",
+        },
+    )
+    _write_plugin(
+        tmp_path,
+        "model",
+        "routed",
+        manifest,
+        files={"model.py": _MODEL_MODULE},
+    )
+
+    parsed = load_model_plugins(tmp_path)[0].manifest.model
+
+    assert parsed is not None
+    assert parsed.roles == ("coding", "reasoning")
+    assert parsed.supports("tools") is True
+    assert parsed.supports("streaming") is False
+    assert parsed.context_window == 64000
+
+
+_MODEL_ROUTER_MODULE = """
+from core.model import ModelRouteDecision, ModelRouter
+
+
+class StaticRouter(ModelRouter):
+    def route(self, request):
+        return ModelRouteDecision(candidates=(request.default_model,))
+
+
+def create_router(plugin_dir):
+    return StaticRouter()
+"""
+
+
+def test_load_model_router_plugins_is_lazy_and_returns_router(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "model_routers",
+        "static",
+        {
+            "name": "static",
+            "type": "model-router",
+            "entry": {"module": "router.py", "factory": "create_router"},
+        },
+        files={"router.py": _MODEL_ROUTER_MODULE},
+    )
+
+    plugins = load_model_router_plugins(tmp_path)
+
+    assert len(plugins) == 1
+    assert type(plugins[0].create()).__name__ == "StaticRouter"
+
+
+def test_model_router_rejects_bad_factory_return(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "model_routers",
+        "bad",
+        {
+            "name": "bad",
+            "type": "model-router",
+            "entry": {"module": "router.py", "factory": "create_router"},
+        },
+        files={"router.py": "def create_router(plugin_dir):\n    return 42\n"},
+    )
+
+    with pytest.raises(ValueError, match="ModelRouter"):
+        load_model_router_plugins(tmp_path)[0].create()
 
 
 _CONTEXT_MODULE = """

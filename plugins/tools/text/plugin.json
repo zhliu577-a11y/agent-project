@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "text",
   "type": "tool",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "tool.v1",
   "description": "高频轻量文本处理（slug 转换、字数统计），进程内直接执行",
   "enabled": true,
   "entry": {

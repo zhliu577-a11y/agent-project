@@ -13,8 +13,8 @@
 
 - 固定异步 agent loop（调模型 → 执行工具 → 回填 → 判断结束），支持流式输出与多个工具的并行执行
 - **插件目录（drop-in）**：`plugins/` 下每个插件是一个自包含目录 + `plugin.json`，
-  拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model`、`skill`、
-  `session`、`memory`、`embedding`、`listener`、`context` 十类
+  拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model`、`model-router`、
+  `skill`、`session`、`memory`、`embedding`、`listener`、`context` 十一类
 - **功能包**：一个包可用 `contributes[]` 同时提供 skill、hook、tool 等能力，
   发现阶段统一展开为 contribution 后按受控 kind 注册表装配
 - **MCP 网关**：Agent 只面向网关这一个通道；网关统一维护各 MCP 插件的连接、
@@ -26,8 +26,9 @@
 - **外部工具运行时**：`tool` 插件也可声明 `runtime: node | process` 和
   `protocol: jsonrpc-stdio`，用 TypeScript/Node 或其它语言实现；进程首次调用时
   启动，Runtime 关闭时统一回收
-- **模型插件**：LLM 适配器来自 `plugins/model/*`（当前 deepseek 为默认），
-  `AGENT_MODEL` 环境变量即可切换模型提供方
+- **模型插件**：LLM 适配器来自 `plugins/model/*`（当前 deepseek 为默认）；
+  `ModelGateway` 统一负责惰性加载、预热、路由、fallback 与资源回收，
+  agent loop 始终只依赖 `ModelAdapter.complete()`
 - **技能插件**：纯内容插件（`plugins/skills/*`）按需注入操作说明——启动只放
   目录条目，模型需要时用 `use_skill` 读取完整正文（渐进披露）
 - **会话插件**：短期记忆插件化（`plugins/session/*`）——同一会话多轮历史
@@ -40,9 +41,10 @@
   安装后默认禁用，启停状态由 `data/plugin-registry.json` 管理
 - **HarnessRuntime**：统一装配插件、网关、模型、会话和工具；启动成功、加载失败
   与关闭状态会回写到 registry，CLI 和未来网页只依赖这一运行时边界
-- **CLI**：`python -m cli plugin ...` 提供 validate / install / enable / disable /
+- **CLI**：`python cli.py plugin ...` 提供 validate / install / enable / disable /
   remove / list；后续网页前端复用同一套 `PluginManager`
-- 按需挂载：模型通过 `use_plugin` 让网关挂载插件，避免无谓的进程与上下文开销
+- **MCP 预加载**：宿主通过 `mcp.preload` 或 `MCP_PRELOAD` 选择启动即挂载的
+  MCP；其余 MCP 仍由模型通过 `use_plugin` 按需挂载
 - 权限钩子插件示例：`allow / ask / deny` 策略随插件文件夹走，支持通配符
 - 配置文件带 schema 校验：写错清单/策略启动即报错，绝不静默出错
 - 单元测试 + ruff 规范 + GitHub Actions CI
@@ -71,9 +73,10 @@
 
 运行链路：启动时扫描 `plugins/` 与 registry 中已启用的外部包 →
 钩子插件实例化进 `HookGateway`、本地工具
-直接注册进 `ToolRegistry`、MCP 插件只读清单 → 本地工具第一轮即可调用；MCP
-工具由模型决定调 `use_plugin` → 网关连接对应 MCP 插件并注册命名空间工具
-（都先过权限钩子闸门）→ 结果回填 → 模型给出最终回答。
+直接注册进 `ToolRegistry`、MCP 插件只读清单，并按 `mcp.preload` 预挂载选中项 →
+本地工具和预加载的 MCP 工具第一轮即可调用；其余 MCP 工具由模型决定调
+`use_plugin` → 网关连接对应 MCP 插件并注册命名空间工具（都先过权限钩子闸门）
+→ 结果回填 → 模型给出最终回答。
 
 ## 快速开始
 
@@ -152,9 +155,12 @@ plugins/
 
 ```json
 {
+  "apiVersion": "1",
   "name": "time",
   "type": "mcp",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "mcp.v1",
   "description": "查询指定时区的当前时间",
   "enabled": true,
   "entry": {}
@@ -164,6 +170,8 @@ plugins/
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
 `mcp` / `hook` / `tool` / `model` / `skill` / `session` / `memory` / `embedding` /
 `listener` / `context`；
+`apiVersion` 固定为 `"1"`，`protocolVersion` 当前为 `1`，`contract` 必须与
+`<type>.v<protocolVersion>` 一致（例如 `mcp.v1`、`tool.v1`）；
 `enabled: false` 的插件
 结构仍会校验但不会加载。可选字段 `priority`（整数，默认 `0`）决定钩子插件的
 执行顺序：**越小越先执行**；可选字段 `errors` 声明插件已知的领域错误
@@ -178,15 +186,18 @@ plugins/
   "apiVersion": "1",
   "name": "code-quality",
   "version": "1.0.0",
+  "protocolVersion": 1,
   "contributes": [
     {
       "id": "lint",
       "kind": "skill",
+      "contract": "skill.v1",
       "entry": { "content": "skills/lint/SKILL.md" }
     },
     {
       "id": "format-hook",
       "kind": "hook",
+      "contract": "hook.v1",
       "entry": { "module": "hooks/hook.py", "factory": "create_hook" }
     }
   ]
@@ -232,7 +243,7 @@ validate -> staging -> 静态入口检查 -> sha256 -> 原子移动 -> registry
 
 外部插件按包隔离装配：一个包失败只把它标为 `error`，不会自动把其它插件标错。
 如果失败包恰好提供当前选中的 model/session/memory，Runtime 仍会拒绝启动。
-`python -m cli plugin list` 会同时显示期望启停状态和最近一次运行状态。
+`python cli.py plugin list` 会同时显示期望启停状态和最近一次运行状态。
 
 当前只接受目录和 zip。zip 解压会拒绝路径穿越和符号链接，并限制文件数量与
 总大小；入口路径也不能逃出插件包根目录。插件代码仍属于可信执行边界，这些
@@ -256,6 +267,36 @@ validate -> staging -> 静态入口检查 -> sha256 -> 原子移动 -> registry
   其余参数（如 `npx -y`）原样保留。
 - 子进程工作目录固定为该插件目录，插件自带资源用相对路径即可。
 - `transport` 目前只支持 `stdio`（远程 HTTP 在 Roadmap）。
+
+MCP 默认按需挂载：Runtime 启动时只读取插件清单，模型调用 `use_plugin` 后
+才连接服务器并执行 `tools/list`。频繁使用、希望第一轮模型请求就携带工具
+schema 的插件，可以显式预加载：
+
+```json
+{
+  "mcp": {
+    "preload": ["time", "math"]
+  }
+}
+```
+
+也可用逗号分隔的环境变量覆盖配置文件：
+
+```powershell
+$env:MCP_PRELOAD = "time,math"
+```
+
+CLI 管理命令：
+
+```powershell
+python cli.py mcp list
+python cli.py mcp preload add time
+python cli.py mcp preload remove time
+```
+
+预加载会增加启动时间和常驻子进程数量，建议只放高频 MCP。连接失败不会阻止
+Runtime 启动，后续仍可调用 `use_plugin` 重试；配置了不存在的名称会在启动时
+明确报错，避免拼写错误被静默忽略。
 
 ### 本地工具插件（`type: "tool"`）
 
@@ -363,10 +404,72 @@ JSON-RPC `error.code` 是字符串且命中该插件 `errors` 声明时，会按
 
 `model.py` 实现 `core.model.ModelAdapter`，工厂 `create_model(plugin_dir)` 返回
 适配器实例。装配阶段只校验入口、**不实例化**（构造可能读取密钥等环境变量），
-由 Harness 根据 `AGENT_MODEL`（默认 `deepseek`）选出激活插件后惰性创建。
-仓库自带两个示例：`deepseek`（默认）与 `openai`。换模型 = 复制
-`plugins/model/openai/` 目录改成自己的适配器（或直接设
-`AGENT_MODEL=openai` 并用 `OPENAI_*` 配置），互不影响。
+由 `ModelGateway` 根据默认模型、显式覆盖、agent role 和 fallback 选择提供方后
+惰性创建。仓库自带两个示例：`deepseek`（默认）与 `openai`。换模型 = 复制
+`plugins/model/openai/` 目录改成自己的适配器，或设置 `AGENT_MODEL=openai`
+并使用对应配置。
+
+`Runtime.model` 暴露的是 `ModelGateway` 这一单一 `ModelAdapter`，`Runtime.models`
+提供模型资源管理接口：
+
+```python
+await runtime.models.use("openai")  # 显式切换到 openai
+await runtime.models.prewarm("openai")  # 只初始化，不切换
+await runtime.models.unload("openai")  # 等待在途请求结束后释放
+runtime.models.status()  # idle / loading / active / error / stopped
+```
+
+默认模型与 `keepWarm` 中的 provider 会在 Runtime 启动时预热；其它 provider
+保持惰性创建。一次请求结束后 provider 默认继续保留，避免每轮重复建连；
+Runtime 关闭时统一调用其可选 `stop()` 并关闭客户端。
+
+模型选择由受信任的 `model-router.v1` 插件执行，默认
+[`static`](plugins/model_routers/static/router.py) 规则为：
+
+```text
+显式 use 覆盖 -> agent role route -> 默认模型 -> fallback
+```
+
+`config/model.json` 示例：
+
+```json
+{
+  "model": "deepseek",
+  "router": "static",
+  "fallback": ["openai"],
+  "keepWarm": ["deepseek"],
+  "routes": {
+    "coding": ["deepseek", "openai"],
+    "summary": ["openai"]
+  }
+}
+```
+
+fallback 只会在尚未向调用方输出 token 时发生。一旦流式输出已经开始，
+Gateway 会直接报错而不会切换模型，避免把两个模型的文本拼到同一条回复里。
+provider 的能力元数据（roles、capabilities、contextWindow、tools、streaming、
+cost/latency tier）来自各自的 `plugin.json`，路由插件可以据此做更复杂的选择。
+
+内置 provider 优先读取
+`config/plugins/model/<name>.json` 的 `apiKey`、`baseUrl`、`model`、`timeout`、
+`maxRetries`，环境变量作为兼容 fallback。
+
+Codex 的 `wire_api = "responses"` 配置不能直接塞进现有 OpenAI
+`chat.completions` 插件，应使用 `sub2api` 插件。它的非敏感配置位于
+`config/plugins/model/sub2api.json`，API key 只放环境变量：
+
+```dotenv
+AGENT_MODEL=sub2api
+SUB2API_API_KEY=sk-...
+SUB2API_BASE_URL=http://172.16.3.6:8589/v1
+SUB2API_MODEL=deepseek-v4-flash
+SUB2API_DISABLE_RESPONSE_STORAGE=true
+```
+
+该插件调用 `client.responses.create(...)`，把内部消息转换为 Responses
+input items，并把 `response.output_text.delta` 与 function-call 事件解析回
+`ModelResponse`。它支持流式文本和工具调用；`store=false` 对应 Codex 配置中的
+`disable_response_storage = true`。
 
 模型插件只负责**传输**（鉴权 / base_url / 请求体 / 取流）；把流式分片翻译成
 `ModelResponse` 的解析逻辑由内核 [core/parser.py] 提供（`ResponseParser` +
@@ -559,9 +662,12 @@ $env:CONTEXT_STRATEGY="summary-window"
 
 ## 配置说明
 
-### `config.json`（中心配置，随仓库提交）
+### `config/`（中心配置，随仓库提交）
 
-只承载“选择型配置”，优先级 **环境变量 > config.json > 内置默认**；
+`config/config.json` 承载共享默认值，`config/<section>.json` 承载模型、会话、
+记忆、嵌入、上下文和 MCP 等分域配置，`config/plugins/<kind>/<name>.json`
+承载单个插件的私有配置。优先级为
+**环境变量 > 分域/单插件配置 > config/config.json > 内置默认**；
 密钥与数据目录仍只放 `.env`。
 
 ```json
@@ -574,8 +680,9 @@ $env:CONTEXT_STRATEGY="summary-window"
 }
 ```
 
-对应字段写错启动即报错（`core/config.py` 校验）；想临时换后端，用环境变量
-覆盖即可（例如 `SESSION_STORE=inmemory`）。
+对应字段写错启动即报错（根目录 `config.py` 校验）；想临时换后端，用环境变量
+覆盖即可（例如 `SESSION_STORE=inmemory`）。MCP 预加载列表由
+`config/mcp.json` 管理，CLI 的 `mcp preload add/remove` 会更新该文件。
 
 ### `.env`（密钥与环境，已 gitignore，绝不提交）
 
@@ -587,6 +694,13 @@ $env:CONTEXT_STRATEGY="summary-window"
 | `DEEPSEEK_TIMEOUT` | `60` | 单次模型请求超时（秒） |
 | `DEEPSEEK_MAX_RETRIES` | `3` | 模型请求重试次数（仅安全场景） |
 | `AGENT_MODEL` | `deepseek` | 激活的模型插件名（plugins/model/* 里选） |
+| `MODEL_FALLBACK` | 无 | fallback 模型名，逗号分隔；覆盖 `model.fallback` |
+| `MODEL_KEEP_WARM` | 无 | Runtime 启动时预初始化的模型名，逗号分隔 |
+| `MODEL_ROUTER` | 无 | 激活的路由插件名；未设置时使用 Gateway 内置默认路由 |
+| `SUB2API_API_KEY` | 无 | Sub2API Responses 网关 token |
+| `SUB2API_BASE_URL` | 插件配置 | Sub2API 的 `/v1` 地址 |
+| `SUB2API_MODEL` | `deepseek-v4-flash` | Responses 网关使用的模型名 |
+| `SUB2API_DISABLE_RESPONSE_STORAGE` | `true` | 是否在网关禁用响应存储 |
 | `SESSION_STORE` | `jsonl` | 激活的会话存储插件名（plugins/session/* 里选） |
 | `SESSION_ID` | `default` | 会话标识，同名会话自动恢复历史 |
 | `SESSION_DATA_DIR` | `.sessions/` | jsonl 会话数据目录 |
@@ -603,6 +717,7 @@ $env:CONTEXT_STRATEGY="summary-window"
 | `MCP_CONNECT_TIMEOUT` | `20` | MCP 插件连接超时（秒） |
 | `MCP_CALL_TIMEOUT` | `30` | 单次 MCP 工具调用超时（秒） |
 | `MCP_CONNECT_RETRIES` | `0` | MCP 连接失败额外重试次数（指数退避，默认不重试） |
+| `MCP_PRELOAD` | 无 | Runtime 启动时预加载的 MCP 插件名，逗号分隔；覆盖 `mcp.preload` |
 
 ### 日志追踪与状态快照（tracing / checkpoint）
 
@@ -709,6 +824,75 @@ lint + format 检查 + 全部测试。
 5. 可观测性优先：结构化日志、异常隔离、可回放。
 6. 代码必须配套测试，测试通过才允许合并。
 7. LLM 优先、流程从简：内核只提供最小行动能力，规划与工具组合交给模型本身。
+
+## 插件平台协议（四大要求）
+
+当前插件基座按 **Manifest / Capability Contract / Lifecycle / Versioned Protocol**
+四项要求实现，详细决策见 `docs/adr/0013-plugin-platform-protocol.md`，清单结构见
+`docs/plugin-manifest.schema.json`。
+
+### Manifest
+
+`plugin.json` 是唯一声明入口。单能力插件声明 `type + entry`；多能力包声明
+`apiVersion + contributes[]`。发现阶段只读取和校验 JSON，不导入插件代码。
+
+### Capability Contract
+
+每个受信任的 `KindHandler` 声明支持的协议版本和产物接口。清单中的
+`type + protocolVersion` 形成规范契约，例如 `hook.v1`、`tool.v1`；
+如果显式写了 `contract`，必须与宿主计算结果一致。工厂返回值仍由对应接口验证，
+例如 hook 必须返回 `LifecycleHooks`，tool 必须返回 `Tool`。
+
+### Lifecycle
+
+装配流程为：
+
+```text
+discover -> validate -> negotiate -> load -> instantiate
+-> register -> setup(context) -> start -> ready -> stop
+```
+
+`setup(context)`、`start()`、`stop()` 是可选生命周期方法。Runtime 只激活当前
+选中的能力；启动失败会逆序回滚已进入生命周期的插件，包括 `setup()` 失败的
+当前插件（因此 `stop()` 必须可重复调用），正常关闭也会逆序释放资源。
+
+### Versioned Protocol
+
+清单可显式声明：
+
+```json
+{
+  "apiVersion": "1",
+  "protocolVersion": 1,
+  "contract": "tool.v1"
+}
+```
+
+`apiVersion` 是 manifest schema 版本，`protocolVersion` 是插件执行协议版本，
+`version` 是插件自身版本。当前宿主只接受字段与 `KindHandler` 一致的协议版本，
+不兼容插件会在导入代码前失败。
+
+### 配置目录
+
+配置统一放到 `config/`：
+
+```text
+config/
+├── config.json
+├── model.json
+├── session.json
+├── memory.json
+├── embedding.json
+├── context.json
+├── mcp.json
+└── plugins/
+    ├── hook/permission.json
+    └── <kind>/<name>.json
+```
+
+优先级为：环境变量 > 分域/单插件配置 > `config/config.json` > 内置默认。
+运行时把 `config/plugins/<kind>/<name>.json` 通过 `PluginContext.config`
+以只读形式交给插件。
 
 ## Roadmap
 

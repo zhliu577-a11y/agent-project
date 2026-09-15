@@ -5,7 +5,7 @@ import os
 
 from dotenv import load_dotenv
 
-from core.config import AppConfig
+from config import AppConfig
 from core.context import ContextPolicy
 from core.events import Event, EventBus
 from core.state import capture

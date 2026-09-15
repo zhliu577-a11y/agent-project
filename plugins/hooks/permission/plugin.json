@@ -1,10 +1,20 @@
 {
+  "apiVersion": "1",
   "name": "permission",
   "type": "hook",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "hook.v1",
   "description": "工具权限策略：allow / ask / deny 闸门（策略文件随插件自带）",
   "priority": 10,
   "enabled": true,
+  "hook": {
+    "events": ["tool_before"],
+    "matcher": "*",
+    "priority": 10,
+    "timeout": 2.0,
+    "onError": "deny"
+  },
   "entry": {
     "module": "hook.py",
     "factory": "create_hook"

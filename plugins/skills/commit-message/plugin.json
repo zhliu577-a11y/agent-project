@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "commit-message",
   "type": "skill",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "skill.v1",
   "description": "编写规范的 Git 提交信息（Conventional Commits 中文风格）",
   "enabled": true,
   "entry": {

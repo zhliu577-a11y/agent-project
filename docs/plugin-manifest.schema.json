@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/harness/plugin-manifest.schema.json",
+  "title": "Harness plugin manifest",
+  "description": "Versioned manifest for one capability or one multi-capability plugin package.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/singlePlugin"
+    },
+    {
+      "$ref": "#/$defs/pluginPackage"
+    }
+  ],
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "protocolVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "capabilityKinds": {
+      "type": "string",
+      "enum": [
+        "hook",
+        "mcp",
+        "tool",
+        "model",
+        "model-router",
+        "context",
+        "skill",
+        "session",
+        "memory",
+        "embedding",
+        "listener"
+      ]
+    },
+    "modelMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "roles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "contextWindow": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "supportsTools": {
+          "type": "boolean"
+        },
+        "supportsStreaming": {
+          "type": "boolean"
+        },
+        "costTier": {
+          "type": "string"
+        },
+        "latencyTier": {
+          "type": "string"
+        }
+      }
+    },
+    "singlePlugin": {
+      "type": "object",
+      "required": [
+        "apiVersion",
+        "name",
+        "type",
+        "version",
+        "protocolVersion",
+        "contract",
+        "entry"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "apiVersion": {
+          "type": "string",
+          "const": "1"
+        },
+        "protocolVersion": {
+          "$ref": "#/$defs/protocolVersion"
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "type": {
+          "$ref": "#/$defs/capabilityKinds"
+        },
+        "version": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "contract": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*\\.v[0-9]+$"
+        },
+        "entry": {
+          "type": "object"
+        },
+        "priority": {
+          "type": "integer"
+        },
+        "model": {
+          "$ref": "#/$defs/modelMetadata"
+        }
+      }
+    },
+    "pluginPackage": {
+      "type": "object",
+      "required": [
+        "apiVersion",
+        "name",
+        "version",
+        "protocolVersion",
+        "contributes"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "apiVersion": {
+          "type": "string",
+          "const": "1"
+        },
+        "protocolVersion": {
+          "$ref": "#/$defs/protocolVersion"
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "version": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "contributes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "kind",
+              "contract",
+              "entry"
+            ],
+            "additionalProperties": true,
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/name"
+              },
+              "kind": {
+                "$ref": "#/$defs/capabilityKinds"
+              },
+              "protocolVersion": {
+                "$ref": "#/$defs/protocolVersion"
+              },
+              "contract": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]*\\.v[0-9]+$"
+              },
+              "entry": {
+                "type": "object"
+              },
+              "model": {
+                "$ref": "#/$defs/modelMetadata"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

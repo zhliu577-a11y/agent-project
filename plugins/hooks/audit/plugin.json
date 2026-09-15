@@ -1,9 +1,18 @@
 {
+  "apiVersion": "1",
   "name": "audit",
   "type": "hook",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "hook.v1",
   "description": "示例钩子：把模型回复与每次工具调用（含结果）记录到本插件目录的 audit.log",
   "enabled": true,
+  "hook": {
+    "events": ["llm_response", "tool_before", "tool_after", "turn_end"],
+    "priority": 100,
+    "timeout": 2.0,
+    "onError": "allow"
+  },
   "entry": {
     "module": "hook.py",
     "factory": "create_hook"

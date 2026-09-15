@@ -1,8 +1,4 @@
-# plugins/hooks/permission/hook.py —— 示例钩子插件：工具权限策略
-#
-# 一个钩子插件 = 实现 LifecycleHooks 的类 + 一个工厂函数。
-# 工厂接收插件目录（Path），返回钩子实例；清单里声明：
-#   "entry": { "module": "hook.py", "factory": "create_hook" }
+# plugins/hooks/permission/hook.py - declarative tool permission hook
 import fnmatch
 import json
 import logging
@@ -11,6 +7,7 @@ from pathlib import Path
 
 from core.hooks import HookDecision, LifecycleHooks
 from core.types import ToolCall, TurnContext
+from plugins.context import PluginContext
 
 logger = logging.getLogger(__name__)
 
@@ -19,22 +16,19 @@ _VALID_MODES = {"allow", "ask", "deny"}
 
 @dataclass
 class Rule:
-    pattern: str  # 支持通配符，如 "filesystem__*"
-    mode: str  # allow | ask | deny
+    pattern: str
+    mode: str
 
 
 class PermissionHooks(LifecycleHooks):
-    """在 tool_before 时按策略表态：allow / ask / deny。
-
-    只做“表态”，不做交互：ask 的确认提示统一由 HookGateway 折叠后执行一次。
-    """
+    """Return allow/ask/deny decisions for matching tool names."""
 
     def __init__(self, rules: list[Rule] | None = None, default: str = "allow") -> None:
         if default not in _VALID_MODES:
-            raise ValueError(f"非法的 default 模式: {default}")
+            raise ValueError(f"invalid default mode: {default}")
         for rule in rules or []:
             if rule.mode not in _VALID_MODES:
-                raise ValueError(f"非法的规则模式: {rule.mode}")
+                raise ValueError(f"invalid rule mode: {rule.mode}")
         self._rules = list(rules or [])
         self._default = default
 
@@ -47,45 +41,55 @@ class PermissionHooks(LifecycleHooks):
     async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> HookDecision:
         mode = self.mode_for(tool_call.name)
         if mode == "deny":
-            logger.warning("已拦截工具调用: %s（策略拒绝）", tool_call.name)
+            logger.warning("tool call denied by policy: %s", tool_call.name)
         elif mode == "ask":
-            logger.info("工具调用需要用户确认: %s", tool_call.name)
-        return mode
+            logger.info("tool call requires confirmation: %s", tool_call.name)
+        return mode  # type: ignore[return-value]
 
 
 def load_policy(path: str | Path) -> PermissionHooks:
-    """读取并校验权限策略 JSON。"""
-    path = Path(path)
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    """Load permission policy from a standalone JSON file."""
+    policy_path = Path(path)
+    raw = json.loads(policy_path.read_text(encoding="utf-8"))
+    return parse_policy(raw, str(policy_path))
+
+
+def parse_policy(raw: object, where: str = "permission policy") -> PermissionHooks:
+    """Validate a policy object from either the plugin or central config."""
     if not isinstance(raw, dict):
-        raise ValueError(f"{path}: 顶层必须是 JSON 对象")
+        raise ValueError(f"{where}: top-level must be a JSON object")
 
     default = raw.get("default", "allow")
     if default not in _VALID_MODES:
-        raise ValueError(f"{path}: 非法的 default '{default}'，可选: {sorted(_VALID_MODES)}")
+        raise ValueError(f"{where}: invalid default '{default}', choose {sorted(_VALID_MODES)}")
 
     rules_raw = raw.get("rules", [])
     if not isinstance(rules_raw, list):
-        raise ValueError(f"{path}: 'rules' 必须是数组")
+        raise ValueError(f"{where}: 'rules' must be an array")
 
     rules: list[Rule] = []
-    for i, rule in enumerate(rules_raw, start=1):
-        where = f"{path}: 第 {i} 条规则"
-        if not isinstance(rule, dict):
-            raise ValueError(f"{where} 必须是对象")
-        tool = rule.get("tool")
-        mode = rule.get("mode")
+    for index, item in enumerate(rules_raw, start=1):
+        item_where = f"{where}: rule {index}"
+        if not isinstance(item, dict):
+            raise ValueError(f"{item_where} must be an object")
+        tool = item.get("tool")
+        mode = item.get("mode")
         if not isinstance(tool, str) or not tool.strip():
-            raise ValueError(f"{where} 缺少非空 'tool'")
+            raise ValueError(f"{item_where} requires a non-empty 'tool'")
         if mode not in _VALID_MODES:
             raise ValueError(
-                f"{where} ('{tool}'): 非法的 mode '{mode}'，可选: {sorted(_VALID_MODES)}"
+                f"{item_where} ('{tool}'): invalid mode '{mode}', choose {sorted(_VALID_MODES)}"
             )
-        rules.append(Rule(tool, mode))
+        rules.append(Rule(tool, str(mode)))
 
-    return PermissionHooks(rules, default=default)
+    return PermissionHooks(rules, default=str(default))
 
 
-def create_hook(plugin_dir: Path) -> PermissionHooks:
-    """插件工厂：加载本插件目录下的 permission.json 并返回策略实例。"""
+def create_hook(
+    plugin_dir: Path,
+    context: PluginContext | None = None,
+) -> PermissionHooks:
+    """Prefer central config, with the plugin-local file as compatibility fallback."""
+    if context is not None and context.config:
+        return parse_policy(dict(context.config), f"plugin config hook/{context.name}")
     return load_policy(plugin_dir / "permission.json")

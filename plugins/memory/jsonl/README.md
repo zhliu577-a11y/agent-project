@@ -6,8 +6,8 @@
 ## 配置
 
 ```text
-config.json / 环境变量: MEMORY_STORE=jsonl
-数据目录:              MEMORY_DATA_DIR，默认 .memory/
+config/memory.json / 环境变量: MEMORY_STORE=jsonl
+数据目录:                      MEMORY_DATA_DIR，默认 .memory/
 ```
 
 实现与 sqlite 后端相同的 `MemoryStore` 契约，可随时切换。

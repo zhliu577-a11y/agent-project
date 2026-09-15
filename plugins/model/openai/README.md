@@ -17,8 +17,8 @@ $env:AGENT_MODEL = "openai"   # 或在 .env 里写 AGENT_MODEL=openai
 .venv\Scripts\python.exe main.py
 ```
 
-也可以写进项目根 `config.json`（`"model": "openai"`）；选择优先级为
-**环境变量 > config.json > 默认值**。
+也可以写进 `config/model.json`（`"model": "openai"`）；选择优先级为
+**环境变量 > config/model.json > config/config.json > 默认值**。
 
 这就是“换模型 = 复制插件目录 + 改配置”：接通义、本地 vLLM 等任何
 OpenAI 兼容服务时，复制本目录并修改 `OPENAI_*` 对应的变量即可。

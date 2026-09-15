@@ -1,7 +1,10 @@
 {
+  "apiVersion": "1",
   "name": "debug",
   "type": "embedding",
   "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "embedding.v1",
   "description": "确定性哈希嵌入：离线可用，用于开发/测试向量链路（无语义）",
   "enabled": true,
   "entry": {

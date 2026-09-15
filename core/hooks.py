@@ -1,6 +1,9 @@
-# core/hooks.py —— 钩子网关：所有钩子插件的统一入口（类型化事件，异步）
+# core/hooks.py - typed in-process hook gateway
+import asyncio
+import fnmatch
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from core.events import Event, EventBus
@@ -8,83 +11,161 @@ from core.types import ModelResponse, ToolCall, TurnContext
 
 logger = logging.getLogger(__name__)
 
-# 钩子对“是否执行工具”的表态：
-#   allow —— 放行；ask —— 需要用户确认；deny —— 拒绝。
-# 网关按 deny > ask > allow 折叠多个钩子的决策。
 HookDecision = Literal["allow", "ask", "deny"]
+HookEvent = Literal[
+    "turn_start",
+    "llm_response",
+    "tool_before",
+    "tool_after",
+    "turn_end",
+]
+HookFailurePolicy = Literal["allow", "deny"]
+
+HOOK_EVENTS: tuple[HookEvent, ...] = (
+    "turn_start",
+    "llm_response",
+    "tool_before",
+    "tool_after",
+    "turn_end",
+)
 
 ConfirmFn = Callable[[TurnContext, ToolCall], Awaitable[bool]]
 
-# 阶段一由总线桥接的观察事件（决策类 tool_before 仍走 HookGateway 本体）
 _BRIDGED_EVENTS = ("turn.start", "model.response", "tool.after", "turn.end")
 
 
-class LifecycleHooks:
-    """钩子插件基类：覆写需要关心的方法，不覆写的自动忽略。
+@dataclass(frozen=True)
+class HookSpec:
+    """Declarative scheduling contract for one internal hook plugin."""
 
-    钩子插件放在 plugins/hooks/<name>/ 下，由插件加载器实例化后加入 HookGateway。
-    """
+    events: tuple[HookEvent, ...] = HOOK_EVENTS
+    matcher: str = "*"
+    priority: int = 0
+    timeout: float = 5.0
+    on_error: HookFailurePolicy | None = None
+
+    def handles(self, event: HookEvent) -> bool:
+        return event in self.events
+
+    def matches(self, value: str | None = None) -> bool:
+        return value is None or fnmatch.fnmatch(value, self.matcher)
+
+    def failure_decision(self, event: HookEvent) -> HookFailurePolicy:
+        if self.on_error is not None:
+            return self.on_error
+        return "deny" if event == "tool_before" else "allow"
+
+
+@dataclass(frozen=True)
+class HookResult:
+    """Optional structured result returned by decision-capable hooks."""
+
+    decision: HookDecision = "allow"
+    reason: str = ""
+
+
+class LifecycleHooks:
+    """Base class for internal hook plugins."""
+
+    async def setup(self, context: object) -> None: ...
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
 
     async def turn_start(self, ctx: TurnContext) -> None: ...
     async def llm_response(self, ctx: TurnContext, resp: ModelResponse) -> None: ...
 
-    async def tool_before(self, ctx: TurnContext, tool_call: ToolCall) -> HookDecision:
-        """对该工具调用表态：allow（放行）/ ask（请用户确认）/ deny（拒绝）。"""
+    async def tool_before(
+        self,
+        ctx: TurnContext,
+        tool_call: ToolCall,
+    ) -> HookDecision | HookResult | bool | None:
         return "allow"
 
     async def tool_after(
-        self, ctx: TurnContext, tool_call: ToolCall, result: Any, ok: bool
+        self,
+        ctx: TurnContext,
+        tool_call: ToolCall,
+        result: Any,
+        ok: bool,
     ) -> None: ...
+
     async def turn_end(self, ctx: TurnContext) -> None: ...
 
 
 async def _default_confirm(ctx: TurnContext, tool_call: ToolCall) -> bool:
-    """网关默认的 ask 确认：交互提示必须走 input（用户要看得见并回答）。"""
-    logger.info("请求用户确认工具调用: %s", tool_call.name)
+    """Ask the interactive client for confirmation."""
+    logger.info("requesting confirmation for tool call: %s", tool_call.name)
     answer = (
-        input(f"[权限] 是否允许调用 {tool_call.name}(参数: {tool_call.arguments})? [y/N]: ")
+        input(f"[permission] allow {tool_call.name} with arguments {tool_call.arguments}? [y/N]: ")
         .strip()
         .lower()
     )
     return answer in {"y", "yes"}
 
 
+@dataclass(frozen=True)
+class _HookRegistration:
+    name: str
+    spec: HookSpec
+    order: int
+    hook: LifecycleHooks
+
+
 class HookGateway:
-    """钩子网关：聚合所有钩子插件，内核只面向这一个网关。
-
-    与 MCP 网关对应：内核把 turn/llm/tool 等生命周期事件交给本网关，
-    由网关按（priority, 注册顺序）扇出给每个钩子插件，并负责异常隔离与决策汇总。
-
-    执行顺序设计：
-    - priority 越小越先执行；相同 priority 保持 add 的先后顺序（稳定、可预测）；
-    - 权限/安全类闸门建议用较小的 priority（先表态），记录/注入类默认值即可；
-    - tool_before 不做“首个拒绝即短路”，而是让所有钩子表态后折叠
-      （deny > ask > allow），便于审计钩子看到完整尝试；
-    - 钩子抛异常视为该钩子表态 deny（安全侧默认拒绝），但不阻断其余钩子表态；
-    - 折叠结果为 ask 时，网关只向用户确认一次（注入 confirm 可替换交互实现）。
-    """
+    """Ordered, isolated in-process fan-out for hook plugins."""
 
     def __init__(self) -> None:
-        self._hooks: list[tuple[int, int, LifecycleHooks]] = []
+        self._hooks: list[_HookRegistration] = []
         self._attached_buses: set[int] = set()
 
-    def add(self, hook: LifecycleHooks, priority: int = 0) -> None:
+    def add(
+        self,
+        hook: LifecycleHooks,
+        priority: int = 0,
+        *,
+        name: str | None = None,
+        spec: HookSpec | None = None,
+    ) -> None:
+        """Register a hook.
+
+        ``priority`` remains for backward compatibility. A supplied ``spec`` is
+        the authoritative declarative scheduling contract.
+        """
         if not isinstance(priority, int) or isinstance(priority, bool):
-            raise TypeError(f"priority 必须是整数，收到: {priority!r}")
-        self._hooks.append((priority, len(self._hooks), hook))
+            raise TypeError(f"priority must be an integer, got: {priority!r}")
+        resolved_name = name or type(hook).__name__
+        resolved_spec = spec or HookSpec(priority=priority)
+        if resolved_spec.priority != priority and spec is None:
+            resolved_spec = HookSpec(
+                events=resolved_spec.events,
+                matcher=resolved_spec.matcher,
+                priority=priority,
+                timeout=resolved_spec.timeout,
+                on_error=resolved_spec.on_error,
+            )
+        if name is not None and any(item.name == resolved_name for item in self._hooks):
+            raise ValueError(f"duplicate hook plugin name: {resolved_name}")
+        self._hooks.append(
+            _HookRegistration(
+                name=resolved_name,
+                spec=resolved_spec,
+                order=len(self._hooks),
+                hook=hook,
+            )
+        )
 
     @property
     def count(self) -> int:
         return len(self._hooks)
 
     def attach(self, bus: EventBus, *, priority: int = 100) -> None:
-        """把 hook 网关桥接到事件总线（幂等）；旧 hook 插件无需改动。"""
+        """Bridge observation events from the shared EventBus exactly once."""
         if id(bus) in self._attached_buses:
             return
         for name in _BRIDGED_EVENTS:
             bus.subscribe(name, self._on_bus_event, priority=priority)
         self._attached_buses.add(id(bus))
-        logger.info("HookGateway 已桥接事件总线（%d 个观察事件）", len(_BRIDGED_EVENTS))
+        logger.info("HookGateway attached to EventBus (%d events)", len(_BRIDGED_EVENTS))
 
     async def _on_bus_event(self, event: Event) -> None:
         payload = event.payload
@@ -94,27 +175,53 @@ class HookGateway:
             await self.llm_response(payload["ctx"], payload["resp"])
         elif event.name == "tool.after":
             await self.tool_after(
-                payload["ctx"], payload["tool_call"], payload["result"], payload["ok"]
+                payload["ctx"],
+                payload["tool_call"],
+                payload["result"],
+                payload["ok"],
             )
         elif event.name == "turn.end":
             await self.turn_end(payload["ctx"])
 
-    def _ordered(self) -> list[tuple[int, int, LifecycleHooks]]:
-        return sorted(self._hooks)
+    def _ordered(self, event: HookEvent, subject: str | None = None) -> list[_HookRegistration]:
+        return sorted(
+            (
+                registration
+                for registration in self._hooks
+                if registration.spec.handles(event) and registration.spec.matches(subject)
+            ),
+            key=lambda item: (item.spec.priority, item.order),
+        )
+
+    async def _invoke(self, registration: _HookRegistration, event: HookEvent, awaitable):
+        try:
+            return await asyncio.wait_for(awaitable, timeout=registration.spec.timeout)
+        except TimeoutError:
+            logger.error(
+                "hook %s timed out after %.3fs during %s",
+                registration.name,
+                registration.spec.timeout,
+                event,
+            )
+            raise
 
     async def turn_start(self, ctx: TurnContext) -> None:
-        for _, _, hook in self._ordered():
+        for registration in self._ordered("turn_start"):
             try:
-                await hook.turn_start(ctx)
+                await self._invoke(registration, "turn_start", registration.hook.turn_start(ctx))
             except Exception as exc:
-                logger.exception("turn_start 钩子执行失败: %s", exc)
+                logger.exception("turn_start hook failed: %s: %s", registration.name, exc)
 
     async def llm_response(self, ctx: TurnContext, resp: ModelResponse) -> None:
-        for _, _, hook in self._ordered():
+        for registration in self._ordered("llm_response"):
             try:
-                await hook.llm_response(ctx, resp)
+                await self._invoke(
+                    registration,
+                    "llm_response",
+                    registration.hook.llm_response(ctx, resp),
+                )
             except Exception as exc:
-                logger.exception("llm_response 钩子执行失败: %s", exc)
+                logger.exception("llm_response hook failed: %s: %s", registration.name, exc)
 
     async def tool_before(
         self,
@@ -122,50 +229,79 @@ class HookGateway:
         tool_call: ToolCall,
         confirm: ConfirmFn | None = None,
     ) -> bool:
-        """让全部钩子表态并按 deny > ask > allow 折叠，返回最终是否放行。"""
+        """Collect decisions using deny > ask > allow, then ask at most once."""
         decision: HookDecision = "allow"
-        for _, _, hook in self._ordered():
+        subject = getattr(tool_call, "name", None)
+        for registration in self._ordered("tool_before", subject):
             try:
-                vote = await hook.tool_before(ctx, tool_call)
-            except Exception as exc:
-                logger.exception("tool_before 钩子执行失败，按拒绝处理: %s", exc)
-                vote = "deny"
-            if vote not in ("allow", "ask", "deny"):
-                logger.warning(
-                    "钩子 %s 返回了非法决策 %r，按拒绝处理",
-                    type(hook).__name__,
-                    vote,
+                value = await self._invoke(
+                    registration,
+                    "tool_before",
+                    registration.hook.tool_before(ctx, tool_call),
                 )
-                vote = "deny"
+                vote = _coerce_decision(value, registration.name)
+            except Exception as exc:
+                logger.exception(
+                    "tool_before hook failed: %s: %s (policy=%s)",
+                    registration.name,
+                    exc,
+                    registration.spec.failure_decision("tool_before"),
+                )
+                vote = registration.spec.failure_decision("tool_before")
+
             if vote == "deny":
                 decision = "deny"
             elif decision == "allow" and vote == "ask":
                 decision = "ask"
 
         if decision == "deny":
-            logger.warning("工具调用被钩子网关拦截: %s", tool_call.name)
+            logger.warning("tool call denied by hook gateway: %s", tool_call.name)
             return False
         if decision == "ask":
             asker = confirm if confirm is not None else _default_confirm
             try:
                 return await asker(ctx, tool_call)
             except Exception as exc:
-                logger.exception("ask 确认执行失败，按拒绝处理: %s", exc)
+                logger.exception("ask confirmation failed; denying: %s", exc)
                 return False
         return True
 
     async def tool_after(
-        self, ctx: TurnContext, tool_call: ToolCall, result: Any, ok: bool
+        self,
+        ctx: TurnContext,
+        tool_call: ToolCall,
+        result: Any,
+        ok: bool,
     ) -> None:
-        for _, _, hook in self._ordered():
+        subject = getattr(tool_call, "name", None)
+        for registration in self._ordered("tool_after", subject):
             try:
-                await hook.tool_after(ctx, tool_call, result, ok)
+                await self._invoke(
+                    registration,
+                    "tool_after",
+                    registration.hook.tool_after(ctx, tool_call, result, ok),
+                )
             except Exception as exc:
-                logger.exception("tool_after 钩子执行失败: %s", exc)
+                logger.exception("tool_after hook failed: %s: %s", registration.name, exc)
 
     async def turn_end(self, ctx: TurnContext) -> None:
-        for _, _, hook in self._ordered():
+        for registration in self._ordered("turn_end"):
             try:
-                await hook.turn_end(ctx)
+                await self._invoke(registration, "turn_end", registration.hook.turn_end(ctx))
             except Exception as exc:
-                logger.exception("turn_end 钩子执行失败: %s", exc)
+                logger.exception("turn_end hook failed: %s: %s", registration.name, exc)
+
+
+def _coerce_decision(value: Any, name: str) -> HookDecision:
+    if isinstance(value, HookResult):
+        value = value.decision
+    if value is True:
+        return "allow"
+    if value is False:
+        return "deny"
+    if value is None:
+        return "allow"
+    if value not in ("allow", "ask", "deny"):
+        logger.warning("hook %s returned invalid decision %r; denying", name, value)
+        return "deny"
+    return value

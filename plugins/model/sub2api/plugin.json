@@ -1,0 +1,23 @@
+{
+  "apiVersion": "1",
+  "name": "sub2api",
+  "type": "model",
+  "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "model.v1",
+  "description": "Sub2API Anthropic group - OpenAI Responses compatible model provider",
+  "enabled": true,
+  "model": {
+    "roles": ["general", "coding", "reasoning"],
+    "capabilities": ["text", "tools", "streaming"],
+    "contextWindow": 200000,
+    "supportsTools": true,
+    "supportsStreaming": true,
+    "costTier": "medium",
+    "latencyTier": "medium"
+  },
+  "entry": {
+    "module": "model.py",
+    "factory": "create_model"
+  }
+}

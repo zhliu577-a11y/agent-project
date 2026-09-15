@@ -308,7 +308,6 @@ class UsePlugin(Tool):
     def __init__(self, gateway: McpGateway, registry: ToolRegistry) -> None:
         self._gateway = gateway
         self._registry = registry
-        self._mounted: set[str] = set()
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -326,21 +325,24 @@ class UsePlugin(Tool):
 
     async def execute(self, **kwargs: Any) -> str:
         name = kwargs["name"]
+        _, message = await self.mount(name)
+        return message
+
+    async def mount(self, name: str) -> tuple[bool, str]:
+        """Mount one plugin and register its tools; safe to call repeatedly."""
         if self._gateway.plugin_spec(name) is None:
-            return f"未知插件: {name}，可挂载: {gateway_available(self._gateway)}"
-        if name in self._mounted:
-            return f"插件 {name} 已挂载，工具: {self._gateway.tool_names(name)}"
+            return False, f"未知插件: {name}，可挂载: {gateway_available(self._gateway)}"
 
         try:
             tools = await self._gateway.mount(name)
         except Exception as exc:
             logger.exception("插件 %s 挂载失败", name)
-            return f"插件 {name} 挂载失败: {exc}"
+            return False, f"插件 {name} 挂载失败: {exc}"
 
         for tool in tools:
-            self._registry.register(tool)
-        self._mounted.add(name)
-        return f"插件 {name} 已挂载，可用工具: {[tool.name for tool in tools]}"
+            if self._registry.describe(tool.name) is None:
+                self._registry.register(tool)
+        return True, f"插件 {name} 已挂载，可用工具: {[tool.name for tool in tools]}"
 
 
 def gateway_available(gateway: McpGateway) -> str:

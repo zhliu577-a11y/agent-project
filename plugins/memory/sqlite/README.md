@@ -5,7 +5,7 @@
 
 ## 配置
 
-- 选择：`config.json` 的 `"memory": { "store": "sqlite" }` 或 `MEMORY_STORE=sqlite`；
+- 选择：`config/memory.json` 的 `"store": "sqlite"` 或 `MEMORY_STORE=sqlite`；
 - 数据文件：`MEMORY_DB_PATH`，默认 `.memory/memory.db`（已 gitignore）。
 
 模型侧工具：`remember` / `recall` / `update_note` / `forget`
