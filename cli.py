@@ -85,8 +85,11 @@ def _list(manager: PluginManager, *, as_json: bool) -> int:
         print("no installed plugin packages")
         return 0
     for record in records:
-        status = "enabled" if record.enabled else "disabled"
-        print(f"{record.name}\t{record.version or '-'}\t{status}\t{record.path}")
+        desired = "enabled" if record.enabled else "disabled"
+        print(
+            f"{record.name}\t{record.version or '-'}\t{desired}"
+            f"\t{record.runtime_status}\t{record.path}"
+        )
     return 0
 
 

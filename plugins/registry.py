@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 REGISTRY_API_VERSION = 1
+RUNTIME_STATUSES = frozenset({"disabled", "idle", "active", "error", "stopped"})
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,11 @@ class PluginRecord:
         )
         updated_at = _expect_str(raw.get("updatedAt", ""), where, "updatedAt", allow_empty=True)
         runtime_status = _expect_str(raw.get("runtimeStatus", "idle"), where, "runtimeStatus")
+        if runtime_status not in RUNTIME_STATUSES:
+            raise ValueError(
+                f"{where}: unsupported 'runtimeStatus' {runtime_status!r}; "
+                f"expected one of {sorted(RUNTIME_STATUSES)}"
+            )
         last_error = raw.get("lastError")
         if last_error is not None and not isinstance(last_error, str):
             raise ValueError(f"{where}: 'lastError' must be a string or null")
@@ -74,7 +80,29 @@ class PluginRecord:
         }
 
     def with_enabled(self, enabled: bool, *, updated_at: str) -> "PluginRecord":
-        return replace(self, enabled=enabled, updated_at=updated_at)
+        return replace(
+            self,
+            enabled=enabled,
+            runtime_status="idle" if enabled else "disabled",
+            last_error=None,
+            updated_at=updated_at,
+        )
+
+    def with_runtime_status(
+        self,
+        runtime_status: str,
+        *,
+        updated_at: str,
+        last_error: str | None = None,
+    ) -> "PluginRecord":
+        if runtime_status not in RUNTIME_STATUSES:
+            raise ValueError(f"unsupported runtime status: {runtime_status!r}")
+        return replace(
+            self,
+            runtime_status=runtime_status,
+            last_error=last_error,
+            updated_at=updated_at,
+        )
 
 
 class PluginRegistry:

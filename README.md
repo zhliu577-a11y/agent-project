@@ -35,6 +35,8 @@
   历史只增不减的问题有解
 - **插件包生命周期**：外部目录或 zip 包经过静态检查、staging、摘要计算后原子安装；
   安装后默认禁用，启停状态由 `data/plugin-registry.json` 管理
+- **HarnessRuntime**：统一装配插件、网关、模型、会话和工具；启动成功、加载失败
+  与关闭状态会回写到 registry，CLI 和未来网页只依赖这一运行时边界
 - **CLI**：`python -m cli plugin ...` 提供 validate / install / enable / disable /
   remove / list；后续网页前端复用同一套 `PluginManager`
 - 按需挂载：模型通过 `use_plugin` 让网关挂载插件，避免无谓的进程与上下文开销
@@ -47,6 +49,7 @@
 ```text
 ┌──────────────────────── 内核（固定，不随插件变化）───────────────────────┐
 │  loop.py       固定循环：调模型 → 工具 → 回填                           │
+│  runtime.py    Runtime：生命周期 roots → 装配对象图 → 关闭与状态回写    │
 │  core/         类型与接口：types / Tool / ToolRegistry / model          │
 │                钩子网关：core/hooks.HookGateway                         │
 └───────┬──────────────────────────────┬─────────────────────────────────┘
@@ -209,6 +212,20 @@ validate -> staging -> 静态入口检查 -> sha256 -> 原子移动 -> registry
 安装后默认 `disabled`；`enable / disable` 只修改 registry，不重写插件自带的
 `plugin.json`。第一版不做热加载，启停后需要重启或重建 Runtime 才生效。
 `remove` 先把目录移动到 `data/plugin-store/trash/`，便于后续审计或恢复。
+
+`runtimeStatus` 记录最近一次 Runtime 装配结果：
+
+| 状态 | 含义 |
+|---|---|
+| `disabled` | 用户已禁用，本次 Runtime 不装配 |
+| `idle` | 已启用，但当前尚未完成装配 |
+| `active` | 当前 Runtime 已成功装配 |
+| `error` | 当前包的声明、入口或初始化失败，错误写入 `lastError` |
+| `stopped` | 上次 Runtime 正常关闭 |
+
+外部插件按包隔离装配：一个包失败只把它标为 `error`，不会自动把其它插件标错。
+如果失败包恰好提供当前选中的 model/session/memory，Runtime 仍会拒绝启动。
+`python -m cli plugin list` 会同时显示期望启停状态和最近一次运行状态。
 
 当前只接受目录和 zip。zip 解压会拒绝路径穿越和符号链接，并限制文件数量与
 总大小；入口路径也不能逃出插件包根目录。插件代码仍属于可信执行边界，这些

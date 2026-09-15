@@ -608,6 +608,11 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
 
 def _iter_manifest_paths(root: Path):
     """递归寻找 plugin.json；找到的插件目录不再向下钻取（插件自身即叶子）。"""
+    root_manifest = root / "plugin.json"
+    if root_manifest.is_file():
+        yield root_manifest
+        return
+
     stack = [root]
     while stack:
         directory = stack.pop()

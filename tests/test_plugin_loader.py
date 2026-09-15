@@ -823,6 +823,30 @@ def test_package_manifest_expands_to_contributions(tmp_path) -> None:
     ]
 
 
+def test_discover_accepts_package_root_with_manifest(tmp_path) -> None:
+    package_dir = _write_package(
+        tmp_path,
+        "quality",
+        {
+            "apiVersion": "1",
+            "name": "quality",
+            "version": "1.0.0",
+            "contributes": [
+                {
+                    "id": "lint",
+                    "kind": "skill",
+                    "entry": {"content": "SKILL.md"},
+                }
+            ],
+        },
+        {"SKILL.md": "# lint\n"},
+    )
+
+    manifests = discover_plugins(package_dir)
+
+    assert [manifest.name for manifest in manifests] == ["quality--lint"]
+
+
 def test_disabled_package_is_validated_but_not_returned(tmp_path) -> None:
     _write_package(
         tmp_path,

@@ -46,4 +46,4 @@ def test_cli_install_enable_and_list(tmp_path, capsys) -> None:
     assert "enabled quality" in capsys.readouterr().out
 
     assert main([*common, "plugin", "list"]) == 0
-    assert "quality\t1.0.0\tenabled" in capsys.readouterr().out
+    assert "quality\t1.0.0\tenabled\tidle" in capsys.readouterr().out

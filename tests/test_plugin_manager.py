@@ -60,6 +60,7 @@ def test_install_is_disabled_and_writes_registry(tmp_path) -> None:
 
     assert record.enabled is False
     assert record.installed is True
+    assert record.runtime_status == "disabled"
     assert record.digest.startswith("sha256:")
     assert (manager.installed_dir / "quality" / "1.0.0" / "plugin.json").is_file()
     assert manager.list_installed() == (record,)
@@ -78,10 +79,12 @@ def test_enable_disable_and_runtime_roots_follow_registry(tmp_path) -> None:
 
     enabled = manager.enable("quality")
     assert enabled.enabled is True
+    assert enabled.runtime_status == "idle"
     assert manager.runtime_roots()[-1] == (manager.installed_dir / "quality" / "1.0.0").resolve()
 
     disabled = manager.disable("quality")
     assert disabled.enabled is False
+    assert disabled.runtime_status == "disabled"
     assert manager.runtime_roots() == [manager.builtin_dir]
 
 
@@ -160,3 +163,12 @@ def test_registry_path_cannot_escape_installed_store(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="outside installed store"):
         manager.runtime_roots()
+
+
+def test_record_runtime_status_requires_known_status(tmp_path) -> None:
+    manager = _manager(tmp_path)
+    package = _write_package(tmp_path / "source")
+    manager.install(package)
+
+    with pytest.raises(ValueError, match="unsupported runtime status"):
+        manager.record_runtime_status("quality", "working")

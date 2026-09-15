@@ -52,6 +52,8 @@ validate
 
 安装后的默认状态是 `installed=true, enabled=false`。`enable / disable`
 只修改注册表。`remove` 先把包移动到 `trash/`，再更新注册表。
+`runtimeStatus` 由 `HarnessRuntime` 在启动、失败和关闭时更新；registry 保存的
+是最近一次实际运行结果，不把“用户希望启用”当成“当前进程已经加载”。
 
 注册表写入采用“临时文件 → flush/fsync → `os.replace`”，并在进程内加锁。
 

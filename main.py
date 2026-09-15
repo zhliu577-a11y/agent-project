@@ -1,10 +1,4 @@
-# main.py —— Harness 启动器：发现插件 → 装配网关 → 进入固定 agent loop（全异步）
-#
-# 启动流程：
-#   1. assemble_plugins 统一装配 plugins/（hook / mcp / tool / model / skill / session）；
-#   2. 钩子插件装进 HookGateway，本地工具直接注册进 ToolRegistry；
-#   3. 按 AGENT_MODEL（默认 deepseek）选定模型插件并惰性实例化；
-#   4. 创建 SkillGateway / McpGateway，注册 use_skill / use_plugin，进入固定 loop。
+# main.py - CLI 启动层：启动 Runtime 并进入固定 agent loop
 import asyncio
 import logging
 import os
@@ -13,26 +7,13 @@ from dotenv import load_dotenv
 
 from core.config import AppConfig
 from core.context import trim_history
-from core.events import Event, EventBus, jsonl_sink
-from core.hooks import HookGateway
-from core.prompt import build_system_prompt
-from core.registry import ToolRegistry
+from core.events import Event, EventBus
 from core.state import capture
 from core.tracing import begin_trace, setup_logging
 from core.types import Message
-from gateways.mcp_gateway import McpGateway, UsePlugin
-from gateways.memory_gateway import (
-    ForgetTool,
-    MemoryGateway,
-    RecallTool,
-    RememberTool,
-    UpdateNoteTool,
-)
 from gateways.session_gateway import SessionGateway
-from gateways.skill_gateway import SkillGateway, UseSkill
 from loop import run_agent
-from plugins.loader import assemble_plugins, attach_listener_plugins
-from plugins.manager import PluginManager
+from runtime import HarnessRuntime, RuntimeStartupError
 
 logger = logging.getLogger("main")
 
@@ -124,160 +105,29 @@ async def main() -> None:
     load_dotenv()
     config = AppConfig.load()
     os.environ.setdefault("EMBEDDING_PROVIDER", config.embedding_provider)
-    # 0. 装配插件：写错清单/入口立刻报错退出，而不是静默出错
     try:
-        plugin_manager = PluginManager()
-        plugin_roots = plugin_manager.runtime_roots()
-        assembly = assemble_plugins(plugin_roots)
-    except ValueError as exc:
-        logger.error("插件装配失败: %s", exc)
-        return
-    hook_plugins = assembly.hooks
-    mcp_specs = assembly.mcp
-    tool_plugins = assembly.tools
-    model_plugins = assembly.models
-
-    # 1. 钩子网关：内核只面向它，具体钩子全部来自插件目录
-    hooks = HookGateway()
-    for manifest, hook in hook_plugins:
-        hooks.add(hook)
-        logger.info("钩子网关已接入插件: %s", manifest.name)
-
-    # 1.5 事件总线：观察层（hook 网关桥接其上；EVENT_LOG 可落 JSONL 时间线）
-    bus = EventBus()
-    event_log = os.getenv("EVENT_LOG")
-    if event_log:
-        bus.subscribe("*", jsonl_sink(event_log))
-        logger.info("事件总线日志已启用: %s", event_log)
-    hooks.attach(bus)
-    attach_listener_plugins(bus, assembly.listeners)
-    if assembly.listeners:
-        logger.info("listener 插件已接入: %s", [p.manifest.name for p in assembly.listeners])
-
-    # 2.5 模型插件：AGENT_MODEL 选择（默认 deepseek），选定后才实例化
-    model_name = config.model
-    model_plugin = next(
-        (plugin for plugin in model_plugins if plugin.manifest.name == model_name), None
-    )
-    if model_plugin is None:
-        logger.error(
-            "未知的模型插件: %s，可选: %s", model_name, [p.manifest.name for p in model_plugins]
-        )
-        return
-    try:
-        model = model_plugin.create()
-    except ValueError as exc:
-        logger.error("模型插件 %s 初始化失败: %s", model_name, exc)
-        return
-
-    # 2.6 会话存储：SESSION_STORE 选择（默认 jsonl），按 SESSION_ID 恢复历史
-    session_store_name = config.session_store
-    session_plugin = next(
-        (plugin for plugin in assembly.sessions if plugin.manifest.name == session_store_name),
-        None,
-    )
-    if session_plugin is None:
-        logger.error(
-            "未知的会话存储插件: %s，可选: %s",
-            session_store_name,
-            [p.manifest.name for p in assembly.sessions],
-        )
-        return
-    try:
-        store = session_plugin.create()
-    except ValueError as exc:
-        logger.error("会话存储插件 %s 初始化失败: %s", session_store_name, exc)
-        return
-    session = SessionGateway(store, session_id=config.session_id)
-    try:
-        history = await session.load_history()
+        runtime = HarnessRuntime(config)
     except (OSError, ValueError) as exc:
-        logger.warning("会话历史读取失败，将开启新会话: %s", exc)
-        history = []
-    logger.info(
-        "会话 %s（%s 存储）恢复历史 %d 条",
-        session.session_id,
-        session_store_name,
-        len(history),
-    )
-
-    # 2.7 长期记忆：MEMORY_STORE 选择（默认 jsonl），跨会话语义笔记
-    memory_store_name = config.memory_store
-    memory_plugin = next(
-        (plugin for plugin in assembly.memories if plugin.manifest.name == memory_store_name),
-        None,
-    )
-    if memory_plugin is None:
-        logger.error(
-            "未知的长期记忆插件: %s，可选: %s",
-            memory_store_name,
-            [p.manifest.name for p in assembly.memories],
-        )
+        logger.error("Runtime 初始化失败: %s", exc)
         return
     try:
-        memory_store = memory_plugin.create()
-    except ValueError as exc:
-        logger.error("长期记忆插件 %s 初始化失败: %s", memory_store_name, exc)
-        return
-    memory_gateway = MemoryGateway(memory_store, events=bus)
-    logger.info("长期记忆已启用（%s 存储）", memory_store_name)
-
-    tools = ToolRegistry()
-
-    # 3. 本地工具直接进注册表（启动即就绪）
-    for _, tools_list in tool_plugins:
-        for tool in tools_list:
-            tools.register(tool)
-        logger.info("本地工具已就绪: %s", [tool.name for tool in tools_list])
-
-    # 4. 技能网关：提示词只放目录，正文由 use_skill 按需读取（渐进披露）
-    skill_gateway = SkillGateway(assembly.skills)
-    tools.register(UseSkill(skill_gateway))
-    logger.info("技能目录: %s", skill_gateway.available())
-
-    # 4.5 长期记忆工具：remember / recall / forget（跨会话笔记）
-    tools.register(RememberTool(memory_gateway))
-    tools.register(RecallTool(memory_gateway))
-    tools.register(ForgetTool(memory_gateway))
-    tools.register(UpdateNoteTool(memory_gateway))
-    logger.info("长期记忆工具已就绪: remember / recall / forget / update_note")
-
-    # 5. 组装系统提示词：只放目录条目；本地工具说明在其 schema 里，不重复写
-    preload_parts: list[tuple[str, str]] = []
-    for skill in assembly.skills:
-        if not skill.preload:
-            continue
         try:
-            content = skill_gateway.get(skill.manifest.name)
-        except ValueError as exc:
-            logger.warning("预载技能 %s 读取失败，已跳过: %s", skill.manifest.name, exc)
-            continue
-        preload_parts.append((skill.manifest.name, content))
-    system_prompt = build_system_prompt(
-        mcp=[(spec.manifest.name, spec.manifest.description) for spec in mcp_specs],
-        skills=skill_gateway.catalog(),
-        preloads=preload_parts,
-    )
-
-    logger.info("MCP 插件目录（尚未连接）: %s", [spec.manifest.name for spec in mcp_specs])
-
-    # 6. MCP 网关：整个应用生命周期里唯一持有 MCP 连接的对象
-    gateway = McpGateway(mcp_specs)
-    try:
-        # 只注册"挂载器"工具，具体 MCP 插件等模型决定后再由网关连接
-        tools.register(UsePlugin(gateway, tools))
+            await runtime.start()
+        except (RuntimeStartupError, OSError, ValueError) as exc:
+            logger.error("Runtime 启动失败: %s", exc)
+            return
         await chat(
-            model,
-            tools,
-            hooks,
-            system_prompt,
-            history=history,
-            session=session,
+            runtime.model,
+            runtime.tools,
+            runtime.hooks,
+            runtime.system_prompt,
+            history=runtime.history,
+            session=runtime.session,
             max_context_tokens=config.context_max_tokens,
-            events=bus,
+            events=runtime.events,
         )
     finally:
-        await gateway.close()
+        await runtime.close()
 
 
 if __name__ == "__main__":

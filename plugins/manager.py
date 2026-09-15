@@ -10,7 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from plugins.loader import PackageInspection, inspect_package
-from plugins.registry import PluginRecord, PluginRegistry
+from plugins.registry import RUNTIME_STATUSES, PluginRecord, PluginRegistry
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PLUGIN_DIR = PROJECT_ROOT / "plugins"
@@ -114,6 +114,7 @@ class PluginManager:
                 enabled=False,
                 installed_at=now,
                 updated_at=now,
+                runtime_status="disabled",
             )
             try:
                 self.registry.set(record)
@@ -148,15 +149,39 @@ class PluginManager:
     def list_installed(self) -> tuple[PluginRecord, ...]:
         return self.registry.all()
 
+    def enabled_records(self) -> tuple[PluginRecord, ...]:
+        return tuple(
+            record for record in self.registry.all() if record.installed and record.enabled
+        )
+
+    def plugin_path(self, name: str) -> Path:
+        return self._resolve_record_path(self._require_record(name))
+
+    def record_runtime_status(
+        self,
+        name: str,
+        status: str,
+        *,
+        last_error: str | None = None,
+    ) -> PluginRecord:
+        if status not in RUNTIME_STATUSES:
+            raise ValueError(f"unsupported runtime status: {status!r}")
+        record = self._require_record(name)
+        updated = record.with_runtime_status(
+            status,
+            updated_at=_now(),
+            last_error=last_error,
+        )
+        self.registry.set(updated)
+        return updated
+
     def runtime_roots(self) -> list[Path]:
         """Return built-ins plus packages enabled in the host registry."""
         roots: list[Path] = []
         if self.builtin_dir.is_dir():
             roots.append(self.builtin_dir)
-        for record in self.registry.all():
-            if not record.installed or not record.enabled:
-                continue
-            path = self._resolve_record_path(record)
+        for record in self.enabled_records():
+            path = self.plugin_path(record.name)
             if not path.is_dir():
                 raise ValueError(f"enabled plugin path does not exist: {path}")
             roots.append(path)
