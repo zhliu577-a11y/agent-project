@@ -6,10 +6,13 @@ from pathlib import Path
 import pytest
 
 from core.hooks import LifecycleHooks
+from plugins import loader as plugin_loader
 from plugins.loader import (
+    KindHandler,
     ModelPlugin,
     NamespacedTool,
     assemble_plugins,
+    discover_contributions,
     discover_plugins,
     load_embedding_plugins,
     load_hook_plugins,
@@ -19,6 +22,7 @@ from plugins.loader import (
     load_session_plugins,
     load_skill_plugins,
     load_tool_plugins,
+    register_kind,
 )
 
 
@@ -757,3 +761,175 @@ def test_embedding_plugin_create_rejects_bad_factory_return(tmp_path) -> None:
     plugin = load_embedding_plugins(tmp_path)[0]
     with pytest.raises(ValueError, match="EmbeddingProvider"):
         plugin.create()
+
+
+def _write_package(root: Path, name: str, manifest: dict, files: dict[str, str]) -> Path:
+    package_dir = root / "packages" / name
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "plugin.json").write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+    for rel, content in files.items():
+        path = package_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return package_dir
+
+
+def test_package_manifest_expands_to_contributions(tmp_path) -> None:
+    _write_package(
+        tmp_path,
+        "quality",
+        {
+            "apiVersion": "1",
+            "name": "quality",
+            "version": "1.2.0",
+            "description": "quality package",
+            "contributes": [
+                {
+                    "id": "lint",
+                    "kind": "skill",
+                    "description": "lint skill",
+                    "entry": {"content": "skills/lint/SKILL.md"},
+                },
+                {
+                    "id": "text-tools",
+                    "kind": "tool",
+                    "entry": {"module": "tool.py", "factory": "create_tools"},
+                },
+            ],
+        },
+        {
+            "skills/lint/SKILL.md": "# lint\n",
+            "tool.py": _TOOL_MODULE,
+        },
+    )
+
+    contributions = discover_contributions(tmp_path)
+    assert [(c.package_name, c.contribution_id, c.kind) for c in contributions] == [
+        ("quality", "lint", "skill"),
+        ("quality", "text-tools", "tool"),
+    ]
+    assert [m.name for m in discover_plugins(tmp_path)] == ["quality--lint", "quality--text-tools"]
+
+    assembly = assemble_plugins(tmp_path)
+    assert [c.contribution_id for c in assembly.contributions] == ["lint", "text-tools"]
+    assert [plugin.manifest.name for plugin in assembly.skills] == ["quality--lint"]
+    assert [manifest.name for manifest, _ in assembly.tools] == ["quality--text-tools"]
+    assert [tool.name for tool in assembly.tools[0][1]] == [
+        "quality--text-tools__echo",
+        "quality--text-tools__count",
+    ]
+
+
+def test_disabled_package_is_validated_but_not_returned(tmp_path) -> None:
+    _write_package(
+        tmp_path,
+        "disabled",
+        {
+            "apiVersion": "1",
+            "name": "disabled",
+            "enabled": False,
+            "contributes": [
+                {
+                    "id": "lint",
+                    "kind": "skill",
+                    "entry": {"content": "SKILL.md"},
+                }
+            ],
+        },
+        {"SKILL.md": "# lint\n"},
+    )
+    assert discover_contributions(tmp_path) == []
+
+
+def test_package_rejects_unknown_contribution_kind_even_when_disabled(tmp_path) -> None:
+    _write_package(
+        tmp_path,
+        "bad-kind",
+        {
+            "apiVersion": "1",
+            "name": "bad-kind",
+            "enabled": False,
+            "contributes": [
+                {
+                    "id": "future",
+                    "kind": "workflow",
+                    "entry": {},
+                }
+            ],
+        },
+        {},
+    )
+    with pytest.raises(ValueError, match="kind"):
+        discover_contributions(tmp_path)
+
+
+def test_package_rejects_duplicate_contribution_id(tmp_path) -> None:
+    _write_package(
+        tmp_path,
+        "duplicate",
+        {
+            "apiVersion": "1",
+            "name": "duplicate",
+            "contributes": [
+                {
+                    "id": "same",
+                    "kind": "skill",
+                    "entry": {"content": "SKILL.md"},
+                },
+                {
+                    "id": "same",
+                    "kind": "skill",
+                    "entry": {"content": "SKILL.md"},
+                },
+            ],
+        },
+        {"SKILL.md": "# lint\n"},
+    )
+    with pytest.raises(ValueError, match="contribution id"):
+        discover_contributions(tmp_path)
+
+
+def test_package_rejects_duplicate_package_name(tmp_path) -> None:
+    manifest = {
+        "apiVersion": "1",
+        "name": "quality",
+        "contributes": [
+            {
+                "id": "lint",
+                "kind": "skill",
+                "entry": {"content": "SKILL.md"},
+            }
+        ],
+    }
+    _write_package(tmp_path, "quality-a", manifest, {"SKILL.md": "# lint\n"})
+    _write_package(tmp_path, "quality-b", manifest, {"SKILL.md": "# lint\n"})
+
+    with pytest.raises(ValueError, match="功能包重名"):
+        discover_contributions(tmp_path)
+
+
+def test_assemble_plugins_uses_kinds_registered_after_import(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(plugin_loader, "_KIND_REGISTRY", dict(plugin_loader._KIND_REGISTRY))
+    monkeypatch.setattr(plugin_loader, "SUPPORTED_KINDS", plugin_loader.SUPPORTED_KINDS)
+    seen: list[tuple[str, str]] = []
+    register_kind(
+        KindHandler(
+            "test-kind",
+            lambda manifest: manifest.name,
+            lambda _assembly, manifest, payload: seen.append((manifest.name, payload)),
+        ),
+        replace=True,
+    )
+    _write_plugin(
+        tmp_path,
+        "custom",
+        "demo",
+        {"name": "demo", "type": "test-kind", "entry": {}},
+    )
+
+    assembly = assemble_plugins(tmp_path)
+
+    assert seen == [("demo", "demo")]
+    assert [(c.kind, c.manifest.name) for c in assembly.contributions] == [("test-kind", "demo")]

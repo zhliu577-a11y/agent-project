@@ -1,6 +1,7 @@
 # plugins/loader.py —— 插件发现与加载（drop-in 插件目录 + kind 注册表）
 #
-# 每个插件是一个自包含的目录，目录内必须有 plugin.json 清单：
+# 每个插件是一个自包含的目录，目录内必须有 plugin.json 清单。
+# 单插件清单使用 type + entry：
 # {
 #   "name": "time",            # 唯一名（字母/数字/下划线/连字符）
 #   "type": "mcp",             # 插件类别：mcp | hook | tool | model | skill
@@ -9,6 +10,21 @@
 #   "enabled": true,           # 可选，默认 true
 #   "entry": { … }             # 类别相关入口
 # }
+#
+# 功能包清单使用 apiVersion + contributes[]，一次声明多个能力：
+# {
+#   "apiVersion": "1",
+#   "name": "quality",
+#   "contributes": [
+#     { "id": "lint", "kind": "skill",
+#       "entry": { "content": "skills/lint/SKILL.md" } },
+#     { "id": "text-tools", "kind": "tool",
+#       "entry": { "module": "tool.py", "factory": "create_tools" } }
+#   ]
+# }
+#
+# 两种清单在发现阶段统一展开为 PluginContribution；装配阶段只按 kind
+# 分派给受信任代码注册的 KindHandler。
 #
 # MCP 插件 entry：
 #   { "command": "python", "args": ["server.py"], "transport": "stdio" }
@@ -38,8 +54,8 @@
 # 可选字段 priority（整数，默认 0）：钩子插件的执行顺序，越小越先执行；
 # 相同 priority 时按插件名排序，保证跨启动稳定。
 #
-# kind 注册表：新增插件类别 = 在 SUPPORTED_KINDS 登记 type，
-# 实现“单个清单加载器”，再在 _KIND_HANDLERS 注册一行，装配入口自动接管。
+# kind 注册表：核心代码显式注册 KindHandler；manifest 只能引用已经注册的
+# kind，不能通过配置新增核心执行阶段。
 import hashlib
 import importlib.util
 import json
@@ -62,16 +78,6 @@ from core.tool import Tool
 logger = logging.getLogger(__name__)
 
 DEFAULT_PLUGINS_DIR = Path(__file__).resolve().parent
-SUPPORTED_KINDS = (
-    "mcp",
-    "hook",
-    "tool",
-    "model",
-    "skill",
-    "session",
-    "memory",
-    "embedding",
-)
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CODE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -99,6 +105,48 @@ class PluginManifest:
     entry: dict[str, Any]
     priority: int = 0
     errors: tuple[DeclaredError, ...] = ()
+    package_name: str | None = None
+    contribution_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PluginContribution:
+    """A normalized capability unit produced by either a package or a single plugin."""
+
+    package_name: str
+    contribution_id: str
+    manifest: PluginManifest
+
+    @property
+    def kind(self) -> str:
+        return self.manifest.type
+
+
+@dataclass(frozen=True)
+class KindHandler:
+    """Trusted load/apply contract for one contribution kind."""
+
+    kind: str
+    load: Callable[[PluginManifest], Any]
+    apply: Callable[["PluginAssembly", PluginManifest, Any], None]
+
+
+_KIND_REGISTRY: dict[str, KindHandler] = {}
+
+
+def register_kind(handler: KindHandler, *, replace: bool = False) -> None:
+    """Register a trusted kind handler during harness startup."""
+    global SUPPORTED_KINDS
+    if not _NAME_RE.fullmatch(handler.kind):
+        raise ValueError(f"invalid kind name: {handler.kind!r}")
+    if handler.kind in _KIND_REGISTRY and not replace:
+        raise ValueError(f"kind already registered: {handler.kind}")
+    _KIND_REGISTRY[handler.kind] = handler
+    SUPPORTED_KINDS = registered_kinds()
+
+
+def registered_kinds() -> tuple[str, ...]:
+    return tuple(_KIND_REGISTRY)
 
 
 @dataclass(frozen=True)
@@ -341,6 +389,136 @@ def _parse_declared_errors(raw: dict[str, Any], where: str) -> tuple[DeclaredErr
     return tuple(declared)
 
 
+def _read_manifest(path: Path) -> dict[str, Any]:
+    where = f"{path}"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{where}: invalid JSON manifest: {exc}") from exc
+    _expect(isinstance(raw, dict), where, "manifest root must be a JSON object")
+    return raw
+
+
+def _merge_declared_errors(
+    defaults: tuple[DeclaredError, ...],
+    extra: tuple[DeclaredError, ...],
+    where: str,
+) -> tuple[DeclaredError, ...]:
+    merged = list(defaults)
+    seen = {error.code for error in defaults}
+    for error in extra:
+        _expect(error.code not in seen, where, f"duplicate error code: {error.code}")
+        merged.append(error)
+        seen.add(error.code)
+    return tuple(merged)
+
+
+def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[PluginManifest]:
+    """Expand a package manifest into one normalized manifest per contribution."""
+    where = f"{path}"
+    _expect(raw.get("apiVersion") == "1", where, "'apiVersion' must be '1'")
+    _expect("type" not in raw, where, "manifest cannot contain both 'type' and 'contributes'")
+
+    package_name = raw.get("name")
+    _expect(
+        isinstance(package_name, str) and _NAME_RE.fullmatch(package_name),
+        where,
+        "missing valid 'name'",
+    )
+
+    version = raw.get("version", "")
+    _expect(isinstance(version, str), where, "'version' must be a string")
+
+    description = raw.get("description", "")
+    _expect(isinstance(description, str), where, "'description' must be a string")
+
+    package_enabled = raw.get("enabled", True)
+    _expect(isinstance(package_enabled, bool), where, "'enabled' must be bool")
+
+    default_priority = raw.get("priority", 0)
+    _expect(
+        isinstance(default_priority, int) and not isinstance(default_priority, bool),
+        where,
+        "'priority' must be an integer",
+    )
+
+    package_errors = _parse_declared_errors(raw, where)
+    items = raw.get("contributes")
+    _expect(
+        isinstance(items, list) and bool(items),
+        where,
+        "'contributes' must be a non-empty array",
+    )
+
+    contributions: list[PluginManifest] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(items, start=1):
+        item_where = f"{where} contributes[{index}]"
+        _expect(isinstance(item, dict), item_where, "contribution must be an object")
+
+        contribution_id = item.get("id")
+        _expect(
+            isinstance(contribution_id, str) and _NAME_RE.fullmatch(contribution_id),
+            item_where,
+            "missing valid 'id'",
+        )
+        _expect(
+            contribution_id not in seen_ids,
+            item_where,
+            f"duplicate contribution id: {contribution_id}",
+        )
+
+        kind = item.get("kind")
+        _expect(
+            isinstance(kind, str) and kind in _KIND_REGISTRY,
+            item_where,
+            f"invalid 'kind' {kind!r}; supported: {', '.join(registered_kinds())}",
+        )
+
+        entry = item.get("entry")
+        _expect(isinstance(entry, dict), item_where, "missing 'entry' object")
+
+        item_version = item.get("version", version)
+        _expect(isinstance(item_version, str), item_where, "'version' must be a string")
+
+        item_description = item.get("description", description)
+        _expect(
+            isinstance(item_description, str),
+            item_where,
+            "'description' must be a string",
+        )
+
+        item_enabled = item.get("enabled", True)
+        _expect(isinstance(item_enabled, bool), item_where, "'enabled' must be bool")
+
+        item_priority = item.get("priority", default_priority)
+        _expect(
+            isinstance(item_priority, int) and not isinstance(item_priority, bool),
+            item_where,
+            "'priority' must be an integer",
+        )
+
+        item_errors = _parse_declared_errors(item, item_where)
+        errors = _merge_declared_errors(package_errors, item_errors, item_where)
+        contributions.append(
+            PluginManifest(
+                name=f"{package_name}--{contribution_id}",
+                type=kind,
+                version=item_version,
+                description=item_description,
+                enabled=package_enabled and item_enabled,
+                directory=path.parent,
+                entry=entry,
+                priority=item_priority,
+                errors=errors,
+                package_name=package_name,
+                contribution_id=contribution_id,
+            )
+        )
+        seen_ids.add(contribution_id)
+    return contributions
+
+
 def _iter_manifest_paths(root: Path):
     """递归寻找 plugin.json；找到的插件目录不再向下钻取（插件自身即叶子）。"""
     stack = [root]
@@ -358,30 +536,60 @@ def _iter_manifest_paths(root: Path):
                 stack.append(child)
 
 
-def discover_plugins(root: str | Path | None = None) -> list[PluginManifest]:
-    """扫描插件目录，返回 enabled 的插件清单（零副作用：不导入、不连接）。
+def discover_contributions(root: str | Path | None = None) -> list[PluginContribution]:
+    """扫描插件目录，把单插件和功能包统一展开为 enabled contribution。
 
-    结构仍会校验：即便 disabled，写错的清单也会抛 ValueError，绝不静默出错。
+    discovery 只读磁盘，不导入代码、不连接服务。结构仍会校验：即便
+    disabled，写错的清单也会抛 ValueError，绝不静默出错。
     """
     root = Path(root) if root is not None else DEFAULT_PLUGINS_DIR
     if not root.exists():
         logger.warning("插件目录不存在，跳过: %s", root)
         return []
 
-    manifests: list[PluginManifest] = []
+    contributions: list[PluginContribution] = []
+    package_directories: dict[str, Path] = {}
     for manifest_path in _iter_manifest_paths(root):
-        manifest = _parse_manifest(manifest_path)
-        if manifest.enabled:
-            manifests.append(manifest)
+        raw = _read_manifest(manifest_path)
+        manifests = (
+            _parse_package_contributions(manifest_path, raw)
+            if "contributes" in raw
+            else [_parse_manifest(manifest_path)]
+        )
+        for manifest in manifests:
+            if manifest.package_name is not None:
+                previous = package_directories.get(manifest.package_name)
+                if previous is not None and previous != manifest.directory:
+                    raise ValueError(
+                        f"功能包重名（{manifest.package_name}）: {previous} / {manifest.directory}"
+                    )
+                package_directories[manifest.package_name] = manifest.directory
+            if manifest.enabled:
+                contributions.append(
+                    PluginContribution(
+                        package_name=manifest.package_name or manifest.name,
+                        contribution_id=manifest.contribution_id or "default",
+                        manifest=manifest,
+                    )
+                )
 
     seen: set[tuple[str, str]] = set()
-    for manifest in manifests:
-        key = (manifest.type, manifest.name)
+    for contribution in contributions:
+        key = (contribution.kind, contribution.manifest.name)
         if key in seen:
+            manifest = contribution.manifest
             raise ValueError(f"插件重名（{manifest.type}/{manifest.name}）: {manifest.directory}")
         seen.add(key)
 
-    return sorted(manifests, key=lambda m: (m.type, m.name))
+    return sorted(
+        contributions,
+        key=lambda c: (c.kind, c.manifest.name, c.package_name, c.contribution_id),
+    )
+
+
+def discover_plugins(root: str | Path | None = None) -> list[PluginManifest]:
+    """Backward-compatible projection: return normalized contribution manifests."""
+    return [contribution.manifest for contribution in discover_contributions(root)]
 
 
 def _import_module(manifest: PluginManifest, module_path: Path):
@@ -656,64 +864,72 @@ class PluginAssembly:
     sessions: list[SessionPlugin] = field(default_factory=list)
     memories: list[MemoryPlugin] = field(default_factory=list)
     embeddings: list[EmbeddingPlugin] = field(default_factory=list)
+    contributions: list[PluginContribution] = field(default_factory=list)
 
 
-def _add_hook(manifest: PluginManifest, assembly: PluginAssembly) -> None:
-    assembly.hooks.append((manifest, load_hook_plugin(manifest)))
+def _apply_hook(assembly: PluginAssembly, manifest: PluginManifest, hook: LifecycleHooks) -> None:
+    assembly.hooks.append((manifest, hook))
 
 
-def _add_mcp(manifest: PluginManifest, assembly: PluginAssembly) -> None:
-    assembly.mcp.append(load_mcp_plugin(manifest))
+def _apply_mcp(assembly: PluginAssembly, manifest: PluginManifest, spec: McpPluginSpec) -> None:
+    assembly.mcp.append(spec)
 
 
-def _add_tool(manifest: PluginManifest, assembly: PluginAssembly) -> None:
-    assembly.tools.append((manifest, load_tool_plugin(manifest)))
+def _apply_tool(assembly: PluginAssembly, manifest: PluginManifest, tools: list[Tool]) -> None:
+    assembly.tools.append((manifest, tools))
 
 
-def _add_model(manifest: PluginManifest, assembly: PluginAssembly) -> None:
-    assembly.models.append(load_model_plugin(manifest))
+def _apply_model(assembly: PluginAssembly, manifest: PluginManifest, plugin: ModelPlugin) -> None:
+    assembly.models.append(plugin)
 
 
-def _add_skill(manifest: PluginManifest, assembly: PluginAssembly) -> None:
-    assembly.skills.append(load_skill_plugin(manifest))
+def _apply_skill(assembly: PluginAssembly, manifest: PluginManifest, plugin: SkillPlugin) -> None:
+    assembly.skills.append(plugin)
 
 
-def _add_session(manifest: PluginManifest, assembly: PluginAssembly) -> None:
-    assembly.sessions.append(load_session_plugin(manifest))
+def _apply_session(
+    assembly: PluginAssembly, manifest: PluginManifest, plugin: SessionPlugin
+) -> None:
+    assembly.sessions.append(plugin)
 
 
-def _add_memory(manifest: PluginManifest, assembly: PluginAssembly) -> None:
-    assembly.memories.append(load_memory_plugin(manifest))
+def _apply_memory(assembly: PluginAssembly, manifest: PluginManifest, plugin: MemoryPlugin) -> None:
+    assembly.memories.append(plugin)
 
 
-def _add_embedding(manifest: PluginManifest, assembly: PluginAssembly) -> None:
-    assembly.embeddings.append(load_embedding_plugin(manifest))
+def _apply_embedding(
+    assembly: PluginAssembly, manifest: PluginManifest, plugin: EmbeddingPlugin
+) -> None:
+    assembly.embeddings.append(plugin)
 
 
-# kind 注册表：新增插件类别 = SUPPORTED_KINDS 登记 type + 这里注册一个处理器，
-# 处理器把单个清单的产物放进 PluginAssembly 的对应字段。
-_KIND_HANDLERS: dict[str, Callable[[PluginManifest, PluginAssembly], None]] = {
-    "hook": _add_hook,
-    "mcp": _add_mcp,
-    "tool": _add_tool,
-    "model": _add_model,
-    "skill": _add_skill,
-    "session": _add_session,
-    "memory": _add_memory,
-    "embedding": _add_embedding,
-}
+# kind 注册表：受信任的核心代码在这里声明每类 contribution 的
+# load/apply 契约。普通插件清单只能引用已注册的 kind。
+register_kind(KindHandler("hook", load_hook_plugin, _apply_hook))
+register_kind(KindHandler("mcp", load_mcp_plugin, _apply_mcp))
+register_kind(KindHandler("tool", load_tool_plugin, _apply_tool))
+register_kind(KindHandler("model", load_model_plugin, _apply_model))
+register_kind(KindHandler("skill", load_skill_plugin, _apply_skill))
+register_kind(KindHandler("session", load_session_plugin, _apply_session))
+register_kind(KindHandler("memory", load_memory_plugin, _apply_memory))
+register_kind(KindHandler("embedding", load_embedding_plugin, _apply_embedding))
+
+SUPPORTED_KINDS = registered_kinds()
 
 
 def assemble_plugins(root: str | Path | None = None) -> PluginAssembly:
-    """扫描目录并把全部 enabled 插件按 kind 装配成 PluginAssembly。
+    """扫描目录并把全部 enabled contribution 按 kind 装配成 PluginAssembly。
 
     这是 Harness 启动器的统一装配入口；main.py 不感知具体插件类别。
     """
     assembly = PluginAssembly()
-    for manifest in discover_plugins(root):
-        handler = _KIND_HANDLERS.get(manifest.type)
+    for contribution in discover_contributions(root):
+        manifest = contribution.manifest
+        handler = _KIND_REGISTRY.get(contribution.kind)
         if handler is None:  # discover 已校验，这里是防御性兜底
-            raise ValueError(f"插件类别 {manifest.type} 尚未注册加载器（{manifest.name}）")
-        handler(manifest, assembly)
+            raise ValueError(f"插件类别 {contribution.kind} 尚未注册加载器（{manifest.name}）")
+        payload = handler.load(manifest)
+        handler.apply(assembly, manifest, payload)
+        assembly.contributions.append(contribution)
     assembly.hooks.sort(key=lambda pair: (pair[0].priority, pair[0].name))
     return assembly

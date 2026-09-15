@@ -13,7 +13,10 @@
 
 - 固定异步 agent loop（调模型 → 执行工具 → 回填 → 判断结束），支持流式输出与多个工具的并行执行
 - **插件目录（drop-in）**：`plugins/` 下每个插件是一个自包含目录 + `plugin.json`，
-  拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model`、`skill` 五类
+  拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model`、`skill`、
+  `session`、`memory`、`embedding` 八类
+- **功能包**：一个包可用 `contributes[]` 同时提供 skill、hook、tool 等能力，
+  发现阶段统一展开为 contribution 后按受控 kind 注册表装配
 - **MCP 网关**：Agent 只面向网关这一个通道；网关统一维护各 MCP 插件的连接、
   会话、命名与清理，工具名带命名空间（`<插件名>__<工具名>`）
 - **钩子网关**：生命周期钩子全部插件化（`turn_start / llm_response /
@@ -149,6 +152,38 @@ plugins/
 结构仍会校验但不会加载。可选字段 `priority`（整数，默认 `0`）决定钩子插件的
 执行顺序：**越小越先执行**；可选字段 `errors` 声明插件已知的领域错误
 （见下文“错误分类与重试”）。字段写错启动即报错。
+
+### 功能包（`contributes[]`）
+
+需要把多个能力一起发布、启停和版本化时，可以让一个目录提供功能包清单：
+
+```json
+{
+  "apiVersion": "1",
+  "name": "code-quality",
+  "version": "1.0.0",
+  "contributes": [
+    {
+      "id": "lint",
+      "kind": "skill",
+      "entry": { "content": "skills/lint/SKILL.md" }
+    },
+    {
+      "id": "format-hook",
+      "kind": "hook",
+      "entry": { "module": "hooks/hook.py", "factory": "create_hook" }
+    }
+  ]
+}
+```
+
+包内路径统一相对包根目录解析；`enabled`、`priority`、`errors` 可在包级设置，
+并在 contribution 级覆盖或追加。每个 contribution 会展开为
+`<包名>--<contribution-id>`，例如 `code-quality--lint`。`kind` 必须来自
+受信任核心代码注册的 kind；插件清单不能自行注册新的执行阶段。
+
+`GET /plugins` 会同时返回 `packages`、展开后的 `contributions`，以及按 kind
+归类的 `kinds` 视图。
 
 ### MCP 插件（`type: "mcp"`）
 

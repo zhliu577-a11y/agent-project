@@ -38,7 +38,7 @@ from gateways.memory_gateway import (
 from gateways.session_gateway import SessionGateway
 from gateways.skill_gateway import SkillGateway, UseSkill
 from loop import run_agent
-from plugins.loader import PluginAssembly, assemble_plugins
+from plugins.loader import PluginAssembly, assemble_plugins, registered_kinds
 
 logger = logging.getLogger("api")
 
@@ -338,17 +338,22 @@ async def memory_delete(note_id: str) -> dict[str, Any]:
 @app.get("/plugins")
 async def plugin_overview() -> dict[str, Any]:
     assembly = app.state.runtime.assembly
+    packages = sorted({contribution.package_name for contribution in assembly.contributions})
+    kinds: dict[str, list[str]] = {kind: [] for kind in registered_kinds()}
+    for contribution in assembly.contributions:
+        kinds.setdefault(contribution.kind, []).append(contribution.manifest.name)
     return {
-        "kinds": {
-            "hook": [m.name for m, _ in assembly.hooks],
-            "mcp": [s.manifest.name for s in assembly.mcp],
-            "tool": [m.name for m, _ in assembly.tools],
-            "model": [p.manifest.name for p in assembly.models],
-            "skill": [s.manifest.name for s in assembly.skills],
-            "session": [p.manifest.name for p in assembly.sessions],
-            "memory": [p.manifest.name for p in assembly.memories],
-            "embedding": [p.manifest.name for p in assembly.embeddings],
-        },
+        "packages": packages,
+        "contributions": [
+            {
+                "package": contribution.package_name,
+                "id": contribution.contribution_id,
+                "kind": contribution.kind,
+                "name": contribution.manifest.name,
+            }
+            for contribution in assembly.contributions
+        ],
+        "kinds": kinds,
         "local_tools": app.state.runtime.local_tool_names,
     }
 

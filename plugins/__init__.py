@@ -5,21 +5,24 @@
 #     mcp/<name>/    MCP 工具插件（plugin.json + 服务器代码/配置）
 #     hooks/<name>/  生命周期钩子插件（plugin.json + Python 实现）
 #
-# 后续新增插件类别（skill / session / …）时，在 plugins/loader.py 的
-# SUPPORTED_KINDS 中登记即可，内核与网关边界不变。
+# 单插件和功能包都会展开为 contribution。新增插件 kind 时，由受信任的
+# 核心代码调用 register_kind()，插件清单不能自行注册执行阶段。
 from plugins.loader import (
     DEFAULT_PLUGINS_DIR,
     DeclaredError,
     EmbeddingPlugin,
+    KindHandler,
     McpPluginSpec,
     MemoryPlugin,
     ModelPlugin,
     NamespacedTool,
     PluginAssembly,
+    PluginContribution,
     PluginManifest,
     SessionPlugin,
     SkillPlugin,
     assemble_plugins,
+    discover_contributions,
     discover_plugins,
     load_embedding_plugin,
     load_embedding_plugins,
@@ -36,21 +39,27 @@ from plugins.loader import (
     load_skill_plugins,
     load_tool_plugin,
     load_tool_plugins,
+    register_kind,
+    registered_kinds,
 )
 
 __all__ = [
     "DEFAULT_PLUGINS_DIR",
+    "SUPPORTED_KINDS",
     "DeclaredError",
     "EmbeddingPlugin",
+    "KindHandler",
     "McpPluginSpec",
     "MemoryPlugin",
     "ModelPlugin",
     "NamespacedTool",
     "PluginAssembly",
+    "PluginContribution",
     "PluginManifest",
     "SessionPlugin",
     "SkillPlugin",
     "assemble_plugins",
+    "discover_contributions",
     "discover_plugins",
     "load_embedding_plugin",
     "load_embedding_plugins",
@@ -67,4 +76,12 @@ __all__ = [
     "load_skill_plugins",
     "load_tool_plugin",
     "load_tool_plugins",
+    "register_kind",
+    "registered_kinds",
 ]
+
+
+def __getattr__(name: str):
+    if name == "SUPPORTED_KINDS":
+        return registered_kinds()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
