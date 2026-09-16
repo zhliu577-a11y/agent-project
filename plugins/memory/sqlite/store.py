@@ -12,14 +12,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from core.memory import MemoryNote, MemoryStore
+from core.memory import MemoryNote, MemoryStore, note_from_dict, note_to_dict
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_notes (
     id         TEXT PRIMARY KEY,
     content    TEXT NOT NULL,
     tags       TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    record     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory_notes (created_at);
 """
@@ -38,10 +39,15 @@ class SqliteMemoryStore(MemoryStore):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(_SCHEMA)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_notes)")}
+        if "record" not in columns:
+            conn.execute("ALTER TABLE memory_notes ADD COLUMN record TEXT")
         return conn
 
     @staticmethod
     def _row_to_note(row: sqlite3.Row) -> MemoryNote:
+        if "record" in row.keys() and row["record"]:
+            return note_from_dict(json.loads(row["record"]))
         return MemoryNote(
             id=row["id"],
             content=row["content"],
@@ -57,7 +63,8 @@ class SqliteMemoryStore(MemoryStore):
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, content, tags, created_at FROM memory_notes ORDER BY created_at, id"
+                "SELECT id, content, tags, created_at, record"
+                " FROM memory_notes ORDER BY created_at, id"
             ).fetchall()
             return [self._row_to_note(row) for row in rows]
         finally:
@@ -74,12 +81,14 @@ class SqliteMemoryStore(MemoryStore):
         try:
             with conn:
                 conn.execute(
-                    "INSERT INTO memory_notes (id, content, tags, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO memory_notes (id, content, tags, created_at, record)"
+                    " VALUES (?, ?, ?, ?, ?)",
                     (
                         note.id,
                         note.content,
                         json.dumps(note.tags, ensure_ascii=False),
                         note.created_at,
+                        json.dumps(note_to_dict(note), ensure_ascii=False),
                     ),
                 )
             return note
@@ -121,10 +130,39 @@ class SqliteMemoryStore(MemoryStore):
             if cursor.rowcount == 0:
                 return None
             row = conn.execute(
-                "SELECT id, content, tags, created_at FROM memory_notes WHERE id = ?",
+                "SELECT id, content, tags, created_at, record FROM memory_notes WHERE id = ?",
                 (note_id,),
             ).fetchone()
-            return self._row_to_note(row) if row is not None else None
+            if row is None:
+                return None
+            note = self._row_to_note(row)
+            if content is not None:
+                note.content = content
+            if tags is not None:
+                note.tags = list(tags)
+            conn.execute(
+                "UPDATE memory_notes SET record = ? WHERE id = ?",
+                (json.dumps(note_to_dict(note), ensure_ascii=False), note_id),
+            )
+            return note
+        finally:
+            conn.close()
+
+    async def save_record(self, record: MemoryNote) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE memory_notes SET content = ?, tags = ?, created_at = ?, record = ?"
+                    " WHERE id = ?",
+                    (
+                        record.content,
+                        json.dumps(record.tags, ensure_ascii=False),
+                        record.created_at,
+                        json.dumps(note_to_dict(record), ensure_ascii=False),
+                        record.id,
+                    ),
+                )
         finally:
             conn.close()
 
@@ -133,12 +171,13 @@ class SqliteMemoryStore(MemoryStore):
         try:
             if not query:
                 rows = conn.execute(
-                    "SELECT id, content, tags, created_at FROM memory_notes ORDER BY created_at, id"
+                    "SELECT id, content, tags, created_at, record"
+                    " FROM memory_notes ORDER BY created_at, id"
                 ).fetchall()
             else:
                 pattern = f"%{self._escape_like(query)}%"
                 rows = conn.execute(
-                    "SELECT id, content, tags, created_at FROM memory_notes"
+                    "SELECT id, content, tags, created_at, record FROM memory_notes"
                     " WHERE content LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\'"
                     " ORDER BY created_at, id",
                     (pattern, pattern),

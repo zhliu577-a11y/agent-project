@@ -53,8 +53,13 @@ PLUGIN_KINDS: dict[str, KindLoader] = {
 | `tool` | 进程内轻量工具 | ToolRegistry（启动即注册） | 已落地（M1） |
 | `model` | LLM 适配器 | 当前激活的模型实例（AGENT_MODEL 选定） | 已落地（M2） |
 | `context` | 模型请求上下文策略 | 每次模型调用前的消息视图（CONTEXT_STRATEGY 选定） | 已落地 |
+| `compaction` | 持久化短期记忆压缩 | 在 Session 提交前生成替换历史（SESSION_COMPACTION 选定） | 已落地 |
 | `skill` | 按需注入的操作指令 | SkillGateway + use_skill（渐进披露） | 已落地（M3） |
 | `session` | 会话持久化/恢复 | SessionGateway + SessionStore | 已落地（M4a） |
+| `memory` | 跨会话语义事实 | MemoryGateway + MemoryStore | 已落地 |
+| `memory-index` | 派生记忆候选索引 | MemoryGateway 召回候选 | 已落地 |
+| `memory-policy` | 记忆写入准入与召回排序 | MemoryGateway 写入/召回策略 | 已落地 |
+| `embedding` | 向量嵌入提供方 | 向量 memory store 依赖注入 | 已落地 |
 
 约定：
 

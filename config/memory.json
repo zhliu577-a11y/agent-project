@@ -1,3 +1,5 @@
 {
-  "store": "sqlite"
+  "store": "sqlite",
+  "index": "lexical",
+  "policy": "default"
 }

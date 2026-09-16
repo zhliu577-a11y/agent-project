@@ -1,0 +1,14 @@
+{
+  "apiVersion": "1",
+  "name": "recent",
+  "type": "memory-index",
+  "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "memory-index.v1",
+  "description": "Recency-first derived-memory index.",
+  "enabled": true,
+  "entry": {
+    "module": "index.py",
+    "factory": "create_index"
+  }
+}

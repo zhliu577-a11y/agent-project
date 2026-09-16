@@ -56,7 +56,10 @@ class AppConfig:
     model_router: str | None = None
     session_store: str = "jsonl"
     session_id: str = "default"
+    session_compaction: str | None = None
     memory_store: str = "sqlite"
+    memory_index: str | None = None
+    memory_policy: str | None = None
     embedding_provider: str = "debug"
     context_max_tokens: int = 20000
     context_strategy: str = "tail-window"
@@ -128,8 +131,23 @@ class AppConfig:
             session_id=os.getenv(
                 "SESSION_ID", _expect_str(session.get("id", "default"), "session.id")
             ),
+            session_compaction=_load_optional_name(
+                session.get("compaction"),
+                os.getenv("SESSION_COMPACTION"),
+                "session.compaction",
+            ),
             memory_store=os.getenv(
                 "MEMORY_STORE", _expect_str(memory.get("store", "sqlite"), "memory.store")
+            ),
+            memory_index=_load_optional_name(
+                memory.get("index"),
+                os.getenv("MEMORY_INDEX"),
+                "memory.index",
+            ),
+            memory_policy=_load_optional_name(
+                memory.get("policy"),
+                os.getenv("MEMORY_POLICY"),
+                "memory.policy",
             ),
             embedding_provider=os.getenv(
                 "EMBEDDING_PROVIDER",

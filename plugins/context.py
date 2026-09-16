@@ -5,6 +5,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from plugins.services import PluginRequirement, RuntimeServices
+
 
 @dataclass(frozen=True)
 class PluginContext:
@@ -12,7 +14,8 @@ class PluginContext:
 
     Plugins still receive their own directory for backward compatibility. New
     plugins may also declare a ``context`` keyword argument to receive this
-    object and read centrally managed configuration.
+    object, read centrally managed configuration, and resolve declared runtime
+    services.
     """
 
     name: str
@@ -23,6 +26,8 @@ class PluginContext:
     contribution_id: str | None = None
     protocol_version: int = 1
     contract: str = ""
+    requires: tuple[PluginRequirement, ...] = ()
+    services: RuntimeServices | None = None
 
     @classmethod
     def create(
@@ -36,6 +41,8 @@ class PluginContext:
         contribution_id: str | None = None,
         protocol_version: int = 1,
         contract: str = "",
+        requires: tuple[PluginRequirement, ...] = (),
+        services: RuntimeServices | None = None,
     ) -> "PluginContext":
         return cls(
             name=name,
@@ -46,4 +53,6 @@ class PluginContext:
             contribution_id=contribution_id,
             protocol_version=protocol_version,
             contract=contract,
+            requires=requires,
+            services=services,
         )

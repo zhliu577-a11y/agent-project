@@ -72,6 +72,16 @@ class JsonlMemoryStore(MemoryStore):
         await self._write_all(notes)
         return target
 
+    async def save_record(self, record: MemoryNote) -> None:
+        notes = await self._read_all()
+        for index, note in enumerate(notes):
+            if note.id == record.id:
+                notes[index] = record
+                break
+        else:
+            notes.append(record)
+        await self._write_all(notes)
+
     async def search_notes(self, query: str) -> list[MemoryNote]:
         lowered = query.lower()
         return [

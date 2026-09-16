@@ -1,22 +1,70 @@
-# gateways/memory_gateway.py —— 长期记忆网关：语义笔记的读写入口
-#
-# 持有激活的 MemoryStore 插件；模型通过 remember / recall / forget
-# 三个内核工具访问，工具同样过权限/审计钩子。
+"""Semantic-memory transaction boundary."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
 from typing import Any
 
 from core.errors import ToolError, boundary
 from core.events import Event, EventPublisher
-from core.memory import MemoryNote, MemoryStore
+from core.memory import (
+    MemoryIndex,
+    MemoryNote,
+    MemoryPolicy,
+    MemoryQuery,
+    MemoryStore,
+    record_to_dict,
+)
 from core.tool import Tool
 from core.tracing import current_trace_id
 
 
 class MemoryGateway:
-    """长期记忆网关：跨会话语义笔记的增删查。"""
+    """Coordinate durable records, derived indexes, and recall policy."""
 
-    def __init__(self, store: MemoryStore, events: EventPublisher | None = None) -> None:
+    def __init__(
+        self,
+        store: MemoryStore,
+        events: EventPublisher | None = None,
+        *,
+        index: MemoryIndex | None = None,
+        policy: MemoryPolicy | None = None,
+        default_scope: str = "user",
+        default_owner_id: str = "",
+        allowed_scopes: set[str] | frozenset[str] | None = None,
+        allowed_owner_ids: set[str] | frozenset[str] | None = None,
+    ) -> None:
+        if not default_scope:
+            raise ValueError("default_scope must not be empty")
         self._store = store
+        self._index = index
+        self._policy = policy
         self._events = events
+        self._default_scope = default_scope
+        self._default_owner_id = default_owner_id
+        self._allowed_scopes = frozenset(allowed_scopes) if allowed_scopes is not None else None
+        self._allowed_owner_ids = (
+            frozenset(allowed_owner_ids) if allowed_owner_ids is not None else None
+        )
+
+    def _authorize(self, scope: str, owner_id: str) -> None:
+        if self._allowed_scopes is not None and scope not in self._allowed_scopes:
+            raise PermissionError(f"memory scope is not allowed: {scope}")
+        if (
+            self._allowed_owner_ids is not None
+            and owner_id
+            and owner_id not in self._allowed_owner_ids
+        ):
+            raise PermissionError(f"memory owner is not allowed: {owner_id}")
+
+    async def _authorize_record(self, note_id: str) -> None:
+        record = next(
+            (item for item in await self._store.list_notes() if item.id == note_id),
+            None,
+        )
+        if record is None:
+            return
+        self._authorize(record.scope, record.owner_id)
 
     async def _emit(self, name: str, **payload: object) -> None:
         if self._events is None:
@@ -26,18 +74,115 @@ class MemoryGateway:
         )
 
     @boundary("写入长期记忆失败", fallback=ToolError)
-    async def remember(self, content: str, tags: list[str] | None = None) -> MemoryNote:
+    async def remember(
+        self,
+        content: str,
+        tags: list[str] | None = None,
+        *,
+        kind: str = "fact",
+        scope: str | None = None,
+        owner_id: str | None = None,
+        source: str = "explicit",
+        confidence: float = 1.0,
+        importance: float = 0.5,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> MemoryNote:
+        requested_scope = scope or self._default_scope
+        requested_owner_id = self._default_owner_id if owner_id is None else owner_id
+        self._authorize(requested_scope, requested_owner_id)
+
         note = await self._store.add_note(content, tags or [])
-        await self._emit("memory.write", note_id=note.id, tags=note.tags)
+        note.kind = kind
+        note.scope = requested_scope
+        note.owner_id = requested_owner_id
+        note.source = source
+        note.confidence = confidence
+        note.importance = importance
+        note.metadata = dict(metadata or {})
+        note.updated_at = note.created_at
+
+        if self._policy is not None:
+            candidate = self._policy.prepare_write(note)
+            if candidate is None:
+                await self._store.delete_note(note.id)
+                return note
+            note = candidate
+            try:
+                self._authorize(note.scope, note.owner_id)
+            except Exception:
+                await self._store.delete_note(note.id)
+                raise
+
+        try:
+            await self._store.save_record(note)
+            if self._index is not None:
+                await self._index.add(note)
+        except Exception:
+            await self._store.delete_note(note.id)
+            if self._index is not None:
+                await self._index.remove(note.id)
+            raise
+        await self._emit("memory.write", note_id=note.id, tags=note.tags, scope=note.scope)
         return note
 
     @boundary("检索长期记忆失败", fallback=ToolError)
-    async def recall(self, query: str = "") -> list[MemoryNote]:
-        return await self._store.search_notes(query)
+    async def recall(
+        self,
+        query: str = "",
+        *,
+        scope: str | None = None,
+        owner_id: str | None = None,
+        kinds: tuple[str, ...] = (),
+        limit: int = 20,
+    ) -> list[MemoryNote]:
+        request = MemoryQuery(
+            text=query,
+            scope=scope or self._default_scope,
+            owner_id=self._default_owner_id if owner_id is None else owner_id,
+            kinds=kinds,
+            limit=limit,
+        )
+        self._authorize(request.scope or "", request.owner_id or "")
+        if self._index is not None:
+            candidates = await self._index.search(request)
+        else:
+            candidates = await self._store.search_notes(query)
+        candidates = [
+            record
+            for record in candidates
+            if (request.scope is None or record.scope == request.scope)
+            and (request.owner_id is None or record.owner_id == request.owner_id)
+            and (not request.kinds or record.kind in request.kinds)
+        ]
+        if self._policy is not None:
+            candidates = self._policy.rank(request, list(candidates))
+
+        for record in candidates:
+            record.last_accessed_at = record.last_accessed_at or record.created_at
+        return candidates[:limit]
+
+    async def context_records(
+        self,
+        query: str,
+        *,
+        scope: str | None = None,
+        owner_id: str | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        records = await self.recall(
+            query,
+            scope=scope,
+            owner_id=owner_id,
+            limit=limit,
+        )
+        return [record_to_dict(record) for record in records]
 
     @boundary("删除长期记忆失败", fallback=ToolError)
     async def forget(self, note_id: str) -> bool:
+        await self._authorize_record(note_id)
         removed = await self._store.delete_note(note_id)
+        if removed and self._index is not None:
+            await self._index.remove(note_id)
         if removed:
             await self._emit("memory.delete", note_id=note_id)
         return removed
@@ -49,7 +194,10 @@ class MemoryGateway:
         content: str | None = None,
         tags: list[str] | None = None,
     ) -> MemoryNote | None:
+        await self._authorize_record(note_id)
         note = await self._store.update_note(note_id, content, tags)
+        if note is not None and self._index is not None:
+            await self._index.add(note)
         if note is not None:
             await self._emit("memory.update", note_id=note.id, tags=note.tags)
         return note
@@ -59,15 +207,15 @@ def _tags_schema() -> dict[str, Any]:
     return {
         "type": "array",
         "items": {"type": "string"},
-        "description": "标签，便于后续按主题检索",
+        "description": "Tags used for later recall.",
     }
 
 
 class RememberTool(Tool):
     name = "remember"
     description = (
-        "把值得跨会话长期记住的事实、偏好或结论写入长期记忆；"
-        "适合用户偏好、项目约定、重要结论，不要记临时过程。"
+        "Store a durable fact, preference, decision, or constraint for later sessions. "
+        "Do not store temporary turn state."
     )
 
     def __init__(self, gateway: MemoryGateway) -> None:
@@ -78,23 +226,28 @@ class RememberTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "要记住的内容"},
+                "content": {"type": "string", "description": "Content to remember."},
                 "tags": _tags_schema(),
+                "kind": {
+                    "type": "string",
+                    "enum": ["fact", "preference", "decision", "constraint", "observation"],
+                },
             },
             "required": ["content"],
         }
 
     async def execute(self, **kwargs: Any) -> str:
-        note = await self._gateway.remember(kwargs["content"], kwargs.get("tags"))
+        note = await self._gateway.remember(
+            kwargs["content"],
+            kwargs.get("tags"),
+            kind=kwargs.get("kind", "fact"),
+        )
         return f"已记住 [{note.id}]: {note.content}"
 
 
 class RecallTool(Tool):
     name = "recall"
-    description = (
-        "从长期记忆里搜索相关内容（匹配正文或标签，不区分大小写）；"
-        "不传 query 返回全部笔记。返回条目带 id，可用于 forget。"
-    )
+    description = "Search durable memory by content or tags."
 
     def __init__(self, gateway: MemoryGateway) -> None:
         self._gateway = gateway
@@ -103,7 +256,9 @@ class RecallTool(Tool):
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
-            "properties": {"query": {"type": "string", "description": "搜索关键词，可省略"}},
+            "properties": {
+                "query": {"type": "string", "description": "Search text; empty means all."},
+            },
         }
 
     async def execute(self, **kwargs: Any) -> str:
@@ -112,14 +267,14 @@ class RecallTool(Tool):
             return "（长期记忆里没有匹配的笔记）"
         return "\n".join(
             f"- [{note.id}] {note.content}"
-            + (f"  [tags: {'、'.join(note.tags)}]" if note.tags else "")
+            + (f"  [tags: {', '.join(note.tags)}]" if note.tags else "")
             for note in notes
         )
 
 
 class ForgetTool(Tool):
     name = "forget"
-    description = "按 recall 返回的笔记 id 删除一条长期记忆。"
+    description = "Delete one durable memory record by id."
 
     def __init__(self, gateway: MemoryGateway) -> None:
         self._gateway = gateway
@@ -128,7 +283,7 @@ class ForgetTool(Tool):
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
-            "properties": {"note_id": {"type": "string", "description": "要删除的笔记 id"}},
+            "properties": {"note_id": {"type": "string", "description": "Record id."}},
             "required": ["note_id"],
         }
 
@@ -139,10 +294,7 @@ class ForgetTool(Tool):
 
 class UpdateNoteTool(Tool):
     name = "update_note"
-    description = (
-        "更新一条已有记忆笔记的正文或标签（note_id 来自 recall 输出）；"
-        "content 与 tags 至少提供一项，未提供的字段保持不变。"
-    )
+    description = "Update the content or tags of one existing memory record."
 
     def __init__(self, gateway: MemoryGateway) -> None:
         self._gateway = gateway
@@ -152,8 +304,8 @@ class UpdateNoteTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "note_id": {"type": "string", "description": "要更新的笔记 id"},
-                "content": {"type": "string", "description": "新的正文（可省略）"},
+                "note_id": {"type": "string", "description": "Record id."},
+                "content": {"type": "string", "description": "New content."},
                 "tags": _tags_schema(),
             },
             "required": ["note_id"],

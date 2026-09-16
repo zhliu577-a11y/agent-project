@@ -356,6 +356,8 @@ async def test_runtime_loads_enabled_package_and_records_status(tmp_path, monkey
         assert skill_status.loaded is False
         assert "external__echo" in snapshot.tools
         assert type(runtime.context_policy).__name__ == "TailWindowPolicy"
+        assert runtime.context_gateway is not None
+        assert runtime.services.require("memory", "memory") is runtime.memory_store
         assert manager.list_installed()[0].runtime_status == "active"
 
     assert manager.list_installed()[0].runtime_status == "stopped"
@@ -397,7 +399,10 @@ async def test_runtime_preloads_only_host_selected_skills(tmp_path, monkeypatch)
         assert status.bytes > 0
         assert "# lint" in runtime.system_prompt
         records = [json.loads(line) for line in event_log.read_text(encoding="utf-8").splitlines()]
-        assert [record["name"] for record in records] == ["skill.preloaded"]
+        assert [record["name"] for record in records] == [
+            "session.loaded",
+            "skill.preloaded",
+        ]
 
 
 @pytest.mark.asyncio

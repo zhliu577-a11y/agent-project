@@ -28,6 +28,7 @@ from plugins.loader import (
     load_tool_plugins,
     register_kind,
 )
+from plugins.services import RuntimeServices
 
 
 def _write_plugin(
@@ -1083,6 +1084,66 @@ def test_embedding_plugin_create_rejects_bad_factory_return(tmp_path) -> None:
         plugin.create()
 
 
+_DEPENDENT_MEMORY_MODULE = """
+from core.memory import MemoryStore
+
+
+class DependentMemory(MemoryStore):
+    def __init__(self, embedding):
+        self.embedding = embedding
+
+    async def list_notes(self):
+        return []
+
+    async def add_note(self, content, tags):
+        pass
+
+    async def delete_note(self, note_id):
+        return False
+
+    async def update_note(self, note_id, content=None, tags=None):
+        return None
+
+    async def search_notes(self, query):
+        return []
+
+
+def create_store(plugin_dir, embedding):
+    return DependentMemory(embedding)
+"""
+
+
+def test_manifest_requirements_inject_runtime_services(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "memory",
+        "dependent",
+        {
+            "name": "dependent",
+            "type": "memory",
+            "requires": [
+                {
+                    "kind": "embedding",
+                    "name": "debug",
+                    "contract": "embedding.v1",
+                    "inject": "embedding",
+                }
+            ],
+            "entry": {"module": "store.py", "factory": "create_store"},
+        },
+        files={"store.py": _DEPENDENT_MEMORY_MODULE},
+    )
+    services = RuntimeServices()
+    services.select("embedding", "debug")
+    embedding = object()
+    services.register("embedding", "debug", embedding)
+
+    plugin = load_memory_plugins(tmp_path, services=services)[0]
+
+    assert plugin.manifest.requires[0].injection_name == "embedding"
+    assert plugin.create().embedding is embedding
+
+
 def _write_package(root: Path, name: str, manifest: dict, files: dict[str, str]) -> Path:
     package_dir = root / "packages" / name
     package_dir.mkdir(parents=True, exist_ok=True)
@@ -1376,5 +1437,9 @@ def test_repository_context_strategies_are_loadable() -> None:
     context_root = Path(__file__).resolve().parents[1] / "plugins" / "context"
     plugins = load_context_plugins(context_root)
 
-    assert [plugin.manifest.name for plugin in plugins] == ["summary-window", "tail-window"]
+    assert [plugin.manifest.name for plugin in plugins] == [
+        "memory-tail-window",
+        "summary-window",
+        "tail-window",
+    ]
     assert all(callable(plugin.create().prepare) for plugin in plugins)

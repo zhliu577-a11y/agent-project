@@ -1,10 +1,12 @@
 # runtime.py - assemble and own the runnable Harness object graph
+import inspect
 import logging
 import os
 from dataclasses import dataclass, replace
 from typing import Any
 
 from config import AppConfig
+from core.compaction import CompactionPolicy
 from core.context import ContextPolicy
 from core.events import Event, EventGateway, EventIdentity, jsonl_sink
 from core.hooks import HookGateway
@@ -12,6 +14,7 @@ from core.model import ModelAdapter, ModelRouter
 from core.prompt import build_system_prompt
 from core.registry import ToolRegistry
 from core.types import Message
+from gateways.context_gateway import ContextGateway
 from gateways.mcp_gateway import McpGateway, UsePlugin
 from gateways.memory_gateway import (
     ForgetTool,
@@ -32,6 +35,12 @@ from plugins.loader import (
     attach_listener_plugins,
 )
 from plugins.manager import PluginManager
+from plugins.services import (
+    RuntimeServices,
+    ServiceRef,
+    ServiceResolutionError,
+    resolve_dependency_order,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +120,7 @@ class HarnessRuntime:
             for record in self.plugin_manager.list_installed()
         }
         self._assembly = PluginAssembly()
+        self.services = RuntimeServices()
         self._listener_tokens: list[Any] = []
         self._lifecycle = PluginLifecycleManager()
         self._started = False
@@ -123,7 +133,14 @@ class HarnessRuntime:
         self.model: ModelAdapter | None = None
         self.models: ModelGateway | None = None
         self.context_policy: ContextPolicy | None = None
+        self.context_gateway: ContextPolicy | None = None
+        self.compaction_policy: CompactionPolicy | None = None
+        self.session_store: object | None = None
+        self.memory_store: object | None = None
+        self.memory_index: object | None = None
+        self.memory_policy: object | None = None
         self.session: SessionGateway | None = None
+        self.session_checkpoint: dict[str, Any] | None = None
         self.memory: MemoryGateway | None = None
         self.skills: SkillGateway | None = None
         self.mcp_gateway: McpGateway | None = None
@@ -147,9 +164,11 @@ class HarnessRuntime:
             self._create_event_transport()
             self._setup_events()
             await self._create_model()
-            self._create_context_policy()
-            await self._create_session()
-            self._create_memory()
+            await self._create_runtime_services()
+            await self._create_session_gateway()
+            self._create_memory_gateway()
+            await self._initialize_memory_index()
+            self._create_context_gateway()
             self._register_tools()
             self.mcp_gateway = McpGateway(self._assembly.mcp)
             self._use_plugin = UsePlugin(self.mcp_gateway, self.tools)
@@ -296,7 +315,11 @@ class HarnessRuntime:
         assembly = PluginAssembly()
         if self.plugin_manager.builtin_dir.is_dir():
             try:
-                builtins = assemble_plugins(self.plugin_manager.builtin_dir, self.config)
+                builtins = assemble_plugins(
+                    self.plugin_manager.builtin_dir,
+                    self.config,
+                    services=self.services,
+                )
             except Exception as exc:
                 raise RuntimeStartupError(f"内置插件装配失败: {exc}") from exc
             self._record_builtin_states(builtins)
@@ -307,6 +330,7 @@ class HarnessRuntime:
                 package = assemble_plugins(
                     self.plugin_manager.plugin_path(record.name),
                     self.config,
+                    services=self.services,
                 )
                 _merge_assemblies(assembly, package)
             except Exception as exc:
@@ -481,84 +505,183 @@ class HarnessRuntime:
         except Exception as exc:
             raise RuntimeStartupError(f"模型网关初始化失败: {exc}") from exc
 
-    def _create_context_policy(self) -> None:
-        plugin = next(
-            (
-                candidate
-                for candidate in self._assembly.contexts
-                if candidate.manifest.name == self.config.context_strategy
-            ),
-            None,
-        )
-        if plugin is None:
-            raise RuntimeStartupError(
-                f"未知的上下文策略插件: {self.config.context_strategy}，可选: "
-                f"{[candidate.manifest.name for candidate in self._assembly.contexts]}"
-            )
-        try:
-            self.context_policy = plugin.create()
-            self._track_plugin(plugin.manifest, self.context_policy)
-        except Exception as exc:
-            self._mark_manifest_error(plugin.manifest, exc)
-            raise RuntimeStartupError(
-                f"上下文策略插件 {self.config.context_strategy} 初始化失败: {exc}"
-            ) from exc
+    def _service_catalog(self) -> dict[tuple[str, str], PluginManifest]:
+        catalog: dict[tuple[str, str], PluginManifest] = {}
+        for collection in (
+            self._assembly.contexts,
+            self._assembly.compactions,
+            self._assembly.sessions,
+            self._assembly.memories,
+            self._assembly.memory_indexes,
+            self._assembly.memory_policies,
+            self._assembly.embeddings,
+        ):
+            for plugin in collection:
+                catalog[(plugin.manifest.type, plugin.manifest.name)] = plugin.manifest
+        return catalog
 
-    async def _create_session(self) -> None:
+    def _selected_services(self) -> dict[str, str]:
+        selected = {
+            "context": self.config.context_strategy,
+            "session": self.config.session_store,
+            "memory": self.config.memory_store,
+            "embedding": self.config.embedding_provider,
+        }
+        if self.config.session_compaction is not None:
+            selected["compaction"] = self.config.session_compaction
+        if self.config.memory_index is not None:
+            selected["memory-index"] = self.config.memory_index
+        if self.config.memory_policy is not None:
+            selected["memory-policy"] = self.config.memory_policy
+        return selected
+
+    def _service_roots(self) -> list[ServiceRef]:
+        roots = [
+            ServiceRef("context", self.config.context_strategy),
+            ServiceRef("session", self.config.session_store),
+            ServiceRef("memory", self.config.memory_store),
+        ]
+        if self.config.session_compaction is not None:
+            roots.append(ServiceRef("compaction", self.config.session_compaction))
+        if self.config.memory_index is not None:
+            roots.append(ServiceRef("memory-index", self.config.memory_index))
+        if self.config.memory_policy is not None:
+            roots.append(ServiceRef("memory-policy", self.config.memory_policy))
+        return roots
+
+    def _service_plugin(self, ref: ServiceRef):
+        collections = {
+            "context": self._assembly.contexts,
+            "compaction": self._assembly.compactions,
+            "session": self._assembly.sessions,
+            "memory": self._assembly.memories,
+            "memory-index": self._assembly.memory_indexes,
+            "memory-policy": self._assembly.memory_policies,
+            "embedding": self._assembly.embeddings,
+        }
         plugin = next(
             (
                 candidate
-                for candidate in self._assembly.sessions
-                if candidate.manifest.name == self.config.session_store
+                for candidate in collections.get(ref.kind, ())
+                if candidate.manifest.name == ref.name
             ),
             None,
         )
         if plugin is None:
+            available = [candidate.manifest.name for candidate in collections.get(ref.kind, ())]
             raise RuntimeStartupError(
-                f"未知的会话存储插件: {self.config.session_store}，可选: "
-                f"{[candidate.manifest.name for candidate in self._assembly.sessions]}"
+                f"unknown {ref.kind} plugin: {ref.name}; available: {available}"
             )
+        return plugin
+
+    async def _create_runtime_services(self) -> None:
+        selected = self._selected_services()
+        for kind, name in selected.items():
+            self.services.select(kind, name)
+
         try:
-            store = plugin.create()
-            self._track_plugin(plugin.manifest, store)
+            order = resolve_dependency_order(
+                self._service_roots(),
+                catalog=self._service_catalog(),
+                selected=selected,
+            )
+        except ServiceResolutionError as exc:
+            raise RuntimeStartupError(f"plugin dependency graph failed: {exc}") from exc
+
+        created: list[tuple[PluginManifest, object]] = []
+        current_plugin = None
+        try:
+            for ref in order:
+                current_plugin = self._service_plugin(ref)
+                instance = current_plugin.create()
+                self.services.register(ref.kind, ref.name, instance)
+                created.append((current_plugin.manifest, instance))
         except Exception as exc:
-            self._mark_manifest_error(plugin.manifest, exc)
-            raise RuntimeStartupError(
-                f"会话存储插件 {self.config.session_store} 初始化失败: {exc}"
-            ) from exc
-        self.session = SessionGateway(store, session_id=self.config.session_id)
+            await self._rollback_service_instances(created)
+            if current_plugin is not None:
+                self._mark_manifest_error(current_plugin.manifest, exc)
+            raise RuntimeStartupError(f"runtime service assembly failed: {exc}") from exc
+
+        for manifest, instance in created:
+            self._track_plugin(manifest, instance)
+
+        for ref in order:
+            instance = self.services.require(ref.kind, ref.name)
+            if ref.kind == "context":
+                self.context_policy = instance  # type: ignore[assignment]
+            elif ref.kind == "compaction":
+                self.compaction_policy = instance  # type: ignore[assignment]
+            elif ref.kind == "session":
+                self.session_store = instance
+            elif ref.kind == "memory":
+                self.memory_store = instance
+            elif ref.kind == "memory-index":
+                self.memory_index = instance
+            elif ref.kind == "memory-policy":
+                self.memory_policy = instance
+
+    async def _rollback_service_instances(
+        self,
+        created: list[tuple[PluginManifest, object]],
+    ) -> None:
+        for _manifest, instance in reversed(created):
+            stop = getattr(instance, "stop", None)
+            close = getattr(instance, "close", None)
+            cleanup = stop if callable(stop) else close if callable(close) else None
+            if cleanup is None:
+                continue
+            try:
+                result = cleanup()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("service rollback failed")
+
+    async def _create_session_gateway(self) -> None:
+        if self.session_store is None:
+            raise RuntimeStartupError("session store service is not initialized")
+        self.session = SessionGateway(
+            self.session_store,  # type: ignore[arg-type]
+            session_id=self.config.session_id,
+            compaction=self.compaction_policy,
+            max_tokens=self.config.context_max_tokens,
+            events=self._require_events().publisher(EventIdentity.host("session-gateway")),
+        )
         try:
-            self.history = await self.session.load_history()
+            snapshot = await self.session.load_snapshot()
+            self.history = list(snapshot.messages)
+            self.session_checkpoint = snapshot.checkpoint
         except (OSError, ValueError) as exc:
-            logger.warning("会话历史读取失败，将开启新会话: %s", exc)
+            logger.warning("session history load failed; starting a new session: %s", exc)
             self.history = []
+            self.session_checkpoint = None
 
-    def _create_memory(self) -> None:
-        plugin = next(
-            (
-                candidate
-                for candidate in self._assembly.memories
-                if candidate.manifest.name == self.config.memory_store
-            ),
-            None,
-        )
-        if plugin is None:
-            raise RuntimeStartupError(
-                f"未知的长期记忆插件: {self.config.memory_store}，可选: "
-                f"{[candidate.manifest.name for candidate in self._assembly.memories]}"
-            )
-        try:
-            store = plugin.create()
-            self._track_plugin(plugin.manifest, store)
-        except Exception as exc:
-            self._mark_manifest_error(plugin.manifest, exc)
-            raise RuntimeStartupError(
-                f"长期记忆插件 {self.config.memory_store} 初始化失败: {exc}"
-            ) from exc
+    def _create_memory_gateway(self) -> None:
+        if self.memory_store is None:
+            raise RuntimeStartupError("memory store service is not initialized")
         self.memory = MemoryGateway(
-            store,
+            self.memory_store,  # type: ignore[arg-type]
             events=self._require_events().publisher(EventIdentity.host("memory-gateway")),
+            index=self.memory_index,  # type: ignore[arg-type]
+            policy=self.memory_policy,  # type: ignore[arg-type]
         )
+
+    def _create_context_gateway(self) -> None:
+        if self.context_policy is None:
+            raise RuntimeStartupError("context policy service is not initialized")
+        self.context_gateway = ContextGateway(
+            self.context_policy,
+            memory=self.memory,
+        )
+
+    async def _initialize_memory_index(self) -> None:
+        if self.memory_store is None or self.memory_index is None:
+            return
+        try:
+            records = await self.memory_store.list_notes()  # type: ignore[attr-defined]
+            await self.memory_index.rebuild(records)  # type: ignore[attr-defined]
+        except Exception as exc:
+            raise RuntimeStartupError(f"memory index initialization failed: {exc}") from exc
 
     def _register_tools(self) -> None:
         self.tools = ToolRegistry()
@@ -675,6 +798,8 @@ class HarnessRuntime:
             contribution_id=manifest.contribution_id,
             protocol_version=manifest.protocol_version,
             contract=manifest.contract,
+            requires=manifest.requires,
+            services=self.services,
         )
         self._lifecycle.add(context, instance)
 
@@ -696,6 +821,7 @@ def _merge_assemblies(target: PluginAssembly, source: PluginAssembly) -> None:
     target.models.extend(source.models)
     target.model_routers.extend(source.model_routers)
     target.contexts.extend(source.contexts)
+    target.compactions.extend(source.compactions)
     target.skills.extend(source.skills)
     target.sessions.extend(source.sessions)
     target.memories.extend(source.memories)

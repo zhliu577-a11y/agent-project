@@ -92,8 +92,8 @@ async def chat(
         )
         history = ctx.messages[1:]  # 去掉 system，其余全部进入下一轮上下文
         if session is not None:
-            await session.save_history(history)
-            await session.save_checkpoint(capture(ctx))
+            committed = await session.commit_turn(history, capture(ctx))
+            history = list(committed.messages)
 
         if not streamed["active"]:
             # 没有流式输出（例如被拒绝或出错），整段补打
@@ -131,7 +131,7 @@ async def main() -> None:
             session=runtime.session,
             max_context_tokens=config.context_max_tokens,
             events=runtime.events,
-            context_policy=runtime.context_policy,
+            context_policy=runtime.context_gateway or runtime.context_policy,
         )
     finally:
         await runtime.close()

@@ -1,0 +1,5 @@
+{
+  "triggerTokens": 16000,
+  "keepRecentTokens": 6000,
+  "summaryTokens": 2000
+}

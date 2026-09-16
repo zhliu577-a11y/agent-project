@@ -14,8 +14,8 @@
 - 固定异步 agent loop（调模型 → 执行工具 → 回填 → 判断结束），支持流式输出与多个工具的并行执行
 - **插件目录（drop-in）**：`plugins/` 下每个插件是一个自包含目录 + `plugin.json`，
   拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model`、`model-router`、
-  `skill`、`session`、`memory`、`embedding`、`listener`、`event-transport`、`context`
-  十二类
+  `skill`、`session`、`memory`、`memory-index`、`memory-policy`、`embedding`、
+  `listener`、`event-transport`、`context`、`compaction` 十五类
 - **功能包**：一个包可用 `contributes[]` 同时提供 skill、hook、tool 等能力，
   发现阶段统一展开为 contribution 后按受控 kind 注册表装配
 - **MCP 网关**：Agent 只面向网关这一个通道；网关统一维护各 MCP 插件的连接、
@@ -33,10 +33,12 @@
   agent loop 始终只依赖 `ModelAdapter.complete()`
 - **技能插件**：纯内容插件（`plugins/skills/*`）按需注入操作说明——启动只放
   目录条目，模型需要时用 `use_skill` 读取完整正文（渐进披露）
-- **会话插件**：短期记忆插件化（`plugins/session/*`）——同一会话多轮历史
-  自动延续，退出后按 `SESSION_ID` 恢复
-- **长期记忆插件**：跨会话语义笔记（`plugins/memory/*`），模型通过
-  `remember / recall / forget` 主动读写
+- **会话插件**：短期记忆分为 `session` 存储、`context` 请求视图和
+  `compaction` 提交策略三层；`SessionGateway` 统一负责 revision、原子提交、
+  checkpoint 和压缩失败回滚
+- **长期记忆插件**：持久事实、派生索引、读写策略三层分离
+  （`plugins/memory/*`、`plugins/memory-index/*`、`plugins/memory-policy/*`），
+  模型通过 `remember / recall / update_note / forget` 主动读写
 - **上下文策略插件**：完整历史由 Session 保存，模型请求前由可替换的
   `context` 插件生成上下文视图；`CONTEXT_STRATEGY` 可切换策略
 - **插件包生命周期**：外部目录或 zip 包经过静态检查、staging、摘要计算后原子安装；
@@ -129,20 +131,30 @@ plugins/
 │       └── SKILL.md            #   模型按需读取的完整说明
 ├── session/                    # 会话存储插件（短期记忆）
 │   ├── jsonl/                  #   文件持久化（默认，重启可恢复）
-│   └── inmemory/               #   纯内存（重启即失，测试/临时用）
-│       ├── plugin.json         #   { "type": "session", ... }
-│       └── store.py            #   SessionStore 实现
+│   │   ├── plugin.json         #   { "type": "session", ... }
+│   │   └── store.py            #   SessionStore 实现
+│   ├── inmemory/               #   纯内存（重启即失，测试/临时用）
+│   └── rolling-summary/        #   compaction 插件（领域归类，不属于 session kind）
+│       ├── plugin.json         #   { "type": "compaction", ... }
+│       └── policy.py           #   CompactionPolicy 实现
 ├── memory/                     # 长期记忆插件（跨会话语义笔记）
 │   ├── sqlite/                 #   生产默认：事务 + WAL + 参数化查询
 │   ├── jsonl/                  #   人眼可读的示例后端
 │   └── vector/                 #   语义检索后端（存 embedding + 余弦排序）
 │       ├── plugin.json         #   { "type": "memory", ... }
 │       └── store.py            #   MemoryStore 实现
+├── memory-index/               # 派生记忆索引（可重建，不拥有事实）
+│   ├── lexical/                #   默认：正文/标签字面匹配
+│   └── recent/                 #   按更新时间倒序提供候选
+├── memory-policy/              # 写入准入与召回排序策略
+│   ├── default/                #   默认：重要度 + 置信度 + 时间
+│   └── strict/                 #   拒绝弱记录，置信度优先排序
 ├── embedding/                  # 嵌入提供方插件（向量记忆后端使用）
 │   ├── debug/                  #   确定性哈希（离线开发/测试）
 │   └── openai-embedding/       #   OpenAI API（真实语义，需 OPENAI_API_KEY）
 ├── context/                    # 上下文策略插件（可切换模型请求视图）
-│   ├── tail-window/            #   默认：保留 system 与最新完整消息组
+│   ├── memory-tail-window/     #   默认：自动召回记忆 + 保留最新完整消息组
+│   ├── tail-window/            #   纯窗口：保留 system 与最新完整消息组
 │   └── summary-window/         #   旧消息抽取摘要 + 保留最新完整消息组
 ├── event_transports/           # 事件总线实现
 │   ├── in-process/             #   有界异步队列（默认）
@@ -174,8 +186,9 @@ plugins/
 ```
 
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
-`mcp` / `hook` / `tool` / `model` / `skill` / `session` / `memory` / `embedding` /
-`listener` / `event-transport` / `context`；
+`mcp` / `hook` / `tool` / `model` / `model-router` / `skill` / `session` /
+`memory` / `memory-index` / `memory-policy` / `embedding` / `listener` /
+`event-transport` / `context` / `compaction`；
 `apiVersion` 固定为 `"1"`，`protocolVersion` 当前为 `1`，`contract` 必须与
 `<type>.v<protocolVersion>` 一致（例如 `mcp.v1`、`tool.v1`）；
 `enabled: false` 的插件
@@ -525,14 +538,58 @@ bytes / error`。
 }
 ```
 
-会话插件实现 `core.session.SessionStore`（`load` / `save`），是短期记忆的
-存储后端：
+`session` 只负责原始消息的持久化。`SessionGateway` 是它前面的控制面，统一
+处理锁、revision、checkpoint、压缩提交和失败回滚：
 
-- `SESSION_STORE`（默认 `jsonl`）选择激活的存储插件，语义与 `AGENT_MODEL` 一致；
-- 同一会话内每轮历史自动延续（loop 的 `history` 参数），退出后同
-  `SESSION_ID`（默认 `default`）自动恢复；
-- jsonl 示例把消息写在 `SESSION_DATA_DIR`（默认项目下 `.sessions/`，
-  已 gitignore）——换存储 = 复制 `plugins/session/jsonl/` 改实现。
+```text
+Agent loop
+  -> context.prepare()                 # 本次模型看到什么
+  -> SessionGateway.commit_turn()      # 本轮结束后持久化什么
+       -> compaction.compact()         # 可选：生成替换后的历史
+       -> SessionStore.replace()       # 校验 revision 后原子替换
+       -> SessionStore.save_checkpoint()
+```
+
+- `SESSION_STORE`（默认 `jsonl`）选择激活的存储插件；
+- 内置存储实现 `append / get(limit) / replace / clear / metadata / snapshot`；
+  旧 v1 插件只实现 `load / save` 时自动降级到兼容模式；
+- 每次提交带 revision 检查，陈旧写入返回 `SessionConflictError`，不会覆盖新历史；
+- jsonl 文件使用临时文件 + `os.replace` 原子替换，并用跨进程文件锁保护；
+- `SESSION_ID` 经过路径安全校验，不能用 `../` 跳出 `SESSION_DATA_DIR`；
+- `Message` 现在带 `id / timestamp / turn_id / run_id / metadata`，旧 JSONL 可兼容读取；
+- jsonl 数据位于 `SESSION_DATA_DIR`（默认 `.sessions/`，已 gitignore）。
+
+### 会话压缩插件（`type: "compaction"`）
+
+```json
+{
+  "name": "rolling-summary",
+  "type": "compaction",
+  "entry": { "module": "policy.py", "factory": "create_policy" }
+}
+```
+
+压缩策略实现 `core.compaction.CompactionPolicy`：
+
+```python
+async def compact(request: CompactionRequest) -> CompactionResult: ...
+```
+
+内置 `plugins/session/rolling-summary/` 在历史超过阈值后，把旧消息抽取成有限
+长度的摘要，保留最近的消息组。其配置位于
+`config/plugins/compaction/rolling-summary.json`：
+
+```json
+{
+  "triggerTokens": 16000,
+  "keepRecentTokens": 6000,
+  "summaryTokens": 2000
+}
+```
+
+`SESSION_COMPACTION` 选择策略；设为空字符串可关闭持久化压缩。插件只返回
+替换方案，真正的 revision 校验、原子替换和失败回滚始终由 `SessionGateway`
+负责。因此存储后端、模型可见窗口和压缩策略可以彼此独立替换。
 
 ### 长期记忆插件（`type: "memory"`）
 
@@ -553,7 +610,17 @@ bytes / error`。
 `recall` 先把 query 转成向量、按余弦相似度取 Top-K；相似度低于阈值自动回退
 子串/标签搜索。嵌入来源由 `EMBEDDING_PROVIDER` 选择：`debug`（确定性哈希，
 离线跑通链路）或 `openai-embedding`（真实语义，需 `OPENAI_API_KEY`）。
-模型侧提供三个工具：
+
+长期记忆运行时由三层组成：
+
+- `MemoryStore`（`MEMORY_STORE`）：唯一的事实来源，负责持久化；
+- `MemoryIndex`（`MEMORY_INDEX`）：派生的候选召回视图，可从 Store 重建。
+  内置 `lexical` 做正文/标签子串匹配，`recent` 按更新时间提供近因优先候选；
+- `MemoryPolicy`（`MEMORY_POLICY`）：写入门槛与召回排序。内置 `default` 按
+  重要度、置信度、时间排序；`strict` 拒绝过短、低置信度或低重要度记录，
+  并在召回时优先选择高置信度内容。
+
+模型侧提供四个工具：
 
 - `remember(content, tags?)`：把跨会话值得记住的事实写成笔记；
 - `recall(query?)`：按内容/标签检索（当前为子串/标签匹配）并返回笔记；
@@ -566,7 +633,7 @@ bytes / error`。
 
 ```json
 {
-  "name": "tail-window",
+  "name": "memory-tail-window",
   "type": "context",
   "entry": { "module": "policy.py", "factory": "create_policy" }
 }
@@ -578,11 +645,13 @@ bytes / error`。
 async def prepare(request: ContextRequest) -> ContextResult: ...
 ```
 
-- `CONTEXT_STRATEGY`（默认 `tail-window`）选择当前策略；
+- `CONTEXT_STRATEGY`（默认 `memory-tail-window`）选择当前策略；
 - 策略在每次模型调用前执行，包括同一个 agent turn 内的工具循环；
 - `ContextRequest` 提供完整消息、工具 schema、token 预算、会话与 turn 状态；
 - `ContextResult` 只作为“本次发给模型的视图”，不会覆盖 Session 中的完整历史；
-- 默认 `tail-window` 会计算 system prompt 与工具 schema，保留最新完整消息组，
+- `memory-tail-window` 消费 `ContextGateway` 放入 `state["memory.records"]` 的召回结果，
+  默认预留 25% 上下文预算，把记忆作为参考数据并入 system prompt，再保留最新完整消息组；
+- `tail-window` 会计算 system prompt 与工具 schema，保留最新完整消息组，
   不会拆开 `assistant(tool_calls)` 与对应的 `tool` 结果；
 - `summary-window` 额外预留 25% 上下文预算，把较早消息抽取成有限长度摘要并
   并入 system prompt，再原样保留最新完整消息组；
@@ -595,7 +664,7 @@ async def prepare(request: ContextRequest) -> ContextResult: ...
 切换内置策略：
 
 ```powershell
-$env:CONTEXT_STRATEGY="summary-window"
+$env:CONTEXT_STRATEGY="tail-window"
 ```
 
 ### 错误分类与重试（边界翻译）
@@ -695,10 +764,18 @@ $env:CONTEXT_STRATEGY="summary-window"
 ```json
 {
   "model": "deepseek",
-  "session": { "store": "jsonl", "id": "default" },
-  "memory": { "store": "sqlite" },
+  "session": {
+    "store": "jsonl",
+    "id": "default",
+    "compaction": "rolling-summary"
+  },
+  "memory": {
+    "store": "sqlite",
+    "index": "lexical",
+    "policy": "default"
+  },
   "embedding": { "provider": "debug" },
-  "context": { "maxTokens": 20000, "strategy": "tail-window" }
+  "context": { "maxTokens": 20000, "strategy": "memory-tail-window" }
 }
 ```
 
@@ -726,8 +803,11 @@ Skill 的宿主预载和内容预算由 `config/skill.json` 管理。
 | `SUB2API_DISABLE_RESPONSE_STORAGE` | `true` | 是否在网关禁用响应存储 |
 | `SESSION_STORE` | `jsonl` | 激活的会话存储插件名（plugins/session/* 里选） |
 | `SESSION_ID` | `default` | 会话标识，同名会话自动恢复历史 |
+| `SESSION_COMPACTION` | `rolling-summary` | 激活的持久化压缩插件；空字符串关闭 |
 | `SESSION_DATA_DIR` | `.sessions/` | jsonl 会话数据目录 |
 | `MEMORY_STORE` | `sqlite` | 激活的长期记忆插件名（plugins/memory/* 里选） |
+| `MEMORY_INDEX` | `lexical` | 派生记忆索引插件（`lexical` / `recent`） |
+| `MEMORY_POLICY` | `default` | 记忆写入与召回策略插件（`default` / `strict`） |
 | `MEMORY_DB_PATH` | `.memory/memory.db` | sqlite 后端的数据文件路径 |
 | `MEMORY_DATA_DIR` | `.memory/` | jsonl 长期记忆数据目录 |
 | `MEMORY_VECTOR_DB_PATH` | `.memory/vector.db` | vector 后端数据文件 |
@@ -947,12 +1027,64 @@ config/
 ├── mcp.json
 └── plugins/
     ├── hook/permission.json
+    ├── compaction/rolling-summary.json
     └── <kind>/<name>.json
 ```
 
 优先级为：环境变量 > 分域/单插件配置 > `config/config.json` > 内置默认。
 运行时把 `config/plugins/<kind>/<name>.json` 通过 `PluginContext.config`
 以只读形式交给插件。
+
+## Runtime 服务图与记忆边界
+
+Runtime 不再按手写顺序逐个创建 context、session、memory。选中的服务插件会先进入依赖图，
+按依赖优先顺序实例化，再交给 Gateway：
+
+```text
+MemoryStore (memory)
+  <- MemoryIndex (memory-index, optional)
+  <- MemoryPolicy (memory-policy, optional)
+  <- EmbeddingProvider (embedding, required by vector memory)
+
+SessionGateway
+  <- SessionStore (session)
+  <- CompactionPolicy (compaction)
+
+ContextGateway
+  <- ContextPolicy (context)
+  <- MemoryRecallPort (read-only context_records)
+```
+
+插件可以在 `plugin.json` 中声明依赖：
+
+```json
+{
+  "requires": [
+    {
+      "kind": "embedding",
+      "name": "debug",
+      "required": true,
+      "inject": "embedding"
+    }
+  ]
+}
+```
+
+`name` 省略时使用当前配置选中的同 kind 插件；`inject` 省略时使用 kind 名（连字符转下划线）
+作为工厂参数名。缺少必需依赖、契约不匹配或出现依赖环都会在 Runtime 启动阶段失败。
+
+`memory-index` 只保存派生索引，可从 `MemoryStore` 重建；`memory-policy` 负责写入筛选和召回排序，
+两者都不拥有事实记录。`MemoryRecord` 的 `scope` 与 `owner_id` 由 `MemoryGateway` 做读写 ACL，
+为后续多 Agent 隔离预留边界。
+
+`context`、`compaction`、`memory` 保持三套独立协议：Context 只决定本次模型看到什么，
+Compaction 只生成会话历史的替换方案，Memory 负责跨会话事实。`ContextGateway` 只依赖
+`MemoryRecallPort`，召回失败时降级为空记忆并继续原 ContextPolicy，不会绕过压缩、
+修改会话或让记忆故障拖垮模型调用。
+
+当前内置选择为 `MEMORY_INDEX=lexical`、`MEMORY_POLICY=default`。例如希望项目最近更新
+优先进入候选，再由默认策略排序，可使用 `MEMORY_INDEX=recent`；希望长期记忆更偏精确、
+减少低质量写入，可使用 `MEMORY_POLICY=strict`。索引与策略可以独立切换。
 
 ## Roadmap
 

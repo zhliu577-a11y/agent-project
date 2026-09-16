@@ -55,7 +55,7 @@
 
 - `hook` 必须返回 `LifecycleHooks`
 - `tool` 必须返回 `Tool` 或 `Tool` 列表
-- `model`、`session`、`memory`、`embedding`、`context` 必须返回对应接口实例
+- `model`、`session`、`memory`、`embedding`、`context`、`compaction` 必须返回对应接口实例
 
 因此，Manifest 只声明意图，Capability Contract 负责验证宿主可接受的实现边界。
 

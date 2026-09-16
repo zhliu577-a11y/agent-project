@@ -1,10 +1,7 @@
-# plugins/memory/vector/store.py —— 长期记忆插件：向量后端（语义检索）
-#
-# 在 SQLite 里额外保存每条的 embedding 向量：
-# - 写入/更新正文时用 EmbeddingProvider 生成向量；
-# - 检索：query 也转向量 → 余弦相似度排序取 Top-K；
-#   最佳相似度低于阈值时自动回退“子串/标签”字面搜索；
-# - 嵌入来源由 EMBEDDING_PROVIDER 选择（debug=离线测试；openai-embedding=真实语义）。
+"""Vector-backed semantic memory with an injected embedding provider."""
+
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -14,8 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from core.embedding import EmbeddingProvider
-from core.memory import MemoryNote, MemoryStore
-from plugins.loader import DEFAULT_PLUGINS_DIR, load_embedding_plugins
+from core.memory import MemoryNote, MemoryStore, note_from_dict, note_to_dict
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_notes (
@@ -23,7 +19,8 @@ CREATE TABLE IF NOT EXISTS memory_notes (
     content    TEXT NOT NULL,
     tags       TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    embedding  TEXT NOT NULL
+    embedding  TEXT NOT NULL,
+    record     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_vector_created_at ON memory_notes (created_at);
 """
@@ -41,7 +38,7 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 class SqliteVectorMemoryStore(MemoryStore):
-    """SQLite 持久化 + 内存余弦排序：笔记规模下兼顾简单与语义检索。"""
+    """SQLite persistence plus in-process cosine ranking."""
 
     def __init__(
         self,
@@ -62,10 +59,15 @@ class SqliteVectorMemoryStore(MemoryStore):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(_SCHEMA)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_notes)")}
+        if "record" not in columns:
+            conn.execute("ALTER TABLE memory_notes ADD COLUMN record TEXT")
         return conn
 
     @staticmethod
     def _row_to_note(row: sqlite3.Row) -> MemoryNote:
+        if "record" in row.keys() and row["record"]:
+            return note_from_dict(json.loads(row["record"]))
         return MemoryNote(
             id=row["id"],
             content=row["content"],
@@ -81,7 +83,8 @@ class SqliteVectorMemoryStore(MemoryStore):
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, content, tags, created_at FROM memory_notes ORDER BY created_at, id"
+                "SELECT id, content, tags, created_at, embedding, record"
+                " FROM memory_notes ORDER BY created_at, id"
             ).fetchall()
             return [self._row_to_note(row) for row in rows]
         finally:
@@ -99,14 +102,15 @@ class SqliteVectorMemoryStore(MemoryStore):
         try:
             with conn:
                 conn.execute(
-                    "INSERT INTO memory_notes (id, content, tags, created_at, embedding)"
-                    " VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO memory_notes (id, content, tags, created_at, embedding, record)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         note.id,
                         note.content,
                         json.dumps(note.tags, ensure_ascii=False),
                         note.created_at,
                         embedding,
+                        json.dumps(note_to_dict(note), ensure_ascii=False),
                     ),
                 )
             return note
@@ -139,7 +143,7 @@ class SqliteVectorMemoryStore(MemoryStore):
             assignments.append("tags = ?")
             params.append(json.dumps(tags, ensure_ascii=False))
         if not assignments:
-            raise ValueError("update_note 至少要提供 content 或 tags 之一")
+            raise ValueError("update_note requires content or tags")
         params.append(note_id)
         sql = f"UPDATE memory_notes SET {', '.join(assignments)} WHERE id = ?"
 
@@ -150,10 +154,41 @@ class SqliteVectorMemoryStore(MemoryStore):
             if cursor.rowcount == 0:
                 return None
             row = conn.execute(
-                "SELECT id, content, tags, created_at FROM memory_notes WHERE id = ?",
+                "SELECT id, content, tags, created_at, embedding, record"
+                " FROM memory_notes WHERE id = ?",
                 (note_id,),
             ).fetchone()
-            return self._row_to_note(row) if row is not None else None
+            if row is None:
+                return None
+            note = self._row_to_note(row)
+            if content is not None:
+                note.content = content
+            if tags is not None:
+                note.tags = list(tags)
+            note.updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+            conn.execute(
+                "UPDATE memory_notes SET record = ? WHERE id = ?",
+                (json.dumps(note_to_dict(note), ensure_ascii=False), note_id),
+            )
+            return note
+        finally:
+            conn.close()
+
+    async def save_record(self, record: MemoryNote) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE memory_notes SET content = ?, tags = ?, created_at = ?, record = ?"
+                    " WHERE id = ?",
+                    (
+                        record.content,
+                        json.dumps(record.tags, ensure_ascii=False),
+                        record.created_at,
+                        json.dumps(note_to_dict(record), ensure_ascii=False),
+                        record.id,
+                    ),
+                )
         finally:
             conn.close()
 
@@ -170,7 +205,7 @@ class SqliteVectorMemoryStore(MemoryStore):
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, content, tags, created_at, embedding FROM memory_notes"
+                "SELECT id, content, tags, created_at, embedding, record FROM memory_notes"
             ).fetchall()
         finally:
             conn.close()
@@ -192,7 +227,7 @@ class SqliteVectorMemoryStore(MemoryStore):
         try:
             pattern = f"%{self._escape_like(query)}%"
             rows = conn.execute(
-                "SELECT id, content, tags, created_at FROM memory_notes"
+                "SELECT id, content, tags, created_at, embedding, record FROM memory_notes"
                 " WHERE content LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\'"
                 " ORDER BY created_at, id",
                 (pattern, pattern),
@@ -202,20 +237,23 @@ class SqliteVectorMemoryStore(MemoryStore):
             conn.close()
 
 
-def _load_provider() -> EmbeddingProvider:
-    name = os.getenv("EMBEDDING_PROVIDER", "debug")
-    plugins = load_embedding_plugins(DEFAULT_PLUGINS_DIR)
-    plugin = next((p for p in plugins if p.manifest.name == name), None)
-    if plugin is None:
-        available = [p.manifest.name for p in plugins]
-        raise RuntimeError(f"未知的嵌入提供方: {name}，可用: {available}")
-    return plugin.create()
-
-
-def create_store(plugin_dir):
-    """插件工厂：返回向量记忆存储（DB 路径读 MEMORY_VECTOR_DB_PATH）。"""
+def create_store(plugin_dir, context=None, embedding: EmbeddingProvider | None = None):
+    """Create vector memory with the host-provided embedding service."""
+    if embedding is None:
+        raise ValueError("vector memory requires an injected embedding provider")
+    plugin_config = dict(getattr(context, "config", {}) or {})
     default_db = Path(plugin_dir).resolve().parents[2] / ".memory" / "vector.db"
-    db_path = Path(os.getenv("MEMORY_VECTOR_DB_PATH", str(default_db)))
-    threshold = float(os.getenv("VECTOR_SIMILARITY_THRESHOLD", "0.2"))
-    top_k = int(os.getenv("VECTOR_TOP_K", "3"))
-    return SqliteVectorMemoryStore(db_path, _load_provider(), threshold, top_k)
+    db_path = Path(
+        plugin_config.get(
+            "dbPath",
+            os.getenv("MEMORY_VECTOR_DB_PATH", str(default_db)),
+        )
+    )
+    threshold = float(
+        plugin_config.get(
+            "similarityThreshold",
+            os.getenv("VECTOR_SIMILARITY_THRESHOLD", "0.2"),
+        )
+    )
+    top_k = int(plugin_config.get("topK", os.getenv("VECTOR_TOP_K", "3")))
+    return SqliteVectorMemoryStore(db_path, embedding, threshold, top_k)

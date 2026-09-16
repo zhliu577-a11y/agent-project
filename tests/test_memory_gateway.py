@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from core.errors import PluginError
+from core.memory import MemoryQuery, MemoryRecallPort, MemoryRecord
 from core.registry import ToolRegistry
 from gateways.memory_gateway import (
     ForgetTool,
@@ -11,7 +13,13 @@ from gateways.memory_gateway import (
     RememberTool,
     UpdateNoteTool,
 )
-from plugins.loader import load_memory_plugins
+from plugins.loader import (
+    load_embedding_plugins,
+    load_memory_index_plugins,
+    load_memory_plugins,
+    load_memory_policy_plugins,
+)
+from plugins.services import RuntimeServices
 
 REPO_PLUGINS = Path(__file__).resolve().parents[1] / "plugins"
 
@@ -20,6 +28,10 @@ def _memory_gateway(tmp_path: Path, monkeypatch) -> MemoryGateway:
     monkeypatch.setenv("MEMORY_DATA_DIR", str(tmp_path))
     plugin = next(p for p in load_memory_plugins(REPO_PLUGINS) if p.manifest.name == "jsonl")
     return MemoryGateway(plugin.create())
+
+
+def test_memory_gateway_satisfies_read_only_recall_port(tmp_path, monkeypatch) -> None:
+    assert isinstance(_memory_gateway(tmp_path, monkeypatch), MemoryRecallPort)
 
 
 def _sqlite_gateway(tmp_path: Path, monkeypatch) -> MemoryGateway:
@@ -94,10 +106,136 @@ def test_repo_offers_production_and_readable_memory_backends() -> None:
     assert {"sqlite", "jsonl"} <= names
 
 
+def test_repo_offers_replaceable_memory_indexes_and_policies() -> None:
+    index_names = {plugin.manifest.name for plugin in load_memory_index_plugins(REPO_PLUGINS)}
+    policy_names = {plugin.manifest.name for plugin in load_memory_policy_plugins(REPO_PLUGINS)}
+    assert {"lexical", "recent"} <= index_names
+    assert {"default", "strict"} <= policy_names
+
+
+@pytest.mark.asyncio
+async def test_recent_index_orders_candidates_by_update_time() -> None:
+    index = next(
+        plugin
+        for plugin in load_memory_index_plugins(REPO_PLUGINS)
+        if plugin.manifest.name == "recent"
+    ).create()
+    older = MemoryRecord(
+        id="older",
+        content="ruff project rule",
+        tags=["project"],
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    newer = MemoryRecord(
+        id="newer",
+        content="ruff project rule updated",
+        tags=["project"],
+        created_at="2026-01-02T00:00:00+00:00",
+        updated_at="2026-02-01T00:00:00+00:00",
+    )
+    await index.rebuild([older, newer])
+
+    hits = await index.search(MemoryQuery(text="ruff", limit=10))
+
+    assert [record.id for record in hits] == ["newer", "older"]
+
+
+@pytest.mark.asyncio
+async def test_strict_policy_rejects_weak_writes_and_ranks_by_confidence(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MEMORY_DATA_DIR", str(tmp_path))
+    store = next(
+        p for p in load_memory_plugins(REPO_PLUGINS) if p.manifest.name == "jsonl"
+    ).create()
+    policy = next(
+        p for p in load_memory_policy_plugins(REPO_PLUGINS) if p.manifest.name == "strict"
+    )
+    gateway = MemoryGateway(store, policy=policy.create())
+
+    await gateway.remember("tiny", confidence=0.9, importance=0.9)
+    await gateway.remember("well formed but uncertain", confidence=0.2)
+    confident = await gateway.remember(
+        "well formed confident fact",
+        confidence=0.95,
+        importance=0.3,
+    )
+    important = await gateway.remember(
+        "well formed important fact",
+        confidence=0.7,
+        importance=0.9,
+    )
+
+    assert [record.id for record in await store.list_notes()] == [
+        confident.id,
+        important.id,
+    ]
+    assert [record.id for record in await gateway.recall("fact")] == [
+        confident.id,
+        important.id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_memory_gateway_uses_replaceable_index_and_policy(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MEMORY_DATA_DIR", str(tmp_path))
+    store = next(
+        p for p in load_memory_plugins(REPO_PLUGINS) if p.manifest.name == "jsonl"
+    ).create()
+    index = next(p for p in load_memory_index_plugins(REPO_PLUGINS) if p.manifest.name == "lexical")
+    policy = next(
+        p for p in load_memory_policy_plugins(REPO_PLUGINS) if p.manifest.name == "default"
+    )
+    gateway = MemoryGateway(store, index=index.create(), policy=policy.create())
+
+    record = await gateway.remember("prefer ruff", tags=["style"], importance=0.9)
+    hits = await gateway.recall("ruff")
+
+    assert [hit.id for hit in hits] == [record.id]
+    assert await gateway.forget(record.id) is True
+    assert await gateway.recall("ruff") == []
+
+
+@pytest.mark.asyncio
+async def test_memory_gateway_enforces_scope_and_owner_acl(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MEMORY_DATA_DIR", str(tmp_path))
+    store = next(
+        p for p in load_memory_plugins(REPO_PLUGINS) if p.manifest.name == "jsonl"
+    ).create()
+    gateway = MemoryGateway(
+        store,
+        default_scope="agent",
+        default_owner_id="agent-a",
+        allowed_scopes={"agent"},
+        allowed_owner_ids={"agent-a"},
+    )
+
+    await gateway.remember("inside", tags=[])
+    with pytest.raises(PluginError, match="scope"):
+        await gateway.remember("outside", tags=[], scope="project")
+    with pytest.raises(PluginError, match="owner"):
+        await gateway.remember("other", tags=[], owner_id="agent-b")
+
+    assert [record.content for record in await store.list_notes()] == ["inside"]
+
+    other_owner = MemoryGateway(store, default_scope="agent", default_owner_id="agent-b")
+    await other_owner.remember("other owner", tags=[])
+    assert [record.content for record in await gateway.recall("")] == ["inside"]
+
+
 def _vector_gateway(tmp_path: Path, monkeypatch) -> MemoryGateway:
     monkeypatch.setenv("MEMORY_VECTOR_DB_PATH", str(tmp_path / "vector.db"))
     monkeypatch.delenv("EMBEDDING_PROVIDER", raising=False)  # 默认 debug，离线可跑
-    plugin = next(p for p in load_memory_plugins(REPO_PLUGINS) if p.manifest.name == "vector")
+    services = RuntimeServices()
+    services.select("embedding", "debug")
+    debug = next(p for p in load_embedding_plugins(REPO_PLUGINS) if p.manifest.name == "debug")
+    services.register("embedding", "debug", debug.create())
+    plugin = next(
+        p
+        for p in load_memory_plugins(REPO_PLUGINS, services=services)
+        if p.manifest.name == "vector"
+    )
     return MemoryGateway(plugin.create())
 
 

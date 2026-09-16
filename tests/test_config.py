@@ -12,7 +12,10 @@ _CONFIG_KEYS = (
     "AGENT_MODEL",
     "SESSION_STORE",
     "SESSION_ID",
+    "SESSION_COMPACTION",
     "MEMORY_STORE",
+    "MEMORY_INDEX",
+    "MEMORY_POLICY",
     "EMBEDDING_PROVIDER",
     "CONTEXT_MAX_TOKENS",
     "CONTEXT_STRATEGY",
@@ -43,6 +46,14 @@ def test_default_config_path_points_to_config_directory() -> None:
     assert DEFAULT_CONFIG_PATH == Path(__file__).resolve().parents[1] / "config" / "config.json"
 
 
+def test_repository_default_context_is_memory_aware(monkeypatch) -> None:
+    _clean_env(monkeypatch)
+
+    config = AppConfig.load()
+
+    assert config.context_strategy == "memory-tail-window"
+
+
 def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch) -> None:
     _clean_env(monkeypatch)
     config_dir = tmp_path / "config"
@@ -62,8 +73,14 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     _write(config_dir / "model.json", {"model": "openai"})
     _write(config_dir / "event.json", {"handlerTimeout": 2.5})
     _write(config_dir / "event_transport.json", {"provider": "in-process"})
-    _write(config_dir / "session.json", {"store": "inmemory", "id": "cli"})
-    _write(config_dir / "memory.json", {"store": "jsonl"})
+    _write(
+        config_dir / "session.json",
+        {"store": "inmemory", "id": "cli", "compaction": "rolling-summary"},
+    )
+    _write(
+        config_dir / "memory.json",
+        {"store": "jsonl", "index": "lexical", "policy": "default"},
+    )
     _write(config_dir / "embedding.json", {"provider": "openai-embedding"})
     _write(config_dir / "context.json", {"maxTokens": 12345, "strategy": "compact"})
     _write(config_dir / "mcp.json", {"preload": ["time", "math"]})
@@ -86,7 +103,10 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     assert config.event_handler_timeout == 2.5
     assert config.session_store == "inmemory"
     assert config.session_id == "cli"
+    assert config.session_compaction == "rolling-summary"
     assert config.memory_store == "jsonl"
+    assert config.memory_index == "lexical"
+    assert config.memory_policy == "default"
     assert config.embedding_provider == "openai-embedding"
     assert config.context_max_tokens == 12345
     assert config.context_strategy == "compact"
@@ -103,6 +123,9 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     monkeypatch.setenv("EVENT_TRANSPORT", "custom-transport")
     monkeypatch.setenv("EVENT_HANDLER_TIMEOUT", "3.5")
     monkeypatch.setenv("CONTEXT_STRATEGY", "tail-window")
+    monkeypatch.setenv("SESSION_COMPACTION", "")
+    monkeypatch.setenv("MEMORY_INDEX", "")
+    monkeypatch.setenv("MEMORY_POLICY", "strict")
     monkeypatch.setenv("MCP_PRELOAD", "filesystem")
     monkeypatch.setenv("SKILL_PRELOAD", "commit-message")
     monkeypatch.setenv("SKILL_MAX_CONTENT_BYTES", "3000")
@@ -111,6 +134,9 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     assert config.event_transport == "custom-transport"
     assert config.event_handler_timeout == 3.5
     assert config.context_strategy == "tail-window"
+    assert config.session_compaction is None
+    assert config.memory_index is None
+    assert config.memory_policy == "strict"
     assert config.mcp_preload == ("filesystem",)
     assert config.skill_preload == ("commit-message",)
     assert config.skill_max_content_bytes == 3000
@@ -187,6 +213,7 @@ def test_config_missing_file_uses_defaults(tmp_path, monkeypatch) -> None:
     assert config.event_transport == "in-process"
     assert config.event_handler_timeout is None
     assert config.session_store == "jsonl"
+    assert config.session_compaction is None
     assert config.memory_store == "sqlite"
     assert config.context_max_tokens == 20000
     assert config.context_strategy == "tail-window"
@@ -256,4 +283,13 @@ def test_config_rejects_invalid_skill_preload_and_budgets(tmp_path, monkeypatch)
     monkeypatch.delenv("SKILL_PRELOAD")
     _write(config_dir / "config.json", {"skill": {"maxContentBytes": 0}})
     with pytest.raises(ValueError, match="maxContentBytes"):
+        AppConfig.load(config_dir)
+
+
+def test_config_rejects_invalid_session_compaction(tmp_path, monkeypatch) -> None:
+    _clean_env(monkeypatch)
+    config_dir = tmp_path / "config"
+    _write(config_dir / "config.json", {"session": {"compaction": 123}})
+
+    with pytest.raises(ValueError, match="session.compaction"):
         AppConfig.load(config_dir)

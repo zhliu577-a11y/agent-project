@@ -2,17 +2,20 @@
   "model": "deepseek",
   "session": {
     "store": "jsonl",
-    "id": "default"
+    "id": "default",
+    "compaction": "rolling-summary"
   },
   "memory": {
-    "store": "sqlite"
+    "store": "sqlite",
+    "index": "lexical",
+    "policy": "default"
   },
   "embedding": {
     "provider": "debug"
   },
   "context": {
     "maxTokens": 20000,
-    "strategy": "tail-window"
+    "strategy": "memory-tail-window"
   },
   "mcp": {
     "preload": []

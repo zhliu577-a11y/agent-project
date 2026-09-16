@@ -1,4 +1,5 @@
 {
   "store": "jsonl",
-  "id": "default"
+  "id": "default",
+  "compaction": "rolling-summary"
 }

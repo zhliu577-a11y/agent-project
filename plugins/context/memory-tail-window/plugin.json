@@ -1,0 +1,14 @@
+{
+  "apiVersion": "1",
+  "name": "memory-tail-window",
+  "type": "context",
+  "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "context.v1",
+  "description": "Tail window with a bounded automatic recall contribution.",
+  "enabled": true,
+  "entry": {
+    "module": "policy.py",
+    "factory": "create_policy"
+  }
+}

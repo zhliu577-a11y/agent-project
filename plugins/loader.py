@@ -91,6 +91,7 @@ from config import (
     DEFAULT_SKILL_MAX_RESOURCES,
     AppConfig,
 )
+from core.compaction import CompactionPolicy
 from core.context import ContextPolicy
 from core.embedding import EmbeddingProvider
 from core.errors import AGENT_CATEGORIES, resolve_declared_error
@@ -103,7 +104,7 @@ from core.events import (
     coerce_subscriptions,
 )
 from core.hooks import HOOK_EVENTS, HookSpec, LifecycleHooks
-from core.memory import MemoryStore
+from core.memory import MemoryIndex, MemoryPolicy, MemoryStore
 from core.model import ModelAdapter, ModelMetadata, ModelRouter
 from core.session import SessionStore
 from core.tool import Tool
@@ -114,6 +115,11 @@ from plugins.protocol import (
     PLUGIN_PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
     capability_contract,
+)
+from plugins.services import (
+    PluginRequirement,
+    RuntimeServices,
+    validate_requirement,
 )
 
 logger = logging.getLogger(__name__)
@@ -156,6 +162,7 @@ class PluginManifest:
     api_version: str = MANIFEST_API_VERSION
     protocol_version: int = PLUGIN_PROTOCOL_VERSION
     contract: str = ""
+    requires: tuple[PluginRequirement, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -371,6 +378,28 @@ class ContextPlugin:
 
 
 @dataclass(frozen=True)
+class CompactionPlugin:
+    """A compaction policy selected by the runtime for persisted session history."""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> CompactionPolicy:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            policy = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: compaction factory failed: {exc}") from exc
+        _expect(
+            isinstance(policy, CompactionPolicy),
+            where,
+            "compaction factory must return a CompactionPolicy with an async compact() "
+            f"method, got {type(policy).__name__}",
+        )
+        return policy
+
+
+@dataclass(frozen=True)
 class SkillResource:
     """One validated, read-only document shipped with a Skill."""
 
@@ -429,6 +458,48 @@ class MemoryPlugin:
             f"记忆存储工厂必须返回 MemoryStore 实例，实际是 {type(store).__name__}",
         )
         return store
+
+
+@dataclass(frozen=True)
+class MemoryIndexPlugin:
+    """Derived-memory index plugin selected by MEMORY_INDEX."""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> MemoryIndex:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            index = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: memory index factory failed: {exc}") from exc
+        _expect(
+            isinstance(index, MemoryIndex),
+            where,
+            f"memory index factory must return MemoryIndex, got {type(index).__name__}",
+        )
+        return index
+
+
+@dataclass(frozen=True)
+class MemoryPolicyPlugin:
+    """Semantic-memory policy plugin selected by MEMORY_POLICY."""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> MemoryPolicy:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            policy = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: memory policy factory failed: {exc}") from exc
+        _expect(
+            isinstance(policy, MemoryPolicy),
+            where,
+            f"memory policy factory must return MemoryPolicy, got {type(policy).__name__}",
+        )
+        return policy
 
 
 @dataclass(frozen=True)
@@ -561,6 +632,7 @@ def _parse_manifest(path: Path) -> PluginManifest:
 
     errors = _parse_declared_errors(raw, where)
     events = _parse_declared_events(raw, where)
+    requires = _parse_requirements(raw, where)
     hook = _parse_hook_spec(raw, where) if kind == "hook" else None
     model = _parse_model_metadata(raw, where) if kind == "model" else None
 
@@ -580,6 +652,7 @@ def _parse_manifest(path: Path) -> PluginManifest:
         api_version=api_version,
         protocol_version=protocol_version,
         contract=contract,
+        requires=requires,
     )
 
 
@@ -743,6 +816,86 @@ def _parse_declared_events(raw: dict[str, Any], where: str) -> tuple[str, ...]:
     return tuple(declared)
 
 
+def _parse_requirements(
+    raw: dict[str, Any],
+    where: str,
+) -> tuple[PluginRequirement, ...]:
+    """Parse service dependency declarations from a manifest."""
+    items = raw.get("requires", [])
+    _expect(isinstance(items, list), where, "'requires' must be an array")
+
+    requirements: list[PluginRequirement] = []
+    seen: set[tuple[str, str | None, str | None]] = set()
+    for index, item in enumerate(items, start=1):
+        item_where = f"{where} requires[{index}]"
+        _expect(isinstance(item, dict), item_where, "dependency must be an object")
+
+        kind = item.get("kind")
+        _expect(
+            isinstance(kind, str) and bool(_NAME_RE.fullmatch(kind)),
+            item_where,
+            "dependency 'kind' must be a valid plugin kind",
+        )
+        _expect(
+            kind in _KIND_REGISTRY,
+            item_where,
+            f"unknown dependency kind: {kind!r}",
+        )
+
+        name = item.get("name")
+        _expect(
+            name is None or (isinstance(name, str) and bool(_NAME_RE.fullmatch(name))),
+            item_where,
+            "dependency 'name' must be null or a valid plugin name",
+        )
+
+        contract = item.get("contract")
+        _expect(
+            contract is None or (isinstance(contract, str) and bool(contract.strip())),
+            item_where,
+            "dependency 'contract' must be null or a non-empty string",
+        )
+
+        required = item.get("required", True)
+        _expect(isinstance(required, bool), item_where, "dependency 'required' must be bool")
+
+        inject = item.get("inject")
+        _expect(
+            inject is None or (isinstance(inject, str) and bool(inject.strip())),
+            item_where,
+            "dependency 'inject' must be null or a non-empty string",
+        )
+
+        requirement = PluginRequirement(
+            kind=kind,
+            name=name,
+            contract=contract,
+            required=required,
+            inject=inject,
+        )
+        validate_requirement(requirement, item_where)
+        key = (requirement.kind, requirement.name, requirement.inject)
+        _expect(key not in seen, item_where, "duplicate service dependency")
+        seen.add(key)
+        requirements.append(requirement)
+    return tuple(requirements)
+
+
+def _merge_requirements(
+    defaults: tuple[PluginRequirement, ...],
+    extra: tuple[PluginRequirement, ...],
+    where: str,
+) -> tuple[PluginRequirement, ...]:
+    merged = list(defaults)
+    seen = {(item.kind, item.name, item.inject) for item in defaults}
+    for requirement in extra:
+        key = (requirement.kind, requirement.name, requirement.inject)
+        _expect(key not in seen, where, "duplicate service dependency")
+        merged.append(requirement)
+        seen.add(key)
+    return tuple(merged)
+
+
 def _parse_declared_errors(raw: dict[str, Any], where: str) -> tuple[DeclaredError, ...]:
     """校验清单里的 errors 声明：code 唯一、category 合法、retryable 自洽。"""
     items = raw.get("errors", [])
@@ -859,6 +1012,7 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
 
     package_errors = _parse_declared_errors(raw, where)
     package_events = _parse_declared_events(raw, where)
+    package_requires = _parse_requirements(raw, where)
     items = raw.get("contributes")
     _expect(
         isinstance(items, list) and bool(items),
@@ -924,6 +1078,8 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
         errors = _merge_declared_errors(package_errors, item_errors, item_where)
         item_events = _parse_declared_events(item, item_where)
         events = _merge_declared_events(package_events, item_events, item_where)
+        item_requires = _parse_requirements(item, item_where)
+        requires = _merge_requirements(package_requires, item_requires, item_where)
         hook = _parse_hook_spec(item, item_where) if kind == "hook" else None
         model = _parse_model_metadata(item, item_where) if kind == "model" else None
         contributions.append(
@@ -945,6 +1101,7 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
                 api_version=MANIFEST_API_VERSION,
                 protocol_version=item_protocol_version,
                 contract=item_contract,
+                requires=requires,
             )
         )
         seen_ids.add(contribution_id)
@@ -1126,8 +1283,11 @@ def _validate_static_entry(manifest: PluginManifest) -> None:
         "tool",
         "model",
         "context",
+        "compaction",
         "session",
         "memory",
+        "memory-index",
+        "memory-policy",
         "embedding",
         "listener",
         "event-transport",
@@ -1330,7 +1490,11 @@ def _import_module(manifest: PluginManifest, module_path: Path):
     return module
 
 
-def _plugin_context(manifest: PluginManifest, config: AppConfig | None) -> PluginContext:
+def _plugin_context(
+    manifest: PluginManifest,
+    config: AppConfig | None,
+    services: RuntimeServices | None = None,
+) -> PluginContext:
     plugin_config = config.plugin_config(manifest.type, manifest.name) if config is not None else {}
     return PluginContext.create(
         name=manifest.name,
@@ -1341,6 +1505,8 @@ def _plugin_context(manifest: PluginManifest, config: AppConfig | None) -> Plugi
         contribution_id=manifest.contribution_id,
         protocol_version=manifest.protocol_version,
         contract=manifest.contract,
+        requires=manifest.requires,
+        services=services,
     )
 
 
@@ -1358,6 +1524,10 @@ def _call_plugin_factory(
 
     context_parameter = parameters.get("context") or parameters.get("ctx")
     subscriber_parameter = parameters.get("subscriber")
+    dependency_kwargs = _resolve_factory_dependencies(context, parameters)
+    if subscriber_parameter is not None:
+        dependency_kwargs["subscriber"] = subscriber
+
     if context_parameter is not None:
         positional = [
             parameter
@@ -1366,23 +1536,46 @@ def _call_plugin_factory(
             in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
         ]
         if context_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
-            if subscriber_parameter is not None:
-                return factory(context, subscriber=subscriber)
-            return factory(context)
+            return factory(context, **dependency_kwargs)
         if len(positional) == 1 and positional[0].name in {"context", "ctx"}:
-            if subscriber_parameter is not None:
-                return factory(context, subscriber=subscriber)
-            return factory(context)
-        if subscriber_parameter is not None:
-            return factory(
-                context.directory,
-                context=context,
-                subscriber=subscriber,
+            return factory(context, **dependency_kwargs)
+        return factory(context.directory, context=context, **dependency_kwargs)
+    return factory(context.directory, **dependency_kwargs)
+
+
+def _resolve_factory_dependencies(
+    context: PluginContext,
+    parameters: dict[str, inspect.Parameter],
+) -> dict[str, Any]:
+    """Resolve only dependencies explicitly requested by manifest requirements."""
+    if not context.requires:
+        return {}
+    if context.services is None:
+        required = [requirement for requirement in context.requires if requirement.required]
+        if required:
+            names = ", ".join(requirement.injection_name for requirement in required)
+            raise ValueError(
+                f"plugin {context.kind}/{context.name} requires runtime services: {names}"
             )
-        return factory(context.directory, context=context)
-    if subscriber_parameter is not None:
-        return factory(context.directory, subscriber=subscriber)
-    return factory(context.directory)
+        return {}
+
+    values: dict[str, Any] = {}
+    for requirement in context.requires:
+        injection_name = requirement.injection_name
+        if injection_name not in parameters:
+            continue
+        try:
+            values[injection_name] = context.services.require(
+                requirement.kind,
+                requirement.name,
+            )
+        except Exception as exc:
+            if requirement.required:
+                raise ValueError(
+                    f"cannot resolve dependency {requirement.kind}/"
+                    f"{requirement.name or '<selected>'} for {context.name}: {exc}"
+                ) from exc
+    return values
 
 
 def _load_entry_factory(manifest: PluginManifest, kind_label: str) -> Callable[[Path], Any]:
@@ -1423,12 +1616,13 @@ def _load_entry_factory(manifest: PluginManifest, kind_label: str) -> Callable[[
 def load_hook_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> LifecycleHooks:
     """加载单个钩子插件：调用清单声明的 factory(plugin_dir) 得到钩子实例。"""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
     factory = _load_entry_factory(manifest, "hook")
     try:
-        hook = _call_plugin_factory(factory, _plugin_context(manifest, config))
+        hook = _call_plugin_factory(factory, _plugin_context(manifest, config, services))
     except Exception as exc:
         raise ValueError(f"{where}: 工厂执行失败: {exc}") from exc
     _expect(
@@ -1479,6 +1673,7 @@ def _coerce_tools(value: Any, where: str) -> list[Tool]:
 def load_tool_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> list[Tool]:
     """加载单个工具插件，并把每个工具包上插件命名空间。"""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
@@ -1496,7 +1691,10 @@ def load_tool_plugin(
     else:
         factory = _load_entry_factory(manifest, "tool")
         try:
-            produced = _call_plugin_factory(factory, _plugin_context(manifest, config))
+            produced = _call_plugin_factory(
+                factory,
+                _plugin_context(manifest, config, services),
+            )
         except Exception as exc:
             raise ValueError(f"{where}: 工厂执行失败: {exc}") from exc
         tools = _coerce_tools(produced, where)
@@ -1507,10 +1705,11 @@ def load_tool_plugin(
 def load_model_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> ModelPlugin:
     """校验单个模型插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "model")
-    context = _plugin_context(manifest, config)
+    context = _plugin_context(manifest, config, services)
     return ModelPlugin(
         manifest=manifest,
         factory=lambda _directory: _call_plugin_factory(factory, context),
@@ -1521,10 +1720,11 @@ def load_model_plugin(
 def load_model_router_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> ModelRouterPlugin:
     """Validate one model-router plugin without instantiating its policy."""
     factory = _load_entry_factory(manifest, "model-router")
-    context = _plugin_context(manifest, config)
+    context = _plugin_context(manifest, config, services)
     return ModelRouterPlugin(
         manifest=manifest,
         factory=lambda _directory: _call_plugin_factory(factory, context),
@@ -1535,11 +1735,26 @@ def load_model_router_plugin(
 def load_context_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> ContextPlugin:
     """Validate a context policy plugin and keep its factory lazy."""
     factory = _load_entry_factory(manifest, "context")
-    context = _plugin_context(manifest, config)
+    context = _plugin_context(manifest, config, services)
     return ContextPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
+
+
+def load_compaction_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
+) -> CompactionPlugin:
+    """Validate a compaction policy plugin and keep its factory lazy."""
+    factory = _load_entry_factory(manifest, "compaction")
+    context = _plugin_context(manifest, config, services)
+    return CompactionPlugin(
         manifest=manifest,
         factory=lambda _directory: _call_plugin_factory(factory, context),
     )
@@ -1548,6 +1763,7 @@ def load_context_plugin(
 def load_skill_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> SkillPlugin:
     """校验单个技能插件、目录边界和内容预算，但不读取正文。"""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
@@ -1622,10 +1838,11 @@ def load_skill_plugin(
 def load_session_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> SessionPlugin:
     """校验单个会话存储插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "session")
-    context = _plugin_context(manifest, config)
+    context = _plugin_context(manifest, config, services)
     return SessionPlugin(
         manifest=manifest,
         factory=lambda _directory: _call_plugin_factory(factory, context),
@@ -1635,11 +1852,40 @@ def load_session_plugin(
 def load_memory_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> MemoryPlugin:
     """校验单个长期记忆插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "memory")
-    context = _plugin_context(manifest, config)
+    context = _plugin_context(manifest, config, services)
     return MemoryPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
+
+
+def load_memory_index_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
+) -> MemoryIndexPlugin:
+    """Validate a derived-memory index plugin without instantiating it."""
+    factory = _load_entry_factory(manifest, "memory-index")
+    context = _plugin_context(manifest, config, services)
+    return MemoryIndexPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
+
+
+def load_memory_policy_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
+) -> MemoryPolicyPlugin:
+    """Validate a semantic-memory policy plugin without instantiating it."""
+    factory = _load_entry_factory(manifest, "memory-policy")
+    context = _plugin_context(manifest, config, services)
+    return MemoryPolicyPlugin(
         manifest=manifest,
         factory=lambda _directory: _call_plugin_factory(factory, context),
     )
@@ -1648,10 +1894,11 @@ def load_memory_plugin(
 def load_embedding_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> EmbeddingPlugin:
     """校验单个嵌入提供方插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "embedding")
-    context = _plugin_context(manifest, config)
+    context = _plugin_context(manifest, config, services)
     return EmbeddingPlugin(
         manifest=manifest,
         factory=lambda _directory: _call_plugin_factory(factory, context),
@@ -1661,10 +1908,11 @@ def load_embedding_plugin(
 def load_listener_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> ListenerPlugin:
     """校验单个 listener 插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "listener")
-    context = _plugin_context(manifest, config)
+    context = _plugin_context(manifest, config, services)
 
     def create_listener(_directory: Path, subscriber: EventSubscriber | None = None):
         return _call_plugin_factory(factory, context, subscriber=subscriber)
@@ -1678,10 +1926,11 @@ def load_listener_plugin(
 def load_event_transport_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> EventTransportPlugin:
     """Validate one event transport plugin without starting its worker."""
     factory = _load_entry_factory(manifest, "event-transport")
-    context = _plugin_context(manifest, config)
+    context = _plugin_context(manifest, config, services)
     return EventTransportPlugin(
         manifest=manifest,
         factory=lambda _directory: _call_plugin_factory(factory, context),
@@ -1784,6 +2033,20 @@ def load_context_plugins(
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
+def load_compaction_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
+) -> list[CompactionPlugin]:
+    """Load enabled compaction policy plugins without instantiating them."""
+    plugins: list[CompactionPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "compaction":
+            continue
+        plugins.append(load_compaction_plugin(manifest, config))
+        logger.info("compaction policy plugin discovered: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
 def load_skill_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
     config: AppConfig | None = None,
@@ -1815,27 +2078,59 @@ def load_session_plugins(
 def load_memory_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> list[MemoryPlugin]:
     """加载插件目录里全部启用的长期记忆插件（惰性，不实例化）。"""
     plugins: list[MemoryPlugin] = []
     for manifest in discover_plugins(root):
         if manifest.type != "memory":
             continue
-        plugins.append(load_memory_plugin(manifest, config))
+        plugins.append(load_memory_plugin(manifest, config, services))
         logger.info("长期记忆插件已发现: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
+def load_memory_index_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
+) -> list[MemoryIndexPlugin]:
+    """Load enabled derived-memory index plugins without instantiating them."""
+    plugins: list[MemoryIndexPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "memory-index":
+            continue
+        plugins.append(load_memory_index_plugin(manifest, config, services))
+        logger.info("memory index plugin discovered: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
+def load_memory_policy_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
+) -> list[MemoryPolicyPlugin]:
+    """Load enabled semantic-memory policy plugins without instantiating them."""
+    plugins: list[MemoryPolicyPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "memory-policy":
+            continue
+        plugins.append(load_memory_policy_plugin(manifest, config, services))
+        logger.info("memory policy plugin discovered: %s", manifest.name)
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
 def load_embedding_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> list[EmbeddingPlugin]:
     """加载插件目录里全部启用的嵌入提供方插件（惰性，不实例化）。"""
     plugins: list[EmbeddingPlugin] = []
     for manifest in discover_plugins(root):
         if manifest.type != "embedding":
             continue
-        plugins.append(load_embedding_plugin(manifest, config))
+        plugins.append(load_embedding_plugin(manifest, config, services))
         logger.info("嵌入提供方插件已发现: %s", manifest.name)
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
@@ -1881,9 +2176,12 @@ class PluginAssembly:
     models: list[ModelPlugin] = field(default_factory=list)
     model_routers: list[ModelRouterPlugin] = field(default_factory=list)
     contexts: list[ContextPlugin] = field(default_factory=list)
+    compactions: list[CompactionPlugin] = field(default_factory=list)
     skills: list[SkillPlugin] = field(default_factory=list)
     sessions: list[SessionPlugin] = field(default_factory=list)
     memories: list[MemoryPlugin] = field(default_factory=list)
+    memory_indexes: list[MemoryIndexPlugin] = field(default_factory=list)
+    memory_policies: list[MemoryPolicyPlugin] = field(default_factory=list)
     embeddings: list[EmbeddingPlugin] = field(default_factory=list)
     listeners: list[ListenerPlugin] = field(default_factory=list)
     event_transports: list[EventTransportPlugin] = field(default_factory=list)
@@ -1920,6 +2218,14 @@ def _apply_context(
     assembly.contexts.append(plugin)
 
 
+def _apply_compaction(
+    assembly: PluginAssembly,
+    manifest: PluginManifest,
+    plugin: CompactionPlugin,
+) -> None:
+    assembly.compactions.append(plugin)
+
+
 def _apply_skill(assembly: PluginAssembly, manifest: PluginManifest, plugin: SkillPlugin) -> None:
     assembly.skills.append(plugin)
 
@@ -1932,6 +2238,22 @@ def _apply_session(
 
 def _apply_memory(assembly: PluginAssembly, manifest: PluginManifest, plugin: MemoryPlugin) -> None:
     assembly.memories.append(plugin)
+
+
+def _apply_memory_index(
+    assembly: PluginAssembly,
+    manifest: PluginManifest,
+    plugin: MemoryIndexPlugin,
+) -> None:
+    assembly.memory_indexes.append(plugin)
+
+
+def _apply_memory_policy(
+    assembly: PluginAssembly,
+    manifest: PluginManifest,
+    plugin: MemoryPolicyPlugin,
+) -> None:
+    assembly.memory_policies.append(plugin)
 
 
 def _apply_embedding(
@@ -1962,9 +2284,12 @@ register_kind(KindHandler("tool", load_tool_plugin, _apply_tool))
 register_kind(KindHandler("model", load_model_plugin, _apply_model))
 register_kind(KindHandler("model-router", load_model_router_plugin, _apply_model_router))
 register_kind(KindHandler("context", load_context_plugin, _apply_context))
+register_kind(KindHandler("compaction", load_compaction_plugin, _apply_compaction))
 register_kind(KindHandler("skill", load_skill_plugin, _apply_skill))
 register_kind(KindHandler("session", load_session_plugin, _apply_session))
 register_kind(KindHandler("memory", load_memory_plugin, _apply_memory))
+register_kind(KindHandler("memory-index", load_memory_index_plugin, _apply_memory_index))
+register_kind(KindHandler("memory-policy", load_memory_policy_plugin, _apply_memory_policy))
 register_kind(KindHandler("embedding", load_embedding_plugin, _apply_embedding))
 register_kind(KindHandler("listener", load_listener_plugin, _apply_listener))
 register_kind(
@@ -2002,6 +2327,7 @@ def attach_listener_plugins(
 def assemble_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
     config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
 ) -> PluginAssembly:
     """扫描目录并把全部 enabled contribution 按 kind 装配成 PluginAssembly。
 
@@ -2019,7 +2345,12 @@ def assemble_plugins(
         except (TypeError, ValueError):
             loader_parameters = {}
         if "config" in loader_parameters:
-            payload = handler.load(manifest, config=config)
+            if "services" in loader_parameters:
+                payload = handler.load(manifest, config=config, services=services)
+            else:
+                payload = handler.load(manifest, config=config)
+        elif "services" in loader_parameters:
+            payload = handler.load(manifest, services=services)
         else:
             payload = handler.load(manifest)
         handler.apply(assembly, manifest, payload)

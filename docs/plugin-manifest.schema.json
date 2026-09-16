@@ -29,13 +29,43 @@
         "model",
         "model-router",
         "context",
+        "compaction",
         "skill",
         "session",
         "memory",
+        "memory-index",
+        "memory-policy",
         "embedding",
         "listener",
         "event-transport"
       ]
+    },
+    "requirement": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/capabilityKinds"
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "contract": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*\\.v[0-9]+$"
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        },
+        "inject": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        }
+      }
     },
     "modelMetadata": {
       "type": "object",
@@ -161,6 +191,12 @@
         },
         "model": {
           "$ref": "#/$defs/modelMetadata"
+        },
+        "requires": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/requirement"
+          }
         }
       },
       "allOf": [
@@ -246,6 +282,12 @@
               },
               "model": {
                 "$ref": "#/$defs/modelMetadata"
+              },
+              "requires": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/requirement"
+                }
               }
             }
           },
