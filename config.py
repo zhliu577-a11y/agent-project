@@ -6,6 +6,8 @@
 #   config/session.json  session selection
 #   config/memory.json   memory selection
 #   config/embedding.json
+#   config/event.json
+#   config/event_transport.json
 #   config/context.json
 #   config/mcp.json
 #   config/skill.json
@@ -31,6 +33,8 @@ DEFAULT_SKILL_MAX_RESOURCES = 32
 DEFAULT_SKILL_MAX_RESOURCE_BYTES = 256 * 1024
 DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES = 1024 * 1024
 _SECTION_FILES = {
+    "event": "event.json",
+    "event_transport": "event_transport.json",
     "model": "model.json",
     "session": "session.json",
     "memory": "memory.json",
@@ -43,6 +47,8 @@ _SECTION_FILES = {
 
 @dataclass(frozen=True)
 class AppConfig:
+    event_transport: str = "in-process"
+    event_handler_timeout: float | None = None
     model: str = "deepseek"
     model_fallback: tuple[str, ...] = ()
     model_routes: tuple[tuple[str, tuple[str, ...]], ...] = ()
@@ -77,9 +83,26 @@ class AppConfig:
         context = cls._nested(raw, "context")
         mcp = cls._nested(raw, "mcp")
         skill = cls._nested(raw, "skill")
+        event = cls._nested(raw, "event")
+        event_transport = cls._nested(raw, "event_transport")
         model_options = cls._nested(raw, "_model_options")
 
         return cls(
+            event_transport=os.getenv(
+                "EVENT_TRANSPORT",
+                os.getenv(
+                    "EVENT_BUS",
+                    _expect_str(
+                        event_transport.get("provider", "in-process"),
+                        "event_transport.provider",
+                    ),
+                ),
+            ),
+            event_handler_timeout=_load_optional_positive_float(
+                event.get("handlerTimeout"),
+                os.getenv("EVENT_HANDLER_TIMEOUT"),
+                "event.handlerTimeout",
+            ),
             model=os.getenv("AGENT_MODEL", _expect_str(raw.get("model", "deepseek"), "model")),
             model_fallback=_load_model_name_list(
                 model_options.get("fallback", []),
@@ -157,6 +180,11 @@ class AppConfig:
             ),
             config_dir=config_path.parent.resolve(),
         )
+
+    @property
+    def event_bus(self) -> str:
+        """Backward-compatible alias; the value is now an event transport."""
+        return self.event_transport
 
     def plugin_config(self, kind: str, name: str) -> dict[str, Any]:
         """Return one plugin's private config by contribution kind and name."""
@@ -314,6 +342,24 @@ def _load_positive_int(configured: Any, env_value: str | None, key: str) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
         raise ValueError(f"config: '{key}' must be a positive integer")
     return raw
+
+
+def _load_optional_positive_float(
+    configured: Any,
+    env_value: str | None,
+    key: str,
+) -> float | None:
+    raw = env_value if env_value is not None else configured
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str) and env_value is not None:
+        try:
+            raw = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"config: '{key}' must be a positive number") from exc
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        raise ValueError(f"config: '{key}' must be a positive number")
+    return float(raw)
 
 
 def _load_model_name_list(

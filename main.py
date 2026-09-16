@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 
 from config import AppConfig
 from core.context import ContextPolicy
-from core.events import Event, EventBus
+from core.events import Event, EventGateway, EventIdentity
+from core.hooks import PromptRequest
 from core.state import capture
 from core.tracing import begin_trace, setup_logging
 from core.types import Message
@@ -26,18 +27,25 @@ async def chat(
     history: list[Message] | None = None,
     session: SessionGateway | None = None,
     max_context_tokens: int = 20000,
-    events: EventBus | None = None,
+    events: EventGateway | None = None,
     context_policy: ContextPolicy | None = None,
 ) -> list[Message]:
     """交互循环；返回本会话最终历史（不含 system），供持久化/恢复。"""
     logger.info("对话已启动，输入 exit / quit / 退出 结束。")
     history = list(history or [])
     session_id = session.session_id if session is not None else None
+    publisher = events.publisher(EventIdentity.host("cli")) if events is not None else None
 
     async def _publish(name: str, **payload: object) -> None:
-        if events is None:
+        if publisher is None:
             return
-        await events.publish(Event(name=name, payload=dict(payload)))
+        await publisher.publish(
+            Event(
+                name=name,
+                payload=dict(payload),
+                session_id=session_id,
+            )
+        )
 
     await _publish("session.start", session_id=session_id)
 
@@ -60,14 +68,15 @@ async def chat(
 
         streamed["active"] = False
         begin_trace()
-        if events is not None:
-            decision = await events.decide(
-                Event("user_prompt.submit", {"session_id": session_id, "text": user_input})
-            )
-            if decision != "allow":
-                logger.warning("用户输入被事件总线策略拦截: %s", decision)
-                print(f"[bus] 本轮输入被策略拦截({decision})")
-                continue
+        allowed = await hooks.user_prompt_submit(
+            PromptRequest(text=user_input, session_id=session_id)
+        )
+        if not allowed:
+            await _publish("user_prompt.rejected", session_id=session_id)
+            logger.warning("用户输入被控制面策略拦截")
+            print("[policy] 本轮输入未通过策略检查")
+            continue
+        await _publish("user_prompt.accepted", session_id=session_id)
         ctx = await run_agent(
             model,
             tools,

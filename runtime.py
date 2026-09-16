@@ -6,7 +6,7 @@ from typing import Any
 
 from config import AppConfig
 from core.context import ContextPolicy
-from core.events import Event, EventBus, jsonl_sink
+from core.events import Event, EventGateway, EventIdentity, jsonl_sink
 from core.hooks import HookGateway
 from core.model import ModelAdapter, ModelRouter
 from core.prompt import build_system_prompt
@@ -118,7 +118,7 @@ class HarnessRuntime:
         self._ready = False
 
         self.hooks = HookGateway()
-        self.events = EventBus()
+        self.events: EventGateway | None = None
         self.tools = ToolRegistry()
         self.model: ModelAdapter | None = None
         self.models: ModelGateway | None = None
@@ -144,6 +144,7 @@ class HarnessRuntime:
         try:
             self._prepare_external_statuses()
             self._assembly = self._assemble_plugins()
+            self._create_event_transport()
             self._setup_events()
             await self._create_model()
             self._create_context_policy()
@@ -156,6 +157,7 @@ class HarnessRuntime:
             await self._preload_mcp_plugins()
             await self._lifecycle.start_all()
             await self._build_system_prompt()
+            await self._require_events().flush()
             self._ready = True
             logger.info(
                 "Runtime 已就绪：插件包 %d 个，工具 %d 个，MCP 插件 %d 个",
@@ -173,6 +175,11 @@ class HarnessRuntime:
             return
         self._closed = True
         self._ready = False
+        if self.events is not None:
+            try:
+                await self.events.flush()
+            except Exception:
+                logger.exception("event bus flush failed during shutdown")
         self._close_listener_subscriptions()
         await self._lifecycle.stop_all()
         if self.models is not None:
@@ -368,9 +375,13 @@ class HarnessRuntime:
             self._plugin_states[key] = replace(state, status="error", error=str(exc))
 
     def _setup_events(self) -> None:
+        events = self._require_events()
         event_log = os.getenv("EVENT_LOG")
         if event_log:
-            self.events.subscribe("*", jsonl_sink(event_log))
+            events.subscriber(EventIdentity.host("event-log")).subscribe(
+                "*",
+                jsonl_sink(event_log),
+            )
             logger.info("事件总线日志已启用: %s", event_log)
         for manifest, hook in self._assembly.hooks:
             try:
@@ -384,13 +395,46 @@ class HarnessRuntime:
             except Exception as exc:
                 logger.exception("hook plugin %s setup failed", manifest.name)
                 self._mark_manifest_error(manifest, exc)
-        self.hooks.attach(self.events)
+        self.hooks.attach(events)
         for listener in self._assembly.listeners:
             try:
-                self._listener_tokens.extend(attach_listener_plugins(self.events, [listener]))
+                self._listener_tokens.extend(attach_listener_plugins(events, [listener]))
             except Exception as exc:
                 logger.exception("listener 插件 %s 接入失败", listener.manifest.name)
                 self._mark_manifest_error(listener.manifest, exc)
+
+    def _create_event_transport(self) -> None:
+        available = [candidate.manifest.name for candidate in self._assembly.event_transports]
+        plugin = next(
+            (
+                candidate
+                for candidate in self._assembly.event_transports
+                if candidate.manifest.name == self.config.event_transport
+            ),
+            None,
+        )
+        if plugin is None:
+            raise RuntimeStartupError(
+                "unknown event transport plugin: "
+                f"{self.config.event_transport}; available: {available}"
+            )
+        try:
+            transport = plugin.create()
+            self.events = EventGateway(
+                transport=transport,
+                handler_timeout=self.config.event_handler_timeout,
+            )
+            self._track_plugin(plugin.manifest, transport)
+        except Exception as exc:
+            self._mark_manifest_error(plugin.manifest, exc)
+            raise RuntimeStartupError(
+                f"event transport plugin {self.config.event_transport} initialization failed: {exc}"
+            ) from exc
+
+    def _require_events(self) -> EventGateway:
+        if self.events is None:
+            raise RuntimeStartupError("event gateway is not initialized")
+        return self.events
 
     async def _create_model(self) -> None:
         available = [candidate.manifest.name for candidate in self._assembly.models]
@@ -511,7 +555,10 @@ class HarnessRuntime:
             raise RuntimeStartupError(
                 f"长期记忆插件 {self.config.memory_store} 初始化失败: {exc}"
             ) from exc
-        self.memory = MemoryGateway(store, events=self.events)
+        self.memory = MemoryGateway(
+            store,
+            events=self._require_events().publisher(EventIdentity.host("memory-gateway")),
+        )
 
     def _register_tools(self) -> None:
         self.tools = ToolRegistry()
@@ -528,7 +575,12 @@ class HarnessRuntime:
             max_resource_bytes=self.config.skill_max_resource_bytes,
             max_resource_total_bytes=self.config.skill_max_resource_total_bytes,
         )
-        self.tools.register(UseSkill(self.skills, events=self.events))
+        self.tools.register(
+            UseSkill(
+                self.skills,
+                events=self._require_events().publisher(EventIdentity.host("skill-gateway")),
+            )
+        )
         if self.memory is None:
             raise RuntimeStartupError("长期记忆网关未初始化")
         self.tools.register(RememberTool(self.memory))
@@ -593,13 +645,17 @@ class HarnessRuntime:
                     f"{total_bytes} > {self.config.skill_max_preload_bytes} bytes"
                 )
             preloads.append((name, content))
-            await self.events.publish(
-                Event(
-                    "skill.preloaded",
-                    {
-                        "name": name,
-                        "bytes": size,
-                    },
+            await (
+                self._require_events()
+                .publisher(EventIdentity.host("runtime"))
+                .publish(
+                    Event(
+                        "skill.preloaded",
+                        {
+                            "name": name,
+                            "bytes": size,
+                        },
+                    )
                 )
             )
 
@@ -645,6 +701,7 @@ def _merge_assemblies(target: PluginAssembly, source: PluginAssembly) -> None:
     target.memories.extend(source.memories)
     target.embeddings.extend(source.embeddings)
     target.listeners.extend(source.listeners)
+    target.event_transports.extend(source.event_transports)
     target.contributions.extend(source.contributions)
     target.hooks.sort(key=lambda pair: (pair[0].priority, pair[0].name))
 

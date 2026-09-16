@@ -1,88 +1,76 @@
-# ADR 0006：事件总线 UNBOX（观察广播 + 决策折叠）
+# ADR 0006: Observation event bus
 
-- 状态：已采纳（分两阶段落地）
-- 日期：2026-09-10
-- 前置：ADR 0001（插件与网关）、`core/hooks.py`、`core/tracing.py`
+- Status: superseded by ADR 0015
+- Date: 2026-09-10
+- Updated: 2026-09-16
+- Depends on: ADR 0001 (plugin gateways), `core/hooks.py`, `core/tracing.py`
+- Follow-up: ADR 0015 (EventGateway and pluggable event transport)
 
-## 背景
+## Context
 
-目前系统里只有 HookGateway 的 5 个写死事件（turn/llm/tool 前后），且只对 hook
-插件开放。想把“会话开始”“模型请求”“记忆写入”“工具被拒”等事实告诉其它模块
-（tracing、audit、API/前端、未来的多 Agent），只能改内核或绕道 hook。
+The core originally exposed only typed hook calls. Audit, tracing, UI updates,
+timeline projections, and future agents also need to observe facts such as
+turn start, model response, tool completion, memory writes, and session
+lifecycle without coupling publishers to subscribers.
 
-需要一个**进程内的发布/订阅总线**：发布者不知道订阅者，订阅者按需接入。
+## Decision
 
-## 决策
-
-### 1. 事件是结构化数据
+Events are observation-only structured facts:
 
 ```python
-Event(name="tool.after", payload={"ctx": …, "tool_call": …, "ok": True},
-      trace_id="ab12cd34", ts="2026-09-10T12:00:00+00:00")
+Event(
+    name="tool.after",
+    payload={"ctx": ..., "tool_call": ..., "result": ..., "ok": True},
+    trace_id="ab12cd34",
+)
 ```
 
-- 名称用 `<域>.<动作>` 命名（`turn.start`、`model.request`、`tool.after`…）；
-- payload 携带对象引用（内核内部使用）；落盘/日志时由 sink 做安全转换与截断。
+Event names use `<domain>.<action>`. Payloads may carry in-process objects;
+serialization sinks apply their own safe conversion and size limits.
 
-### 2. 两类语义，严格区分
+### Observation delivery
 
-| 类型 | API | 规则 |
-|---|---|---|
-| 观察类 | `publish(event)` | 只读广播；异常隔离；不允许改变流程；支持 `subscribe("*")` |
-| 决策类 | `decide(event) -> allow/ask/deny` | 汇总订阅者表态，按 `deny > ask > allow` 折叠；异常按 deny |
+`publish(event)` means:
 
-决策类事件（如 `tool.before`、`user_prompt.submit`）**必须**由内核采纳结果；
-观察类事件**禁止**成为隐式控制流。
+- the publisher does not know or wait for subscribers;
+- no subscriber can change the publisher's return value;
+- subscriber failure or timeout cannot break the agent loop;
+- wildcard subscriptions are allowed;
+- delivery may be queued and delayed.
 
-### 3. 与 HookGateway 的演进关系（不并行两套）
+### Control plane
 
-分两阶段，避免破坏既有决策语义：
+The event bus does **not** carry allow/ask/deny decisions. Control calls must
+return synchronously:
 
-- **阶段一（本期）**：总线作为观察层落地；loop 把 `turn.start / model.response /
-  tool.after / turn.end` 发布到总线，`HookGateway.attach(bus)` 订阅这些事件并
-  扇出给现有 hook 插件（旧插件零迁移）；**决策类 `tool.before` 仍由
-  HookGateway 直接承担**（ask-once 语义保持在内核）；
-- **阶段二（未来）**：把决策类事件也迁到 `bus.decide`，HookGateway 成为纯适配
-  订阅者；迁移前提是事件 payload 稳定且有回归测试兜底。
+| Concern | Direct owner |
+|---|---|
+| User prompt admission | `HookGateway.user_prompt_submit()` |
+| Tool permission | `HookGateway.tool_before()` |
+| Model call | `ModelAdapter.complete()` |
+| Tool call | `ToolRegistry.execute()` |
+| Session/memory/context | Their gateway or policy object |
 
-### 4. 新增事件清单（阶段一）
+After a decision, the system may publish observations such as
+`user_prompt.accepted`, `user_prompt.rejected`, or `tool.denied`.
 
-| 事件 | 类型 | 发布点 |
-|---|---|---|
-| `turn.start` / `turn.end` | 观察（同时桥接 hook） | loop |
-| `model.request` / `model.response` / `model.error` | 观察 | loop |
-| `tool.after` | 观察（同时桥接 hook） | loop（含被拒工具） |
-| `tool.denied` | 观察 | loop |
-| `memory.write` / `memory.update` / `memory.delete` | 观察 | MemoryGateway |
-| `session.start` / `session.end` | 观察 | CLI / API |
-| `user_prompt.submit` | **决策** | CLI / API（deny 即拒绝本轮） |
+## Event examples
 
-### 5. 落盘与调试
+| Event | Publisher |
+|---|---|
+| `turn.start` / `turn.end` | agent loop |
+| `model.request` / `model.response` / `model.error` | agent loop |
+| `tool.start` / `tool.after` / `tool.denied` | agent loop |
+| `memory.write` / `memory.update` / `memory.delete` | memory gateway |
+| `skill.loaded` / `skill.preloaded` / `skill.resource_loaded` | skill runtime |
+| `session.start` / `session.end` | CLI or future API |
+| `user_prompt.accepted` / `user_prompt.rejected` | CLI or future API |
 
-- 设置 `EVENT_LOG=<path>` 时订阅 `*`，把事件写成 JSONL（payload 安全转换 + 截断），
-  为前端时间线与未来回放打基础；
-- 事件默认带当前 `trace_id`，与日志追踪一致。
+## Boundaries
 
-## 边界
-
-- 进程内总线，不做跨进程消息队列；
-- 不做回放引擎（先记录，后评估）；
-- 观察类处理器不得抛错影响主流程（异常隔离 + 日志）；
-- 订阅顺序按 `(priority, 注册顺序)`，与 HookGateway 一致。
-
-## 落地清单
-
-1. `core/events.py`：`Event` / `EventBus` / `Decision` / JSONL sink；
-2. `HookGateway.attach(bus)`：观察事件 → 现有 hook 扇出；
-3. `loop.run_agent(events=…)`：发布阶段一事件；未传 bus 时行为与现在完全一致；
-4. `main.py` / `api/main.py`：创建总线、挂 sink、发布 session 事件、
-   `user_prompt.submit` 决策；
-5. `MemoryGateway(events=…)`：发布记忆写/改/删事件；
-6. 测试（顺序/隔离/折叠/trace/桥接/loop 事件序列/记忆事件）+ 文档。
-
-落地记录（阶段一已完成）：
-
-- `core/events.py` + HookGateway 桥接 + loop/main/api 发布点 + MemoryGateway 事件；
-- listener kind（`plugins/listeners/timeline` 示例）：订阅者插件化，
-  `events` 声明校验、决策类事件拒绝订阅、退订令牌预留；
-- 回归 149 tests，ruff clean。
+- Observation subscribers never control the main execution path.
+- The event bus is not a service locator or request/response bus.
+- Event history, cursors, replay, and projections belong to a separate
+  EventStore.
+- Multi-agent task dispatch, replies, acknowledgements, and retries belong to
+  a future MessageBus, not this observation bus.

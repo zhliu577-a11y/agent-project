@@ -1,0 +1,15 @@
+{
+  "apiVersion": "1",
+  "name": "tool-metrics",
+  "type": "listener",
+  "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "listener.v1",
+  "description": "Track tool success, failure, and denial counts in a JSON summary.",
+  "enabled": true,
+  "events": ["tool.after", "tool.denied"],
+  "entry": {
+    "module": "listener.py",
+    "factory": "create_listener"
+  }
+}

@@ -2,6 +2,7 @@
 import asyncio
 import logging
 from collections.abc import Callable
+from uuid import uuid4
 
 from core.context import (
     ContextPolicy,
@@ -12,7 +13,7 @@ from core.context import (
     valid_tool_call_sequence,
 )
 from core.errors import RetryableError, classify_error
-from core.events import Event, EventBus
+from core.events import Event, EventGateway, EventIdentity
 from core.hooks import ConfirmFn, HookGateway
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
@@ -36,7 +37,7 @@ async def run_agent(
     on_token: Callable[[str], None] | None = None,
     history: list[Message] | None = None,
     confirm: ConfirmFn | None = None,
-    events: EventBus | None = None,
+    events: EventGateway | None = None,
     context_policy: ContextPolicy | None = None,
     max_context_tokens: int = 20000,
     session_id: str | None = None,
@@ -54,14 +55,25 @@ async def run_agent(
     ctx.messages.append(Message(role="user", content=user_input))
     ctx.state.setdefault("fail_counts", {})  # 工具名 -> 连续失败次数
     ctx.state.setdefault("blocked_tools", set())  # 已禁用的工具名集合
+    run_id = uuid4().hex
+    publisher = events.publisher(EventIdentity.host("agent-loop")) if events is not None else None
 
     if events is not None:
         hooks.attach(events)  # 旧 hook 插件通过总线桥接，行为不变
 
     async def _emit(name: str, **payload: object) -> None:
-        if events is None:
+        if publisher is None:
             return
-        await events.publish(Event(name=name, payload=dict(payload), trace_id=current_trace_id()))
+        await publisher.publish(
+            Event(
+                name=name,
+                payload=dict(payload),
+                trace_id=current_trace_id(),
+                session_id=session_id,
+                run_id=run_id,
+                turn_id=str(ctx.turn),
+            )
+        )
 
     async def _end_turn() -> None:
         if events is None:

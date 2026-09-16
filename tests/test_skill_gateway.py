@@ -191,12 +191,14 @@ async def test_use_skill_publishes_load_events(tmp_path) -> None:
     await tool.execute(name="review")
     await tool.execute(name="review", resource="references/security.md")
     await tool.execute(name="review", resource="references/security.md")
+    await bus.flush()
 
     assert [event.name for event in events] == [
         "skill.loaded",
         "skill.resource_loaded",
     ]
     assert events[0].payload["bytes"] == len("# 评审正文".encode())
+    await bus.stop()
 
 
 @pytest.mark.asyncio

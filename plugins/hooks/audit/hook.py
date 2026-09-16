@@ -3,7 +3,7 @@
 # 一个 hook 插件 = 实现 LifecycleHooks 的类 + 工厂函数 create_hook(plugin_dir)。
 # 工厂收到插件自己的目录，因此配置、日志等文件都可以随插件走。
 #
-# 本示例演示了五个生命周期事件中的四个：
+# 本示例演示了部分生命周期事件：
 #   - llm_response ：模型每次回复后观察（记录回复摘要与请求了哪些工具）
 #   - tool_before  ：工具执行前观察（返回 False 即可拒绝该工具，与 permission 同为权限闸门）
 #   - tool_after   ：工具执行后记录结果

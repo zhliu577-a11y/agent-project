@@ -1,9 +1,18 @@
 # tests/test_events.py —— 事件总线：顺序、折叠、追踪、落盘与桥接
+import asyncio
 import json
 
 import pytest
 
-from core.events import Event, EventBus, jsonl_sink
+from core.events import (
+    Event,
+    EventBus,
+    EventGateway,
+    EventIdentity,
+    EventScope,
+    EventTransport,
+    jsonl_sink,
+)
 from core.hooks import HookGateway, LifecycleHooks
 from core.memory import MemoryNote, MemoryStore
 from core.model import ModelAdapter
@@ -27,8 +36,10 @@ async def test_publish_respects_priority_and_supports_sync_handlers() -> None:
 
     bus.subscribe("demo", async_handler, priority=10)
     await bus.publish(Event("demo"))
+    await bus.flush()
 
     assert order == ["early", "late", "sync"]
+    await bus.stop()
 
 
 @pytest.mark.asyncio
@@ -43,7 +54,9 @@ async def test_publish_isolates_handler_exceptions() -> None:
     bus.subscribe("demo", lambda event: seen.append("after"))
 
     await bus.publish(Event("demo"))  # 不抛出
+    await bus.flush()
     assert seen == ["after"]
+    await bus.stop()
 
 
 @pytest.mark.asyncio
@@ -53,34 +66,60 @@ async def test_wildcard_subscription_receives_all_events() -> None:
     bus.subscribe("*", lambda event: names.append(event.name))
     await bus.publish(Event("a"))
     await bus.publish(Event("b"))
+    await bus.flush()
     assert names == ["a", "b"]
+    await bus.stop()
 
 
 @pytest.mark.asyncio
-async def test_decide_folds_deny_over_ask_over_allow() -> None:
+async def test_subscription_scope_filters_run_and_session() -> None:
+    names: list[str] = []
     bus = EventBus()
-    bus.subscribe("gate", lambda event: None, priority=1)  # 弃权
-    bus.subscribe("gate", lambda event: "allow", priority=2)
-    bus.subscribe("gate", lambda event: "ask", priority=3)
-    assert await bus.decide(Event("gate")) == "ask"
+    bus.subscribe(
+        "tool.after",
+        lambda event: names.append(event.name),
+        scope=EventScope(session_id="s1", run_id="r1"),
+    )
 
-    bus.subscribe("gate", lambda event: "deny", priority=4)
-    assert await bus.decide(Event("gate")) == "deny"
+    await bus.publish(Event("tool.after", session_id="s1", run_id="r2"))
+    await bus.publish(Event("tool.after", session_id="s2", run_id="r1"))
+    await bus.publish(Event("tool.after", session_id="s1", run_id="r1"))
+    await bus.flush()
+
+    assert names == ["tool.after"]
+    await bus.stop()
 
 
 @pytest.mark.asyncio
-async def test_decide_treats_exception_and_invalid_vote_as_deny() -> None:
-    bus = EventBus()
+async def test_drop_newest_reports_overflow_without_blocking_publisher() -> None:
+    seen: list[str] = []
+    release = asyncio.Event()
+    started = asyncio.Event()
+    bus = EventBus(queue_size=1, overflow="drop_newest")
 
-    def boom(event) -> str:
-        raise RuntimeError("坏订阅者")
+    async def blocking_handler(event) -> None:
+        seen.append(event.payload["id"])
+        started.set()
+        await release.wait()
 
-    bus.subscribe("gate", boom)
-    assert await bus.decide(Event("gate")) == "deny"
+    bus.subscribe("demo", blocking_handler)
+    await bus.publish(Event("demo", {"id": "one"}))
+    await started.wait()
+    await bus.publish(Event("demo", {"id": "two"}))
+    await bus.publish(Event("demo", {"id": "three"}))
 
-    other = EventBus()
-    other.subscribe("gate", lambda event: "maybe")
-    assert await other.decide(Event("gate")) == "deny"
+    assert bus.dropped_events == 1
+    release.set()
+    await bus.flush()
+    assert seen == ["one", "two"]
+    await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_gateway_is_observation_only() -> None:
+    gateway = EventGateway()
+    assert not hasattr(gateway, "decide")
+    await gateway.stop()
 
 
 @pytest.mark.asyncio
@@ -91,7 +130,83 @@ async def test_event_gets_trace_id_from_context() -> None:
 
     begin_trace("trace-x")
     await bus.publish(Event("demo"))
+    await bus.flush()
     assert seen == ["trace-x"]
+    await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_gateway_binds_trusted_publisher_identity() -> None:
+    gateway = EventGateway()
+    trusted = EventIdentity.host("memory-gateway")
+    seen = []
+    gateway.subscribe("memory.write", lambda event: seen.append(event))
+
+    await gateway.publisher(trusted).publish(
+        Event(
+            "memory.write",
+            publisher=EventIdentity.host("forged-publisher"),
+        )
+    )
+    await gateway.flush()
+
+    assert seen[0].publisher == trusted
+    assert seen[0].publisher.subject == "host:memory-gateway"
+    await gateway.stop()
+
+
+@pytest.mark.asyncio
+async def test_subscriber_view_queries_only_its_own_subscriptions() -> None:
+    gateway = EventGateway()
+    first = gateway.subscriber(EventIdentity.host("first"))
+    second = gateway.subscriber(EventIdentity.host("second"))
+    first.subscribe("demo.one", lambda event: None)
+    first.subscribe("demo.two", lambda event: None)
+    second.subscribe("demo.one", lambda event: None)
+
+    own = first.subscriptions()
+    assert [(item.event, item.owner.subject) for item in own] == [
+        ("demo.one", "host:first"),
+        ("demo.two", "host:first"),
+    ]
+    assert len(gateway.subscriptions()) == 3
+    assert first.subscriber_count("demo.one") == 1
+    assert gateway.subscriber_count("demo.one") == 2
+    await gateway.stop()
+
+
+@pytest.mark.asyncio
+async def test_gateway_routes_while_transport_only_moves_events() -> None:
+    class RecordingTransport(EventTransport):
+        def __init__(self) -> None:
+            self.dispatch = None
+            self.sent: list[str] = []
+
+        def bind(self, dispatch):
+            self.dispatch = dispatch
+
+        async def send(self, event):
+            self.sent.append(event.name)
+            assert self.dispatch is not None
+            await self.dispatch(event)
+
+        async def flush(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    transport = RecordingTransport()
+    gateway = EventGateway(transport=transport)
+    seen: list[str] = []
+    gateway.subscribe("demo", lambda event: seen.append(event.name))
+
+    await gateway.publish(Event("demo"))
+
+    assert transport.sent == ["demo"]
+    assert seen == ["demo"]
+    assert gateway.subscriptions()[0].event == "demo"
+    await gateway.stop()
 
 
 @pytest.mark.asyncio
@@ -101,6 +216,7 @@ async def test_jsonl_sink_writes_safe_payload(tmp_path) -> None:
     bus.subscribe("*", jsonl_sink(log_path))
 
     await bus.publish(Event("demo", {"text": "你好", "obj": object()}))
+    await bus.flush()
 
     lines = log_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
@@ -108,6 +224,7 @@ async def test_jsonl_sink_writes_safe_payload(tmp_path) -> None:
     assert record["name"] == "demo"
     assert record["payload"]["text"] == "你好"
     assert isinstance(record["payload"]["obj"], str)
+    await bus.stop()
 
 
 class RecordingHooks(LifecycleHooks):
@@ -144,9 +261,11 @@ async def test_hook_gateway_bridges_observation_events() -> None:
         Event("tool.after", {"ctx": None, "tool_call": None, "result": "x", "ok": True})
     )
     await bus.publish(Event("turn.end", {"ctx": None}))
+    await bus.flush()
 
     assert (recording.turn_starts, recording.llm_responses) == (1, 1)
     assert (recording.tool_afters, recording.turn_ends) == (1, 1)
+    await bus.stop()
 
 
 class EchoTool(Tool):
@@ -185,6 +304,7 @@ async def test_loop_publishes_events_and_still_runs_hooks() -> None:
     )
 
     ctx = await run_agent(model, tools, hooks, "系统", "执行", events=bus)
+    await bus.flush()
 
     assert ctx.stop_reason == "done"
     for expected in (
@@ -201,6 +321,7 @@ async def test_loop_publishes_events_and_still_runs_hooks() -> None:
     assert recording.llm_responses == 2
     assert recording.tool_afters == 1
     assert recording.turn_ends == 2
+    await bus.stop()
 
 
 class QuickStore(MemoryStore):
@@ -244,5 +365,7 @@ async def test_memory_gateway_publishes_write_events() -> None:
     note = await gateway.remember("项目用 ruff", tags=["project"])
     await gateway.update(note.id, content="项目用 ruff（2026）")
     await gateway.forget(note.id)
+    await bus.flush()
 
     assert names == ["memory.write", "memory.update", "memory.delete"]
+    await bus.stop()

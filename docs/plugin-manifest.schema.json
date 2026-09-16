@@ -33,7 +33,8 @@
         "session",
         "memory",
         "embedding",
-        "listener"
+        "listener",
+        "event-transport"
       ]
     },
     "modelMetadata": {

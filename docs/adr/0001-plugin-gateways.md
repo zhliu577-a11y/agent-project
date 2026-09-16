@@ -32,9 +32,9 @@ loop 通过 `use_server` 让模型逐台加载服务器。扩展一个新能力�
 
 ### 2. 钩子网关（HookGateway）
 
-- `core/hooks.HookGateway` 是内核唯一钩子入口：按注册顺序扇出
-  turn/llm/tool 生命周期事件，异常隔离；`tool_before` 决策采用
-  “任一拒绝即拒绝、异常按拒绝处理”。
+- `core/hooks.HookGateway` 是内核唯一控制面与钩子入口：按注册顺序扇出
+  prompt/turn/llm/tool 生命周期事件，异常隔离；控制面决策按
+  `deny > ask > allow` 折叠，异常按策略 fail-closed。
 - 钩子插件契约：`entry.module + entry.factory`，加载器动态导入并调用
   `factory(plugin_dir)`，要求返回 `LifecycleHooks`。
 
@@ -44,6 +44,8 @@ loop 通过 `use_server` 让模型逐台加载服务器。扩展一个新能力�
   同优先级按名字典序装配，保证跨启动稳定；
 - `tool_before` 的返回从布尔升级为三方表态 `allow / ask / deny`；网关收集
   **全部**钩子表态后按 `deny > ask > allow` 折叠（对齐 dsh hook outcome 语义）；
+- `user_prompt_submit` 在用户输入进入 agent loop 前执行同样的三方决策折叠，
+  控制面结果由 HookGateway 直接返回，不经过观察事件总线；
 - 不做“首个拒绝即短路”，让审计类钩子也能看到被拒尝试；
 - 折叠结果为 `ask` 时只向用户确认一次（`confirm` 可注入以便测试/非交互环境）；
 - 钩子异常按该钩子表态 `deny` 处理，继续评估其余钩子。
@@ -93,5 +95,5 @@ DeepSeek Harness 为每个 MCP Server 实例化一个 client 插件。该模型�
 - 命名空间变化使既有权限规则需要按新工具名重写（已随 permission 插件更新）；
 - 进程内网关意味着 MCP 子进程仍在 Agent 进程内派生，进程隔离弱于代理进程
   （见备选 A）；
-- 钩子目前只覆盖 loop 内五个时机，尚无用户输入提交前等更细拦截点
-  （Roadmap）。
+- 钩子覆盖用户输入提交前与 loop 内五个时机；会话开始/结束等更细拦截点
+  仍可在 Roadmap 继续扩展。

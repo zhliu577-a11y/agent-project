@@ -94,7 +94,14 @@ from config import (
 from core.context import ContextPolicy
 from core.embedding import EmbeddingProvider
 from core.errors import AGENT_CATEGORIES, resolve_declared_error
-from core.events import EventBus, Subscription, coerce_subscriptions
+from core.events import (
+    EventGateway,
+    EventIdentity,
+    EventSubscriber,
+    EventTransport,
+    Subscription,
+    coerce_subscriptions,
+)
 from core.hooks import HOOK_EVENTS, HookSpec, LifecycleHooks
 from core.memory import MemoryStore
 from core.model import ModelAdapter, ModelMetadata, ModelRouter
@@ -450,12 +457,18 @@ class ListenerPlugin:
     """事件订阅者插件：清单 + 惰性工厂，返回 Subscription 列表接入事件总线。"""
 
     manifest: PluginManifest
-    factory: Callable[[Path], Any]
+    factory: Callable[..., Any]
 
-    def create(self) -> tuple[Subscription, ...]:
+    def create(
+        self,
+        subscriber: EventSubscriber | None = None,
+    ) -> tuple[Subscription, ...]:
         where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
         try:
-            value = self.factory(self.manifest.directory)
+            value = self.factory(
+                self.manifest.directory,
+                subscriber=subscriber,
+            )
         except Exception as exc:
             raise ValueError(f"{where}: listener 工厂执行失败: {exc}") from exc
         subscriptions = coerce_subscriptions(value, where)
@@ -468,6 +481,27 @@ class ListenerPlugin:
                         f"清单声明: {sorted(declared)}"
                     )
         return subscriptions
+
+
+@dataclass(frozen=True)
+class EventTransportPlugin:
+    """A lazily validated implementation of the event-transport.v1 contract."""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> EventTransport:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            transport = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: event transport factory failed: {exc}") from exc
+        _expect(
+            isinstance(transport, EventTransport),
+            where,
+            f"event transport factory must return EventTransport, got {type(transport).__name__}",
+        )
+        return transport
 
 
 def _expect(condition: bool, where: str, message: str) -> None:
@@ -1096,6 +1130,7 @@ def _validate_static_entry(manifest: PluginManifest) -> None:
         "memory",
         "embedding",
         "listener",
+        "event-transport",
         "model-router",
     }:
         _validate_python_module_entry(manifest)
@@ -1312,6 +1347,8 @@ def _plugin_context(manifest: PluginManifest, config: AppConfig | None) -> Plugi
 def _call_plugin_factory(
     factory: Callable[..., Any],
     context: PluginContext,
+    *,
+    subscriber: EventSubscriber | None = None,
 ) -> Any:
     """Call old one-argument factories and new context-aware factories."""
     try:
@@ -1320,6 +1357,7 @@ def _call_plugin_factory(
         return factory(context.directory)
 
     context_parameter = parameters.get("context") or parameters.get("ctx")
+    subscriber_parameter = parameters.get("subscriber")
     if context_parameter is not None:
         positional = [
             parameter
@@ -1328,10 +1366,22 @@ def _call_plugin_factory(
             in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
         ]
         if context_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+            if subscriber_parameter is not None:
+                return factory(context, subscriber=subscriber)
             return factory(context)
         if len(positional) == 1 and positional[0].name in {"context", "ctx"}:
+            if subscriber_parameter is not None:
+                return factory(context, subscriber=subscriber)
             return factory(context)
+        if subscriber_parameter is not None:
+            return factory(
+                context.directory,
+                context=context,
+                subscriber=subscriber,
+            )
         return factory(context.directory, context=context)
+    if subscriber_parameter is not None:
+        return factory(context.directory, subscriber=subscriber)
     return factory(context.directory)
 
 
@@ -1615,7 +1665,24 @@ def load_listener_plugin(
     """校验单个 listener 插件并返回惰性工厂（不在此处实例化）。"""
     factory = _load_entry_factory(manifest, "listener")
     context = _plugin_context(manifest, config)
+
+    def create_listener(_directory: Path, subscriber: EventSubscriber | None = None):
+        return _call_plugin_factory(factory, context, subscriber=subscriber)
+
     return ListenerPlugin(
+        manifest=manifest,
+        factory=create_listener,
+    )
+
+
+def load_event_transport_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+) -> EventTransportPlugin:
+    """Validate one event transport plugin without starting its worker."""
+    factory = _load_entry_factory(manifest, "event-transport")
+    context = _plugin_context(manifest, config)
+    return EventTransportPlugin(
         manifest=manifest,
         factory=lambda _directory: _call_plugin_factory(factory, context),
     )
@@ -1790,6 +1857,20 @@ def load_listener_plugins(
 # ---------- kind 注册表与统一装配 ----------
 
 
+def load_event_transport_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
+) -> list[EventTransportPlugin]:
+    """Load enabled event transport implementations without starting them."""
+    plugins: list[EventTransportPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "event-transport":
+            continue
+        plugins.append(load_event_transport_plugin(manifest, config))
+        logger.info("event transport plugin discovered: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
 @dataclass
 class PluginAssembly:
     """一次装配的结果：按 kind 归好类的插件产物，交给对应网关/注册表。"""
@@ -1805,6 +1886,7 @@ class PluginAssembly:
     memories: list[MemoryPlugin] = field(default_factory=list)
     embeddings: list[EmbeddingPlugin] = field(default_factory=list)
     listeners: list[ListenerPlugin] = field(default_factory=list)
+    event_transports: list[EventTransportPlugin] = field(default_factory=list)
     contributions: list[PluginContribution] = field(default_factory=list)
 
 
@@ -1866,6 +1948,14 @@ def _apply_listener(
 
 # kind 注册表：受信任的核心代码在这里声明每类 contribution 的
 # load/apply 契约。普通插件清单只能引用已注册的 kind。
+def _apply_event_transport(
+    assembly: PluginAssembly,
+    manifest: PluginManifest,
+    plugin: EventTransportPlugin,
+) -> None:
+    assembly.event_transports.append(plugin)
+
+
 register_kind(KindHandler("hook", load_hook_plugin, _apply_hook))
 register_kind(KindHandler("mcp", load_mcp_plugin, _apply_mcp))
 register_kind(KindHandler("tool", load_tool_plugin, _apply_tool))
@@ -1877,22 +1967,32 @@ register_kind(KindHandler("session", load_session_plugin, _apply_session))
 register_kind(KindHandler("memory", load_memory_plugin, _apply_memory))
 register_kind(KindHandler("embedding", load_embedding_plugin, _apply_embedding))
 register_kind(KindHandler("listener", load_listener_plugin, _apply_listener))
+register_kind(
+    KindHandler(
+        "event-transport",
+        load_event_transport_plugin,
+        _apply_event_transport,
+    )
+)
 
 SUPPORTED_KINDS = registered_kinds()
 
 
 def attach_listener_plugins(
-    bus: EventBus, listeners: list[ListenerPlugin]
+    gateway: EventGateway,
+    listeners: list[ListenerPlugin],
 ) -> list[Callable[[], None]]:
     """把 listener 插件订阅到事件总线，返回退订函数列表（热卸载预留）。"""
     tokens: list[Callable[[], None]] = []
     for plugin in listeners:
-        for subscription in plugin.create():
+        subscriber = gateway.subscriber(EventIdentity.plugin(plugin.manifest))
+        for subscription in plugin.create(subscriber):
             tokens.append(
-                bus.subscribe(
+                subscriber.subscribe(
                     subscription.event,
                     subscription.handler,
                     priority=subscription.priority,
+                    scope=subscription.scope,
                 )
             )
         logger.info("listener 插件已接入事件总线: %s", plugin.manifest.name)

@@ -17,8 +17,8 @@
   （事件名 + handler + priority，与 HookGateway 同一套顺序规则）；
 - `events` 声明本插件会订阅的事件（`"*"` 表示全部）；工厂返回未声明的事件会
   启动即报错；
-- **决策类事件**（如 `user_prompt.submit`）不允许 listener 订阅——需要影响流程
-  请写 hook 插件（`tool_before` 那套契约）；
+- listener 只观察事件，不能影响主流程；控制面使用 `HookGateway` 的
+  `user_prompt_submit` / `tool_before` 契约；
 - 订阅者在主流程内被直接调用：保持轻量，重活自己丢后台任务。
 
 ## 用途

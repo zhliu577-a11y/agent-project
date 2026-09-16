@@ -1,0 +1,14 @@
+{
+  "apiVersion": "1",
+  "name": "in-process",
+  "type": "event-transport",
+  "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "event-transport.v1",
+  "description": "Bounded asynchronous in-process event transport.",
+  "enabled": true,
+  "entry": {
+    "module": "transport.py",
+    "factory": "create_transport"
+  }
+}

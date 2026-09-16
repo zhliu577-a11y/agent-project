@@ -5,7 +5,7 @@
 from typing import Any
 
 from core.errors import ToolError, boundary
-from core.events import Event, EventBus
+from core.events import Event, EventPublisher
 from core.memory import MemoryNote, MemoryStore
 from core.tool import Tool
 from core.tracing import current_trace_id
@@ -14,7 +14,7 @@ from core.tracing import current_trace_id
 class MemoryGateway:
     """长期记忆网关：跨会话语义笔记的增删查。"""
 
-    def __init__(self, store: MemoryStore, events: EventBus | None = None) -> None:
+    def __init__(self, store: MemoryStore, events: EventPublisher | None = None) -> None:
         self._store = store
         self._events = events
 

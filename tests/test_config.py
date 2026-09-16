@@ -7,6 +7,8 @@ import pytest
 from config import DEFAULT_CONFIG_PATH, AppConfig
 
 _CONFIG_KEYS = (
+    "EVENT_TRANSPORT",
+    "EVENT_HANDLER_TIMEOUT",
     "AGENT_MODEL",
     "SESSION_STORE",
     "SESSION_ID",
@@ -48,6 +50,7 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
         config_dir / "config.json",
         {
             "model": "legacy",
+            "event_transport": {"provider": "custom-transport"},
             "session": {"store": "jsonl", "id": "shared"},
             "memory": {"store": "sqlite"},
             "embedding": {"provider": "debug"},
@@ -57,6 +60,8 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
         },
     )
     _write(config_dir / "model.json", {"model": "openai"})
+    _write(config_dir / "event.json", {"handlerTimeout": 2.5})
+    _write(config_dir / "event_transport.json", {"provider": "in-process"})
     _write(config_dir / "session.json", {"store": "inmemory", "id": "cli"})
     _write(config_dir / "memory.json", {"store": "jsonl"})
     _write(config_dir / "embedding.json", {"provider": "openai-embedding"})
@@ -77,6 +82,8 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     config = AppConfig.load(config_dir)
 
     assert config.model == "openai"
+    assert config.event_transport == "in-process"
+    assert config.event_handler_timeout == 2.5
     assert config.session_store == "inmemory"
     assert config.session_id == "cli"
     assert config.memory_store == "jsonl"
@@ -93,12 +100,16 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     assert config.config_dir == config_dir.resolve()
 
     monkeypatch.setenv("AGENT_MODEL", "deepseek")
+    monkeypatch.setenv("EVENT_TRANSPORT", "custom-transport")
+    monkeypatch.setenv("EVENT_HANDLER_TIMEOUT", "3.5")
     monkeypatch.setenv("CONTEXT_STRATEGY", "tail-window")
     monkeypatch.setenv("MCP_PRELOAD", "filesystem")
     monkeypatch.setenv("SKILL_PRELOAD", "commit-message")
     monkeypatch.setenv("SKILL_MAX_CONTENT_BYTES", "3000")
     config = AppConfig.load(config_dir)
     assert config.model == "deepseek"
+    assert config.event_transport == "custom-transport"
+    assert config.event_handler_timeout == 3.5
     assert config.context_strategy == "tail-window"
     assert config.mcp_preload == ("filesystem",)
     assert config.skill_preload == ("commit-message",)
@@ -173,6 +184,8 @@ def test_config_missing_file_uses_defaults(tmp_path, monkeypatch) -> None:
     _clean_env(monkeypatch)
     config = AppConfig.load(tmp_path / "not-exists.json")
     assert config.model == "deepseek"
+    assert config.event_transport == "in-process"
+    assert config.event_handler_timeout is None
     assert config.session_store == "jsonl"
     assert config.memory_store == "sqlite"
     assert config.context_max_tokens == 20000

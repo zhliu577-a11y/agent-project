@@ -2,7 +2,7 @@
 #
 # listener 插件契约：工厂接收插件目录，返回 core.events.Subscription 列表
 # （事件名 + handler + priority）。loader 会把它们注册进事件总线；
-# 决策类事件（如 user_prompt.submit）不允许 listener 订阅——那里走 hook 契约。
+# listener 只观察事件，不能影响主流程；控制面走 HookGateway 契约。
 import json
 from pathlib import Path
 

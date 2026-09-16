@@ -17,7 +17,7 @@
 
 - 读取 `PluginManager` 的 enabled records；
 - 分别装配内置插件和每个外部插件包；
-- 创建 HookGateway、EventBus、Model、Session、Memory、SkillGateway、McpGateway
+- 创建 HookGateway、EventGateway、Model、Session、Memory、SkillGateway、McpGateway
   和 ToolRegistry；
 - 暴露 `start()`、`close()`、`ready` 与 JSON-safe 的 `snapshot()`；
 - 把外部包的实际运行结果写回 `PluginManager`。

@@ -14,13 +14,15 @@
 - 固定异步 agent loop（调模型 → 执行工具 → 回填 → 判断结束），支持流式输出与多个工具的并行执行
 - **插件目录（drop-in）**：`plugins/` 下每个插件是一个自包含目录 + `plugin.json`，
   拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model`、`model-router`、
-  `skill`、`session`、`memory`、`embedding`、`listener`、`context` 十一类
+  `skill`、`session`、`memory`、`embedding`、`listener`、`event-transport`、`context`
+  十二类
 - **功能包**：一个包可用 `contributes[]` 同时提供 skill、hook、tool 等能力，
   发现阶段统一展开为 contribution 后按受控 kind 注册表装配
 - **MCP 网关**：Agent 只面向网关这一个通道；网关统一维护各 MCP 插件的连接、
   会话、命名与清理，工具名带命名空间（`<插件名>__<工具名>`）
-- **钩子网关**：生命周期钩子全部插件化（`turn_start / llm_response /
-  tool_before / tool_after / turn_end`），内核只面向 `HookGateway`
+- **钩子网关**：生命周期钩子全部插件化（`user_prompt_submit / turn_start /
+  llm_response / tool_before / tool_after / turn_end`），控制面只面向
+  `HookGateway`
 - **本地工具插件**：高频轻量能力以进程内 Python 函数提供（`plugins/tools/*`），
   启动即注册，无子进程、无挂载步骤
 - **外部工具运行时**：`tool` 插件也可声明 `runtime: node | process` 和
@@ -142,8 +144,12 @@ plugins/
 ├── context/                    # 上下文策略插件（可切换模型请求视图）
 │   ├── tail-window/            #   默认：保留 system 与最新完整消息组
 │   └── summary-window/         #   旧消息抽取摘要 + 保留最新完整消息组
+├── event_transports/           # 事件总线实现
+│   ├── in-process/             #   有界异步队列（默认）
+│   └── inline/                 #   当前任务内立即分发
 ├── listeners/                  # 事件订阅者插件（接入事件总线）
-│   └── timeline/               #   把事件写成 JSONL 时间线（示例）
+│   ├── timeline/               #   把事件写成 JSONL 时间线（示例）
+│   └── tool-metrics/           #   汇总工具调用结果（示例）
 └── hooks/                      # 生命周期钩子插件
     └── permission/             #   权限策略示例（allow/ask/deny）
         ├── plugin.json
@@ -169,7 +175,7 @@ plugins/
 
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
 `mcp` / `hook` / `tool` / `model` / `skill` / `session` / `memory` / `embedding` /
-`listener` / `context`；
+`listener` / `event-transport` / `context`；
 `apiVersion` 固定为 `"1"`，`protocolVersion` 当前为 `1`，`contract` 必须与
 `<type>.v<protocolVersion>` 一致（例如 `mcp.v1`、`tool.v1`）；
 `enabled: false` 的插件
@@ -645,6 +651,7 @@ $env:CONTEXT_STRATEGY="summary-window"
 
 | 事件 | 时机 | 说明 |
 |---|---|---|
+| `user_prompt_submit` | 用户输入进入 loop 前 | 控制面闸门，表态 `allow / ask / deny` |
 | `turn_start` | 每轮开始时 | 可注入状态 |
 | `llm_response` | 模型回复后 | 观察/记录模型输出 |
 | `tool_before` | 工具执行前 | 表态 `allow / ask / deny`（权限闸门） |
@@ -655,8 +662,11 @@ $env:CONTEXT_STRATEGY="summary-window"
 
 - 全部钩子按 `(priority, 注册顺序)` 升序执行，同优先级保持加入次序，稳定可预测；
   权限/安全类闸门建议用较小的 `priority`（先表态）；
-- `tool_before` 让**所有**钩子表态后按 `deny > ask > allow` 折叠，不做“首个拒绝
-  即短路”，这样审计类钩子也能看到被拒的尝试；
+- `user_prompt_submit` 和 `tool_before` 让**所有**钩子表态后按
+  `deny > ask > allow` 折叠，不做“首个拒绝即短路”，这样审计类钩子也能看到
+  被拒的尝试；
+- `matcher` 对 `tool_before` 匹配工具名，对 `user_prompt_submit` 匹配
+  `session_id`；
 - 折叠结果是 `ask` 时，网关只向用户确认一次（不会因多个钩子要 ask 而重复弹窗）；
 - 钩子抛异常视为该钩子表态 `deny`（安全侧默认拒绝），但不阻断其余钩子表态。
 
@@ -750,32 +760,42 @@ Skill 的宿主预载和内容预算由 `config/skill.json` 管理。
 
 ### 事件总线（UNBOX）
 
-进程内发布/订阅总线（`core/events.py`），两类事件语义严格区分：
+`EventGateway` 是宿主核心服务，负责逻辑订阅表、通配符和 scope 过滤、
+优先级、身份绑定、订阅者超时与异常隔离；`event-transport.v1` 插件只负责
+实际投递。`HarnessRuntime` 根据 `config/event_transport.json` 的 `provider`
+选择传输实现，默认实现位于 `plugins/event_transports/in-process/`。
 
-| 类型 | API | 规则 |
-|---|---|---|
-| 观察类 | `bus.publish(event)` | 只读广播、异常隔离、支持 `subscribe("*")` |
-| 决策类 | `bus.decide(event)` | 汇总 `allow/ask/deny`，按 `deny > ask > allow` 折叠，异常按 deny |
+- `publisher.publish(event)`：观察类事件，提交给 transport，不等待订阅者；
+- `subscriber.subscribe(name, handler, priority=..., scope=...)`：返回退订令牌；
+- `flush()` / `stop()`：测试、关闭和持久化落盘前等待排队事件送达。
 
-阶段一（当前）：
+总线是**观察旁路，不是主执行路径**。模型调用、工具调用、MCP、Session、
+Memory、权限判断和上下文压缩都保持直接调用；`user_prompt_submit` 与
+`tool_before` 由 `HookGateway` 直接返回控制结果。事件只在发布后继续执行、
+允许延迟、允许订阅者失败时使用。
 
-- loop 发布 `turn.start / model.request / model.response / model.error /
-  tool.start / tool.after / tool.denied / turn.end`；
-- `HookGateway.attach(bus)` 订阅观察事件并扇出给现有 hook 插件（**旧插件零迁移**），
-  决策类 `tool.before` 仍由 HookGateway 直接承担；
-- `MemoryGateway` 发布 `memory.write / memory.update / memory.delete`；
-- CLI 发布 `session.start / session.end`，并在每轮输入前用
-  `user_prompt.submit` 决策事件（返回 `deny` 即拒绝本轮）；
-- 设置 `EVENT_LOG=<path>` 时自动订阅 `*`，把事件写成 JSONL 时间线。
+观察订阅者按 `(priority, 注册顺序)` 顺序执行，单个订阅者异常或超时不会
+影响其他订阅者和 agent loop。队列溢出策略由 transport 插件配置：
 
-第三方模块接入只需要一次订阅，不用改内核：
-
-```python
-from core.events import Event, EventBus
-
-bus = EventBus()
-bus.subscribe("tool.after", lambda event: print(event.name, event.payload["ok"]))
+```json
+{
+  "queueSize": 1024,
+  "overflow": "block"
+}
 ```
+
+订阅者超时属于 Gateway，配置位于 `config/event.json`：
+
+```json
+{
+  "handlerTimeout": null
+}
+```
+
+`Event` 现在包含 `event_id / session_id / run_id / turn_id / agent_id /
+causation_id / correlation_id / publisher`。发布者身份由 Host 根据已验证
+manifest 或 Host 服务生成，插件不能伪造。订阅可以用 `EventScope` 限定到
+某个 Session、Run 或 Agent，为后续多 Agent 隔离事件流做准备。
 
 **listener 插件（`type: "listener"`）**：把“订阅”本身也做成插件——
 
@@ -788,10 +808,29 @@ bus.subscribe("tool.after", lambda event: print(event.name, event.payload["ok"])
 }
 ```
 
-工厂返回 `core.events.Subscription(event, handler, priority)` 列表，loader 在
-启动时把它们注册进总线（订阅了清单未声明的事件、或订阅决策类事件，启动即报错），
-并返回退订令牌（为将来的热卸载预留）。**决策类事件不允许 listener 订阅**——
-需要影响流程请写 hook 插件。完整示例见 `plugins/listeners/timeline/`。
+工厂返回 `core.events.Subscription(event, handler, priority, scope)` 列表。
+loader 在启动时注册订阅，并拒绝 manifest 未声明的事件。需要查询自身身份或订阅情况时，工厂可以声明
+`subscriber=None` 参数接收能力视图；它只能看到自己的 identity、
+`subscriptions()` 和 `subscriber_count(name)`，不能读取 Gateway 全表。
+完整示例见 `plugins/listeners/timeline/` 和 `plugins/listeners/tool-metrics/`。
+
+**event-transport 插件（`type: "event-transport"`）**：
+
+```json
+{
+  "name": "in-process",
+  "type": "event-transport",
+  "contract": "event-transport.v1",
+  "entry": { "module": "transport.py", "factory": "create_transport" }
+}
+```
+
+工厂必须返回 `core.events.EventTransport`。transport 只接收事件和调用 Host
+回调，不持有订阅表。安装外部实现后，只需把
+`config/event_transport.json` 的 `provider` 改成插件名，或用 `EVENT_TRANSPORT=<name>` 覆盖。
+内置的 `in-process` 使用异步队列，`inline` 则在当前调用任务中立即分发。
+`HarnessRuntime.events` 在 `start()` 完成后才可用；启动阶段事件应通过 listener
+插件或 `EVENT_LOG` 订阅。
 
 ### 权限策略（`plugins/hooks/permission/permission.json`）
 
@@ -898,6 +937,8 @@ discover -> validate -> negotiate -> load -> instantiate
 ```text
 config/
 ├── config.json
+├── event.json
+├── event_transport.json
 ├── model.json
 ├── session.json
 ├── memory.json
@@ -918,6 +959,6 @@ config/
 - 网页前端：拖入目录/zip 后调用同一个 `PluginManager`，展示校验结果与启停状态
 - 插件更新与热重载：版本替换、运行时卸载与错误回滚
 - 远程 HTTP MCP 插件（`transport: "http"` + URL + 服务器级信任）
-- 钩子事件扩展（用户输入提交前、会话开始/结束等，对齐 Codex/Claude Code 拦截点）
+- 钩子事件扩展（会话开始/结束等，对齐 Codex/Claude Code 拦截点）
 - 长期记忆插件（`type: "memory"`：跨会话语义笔记 + recall 注入）
 - MCP 网关进程化：把 `McpGateway` 换成独立代理进程/远程网关客户端（同一窄接口）

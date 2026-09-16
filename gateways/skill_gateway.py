@@ -15,7 +15,7 @@ from config import (
     DEFAULT_SKILL_MAX_RESOURCE_BYTES,
     DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES,
 )
-from core.events import Event, EventBus
+from core.events import Event, EventPublisher
 from core.tool import Tool
 from plugins.loader import SkillPlugin
 
@@ -179,7 +179,7 @@ class UseSkill(Tool):
         "按需读取一个技能插件的完整操作说明或附属资源；收到正文后请按其中的规则/清单执行当前任务。"
     )
 
-    def __init__(self, gateway: SkillGateway, events: EventBus | None = None) -> None:
+    def __init__(self, gateway: SkillGateway, events: EventPublisher | None = None) -> None:
         self._gateway = gateway
         self._events = events
 

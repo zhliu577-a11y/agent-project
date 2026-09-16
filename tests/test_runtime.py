@@ -1,10 +1,10 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from config import AppConfig
-from core.events import Event
 from plugins.manager import PluginManager
 from runtime import HarnessRuntime, RuntimeStartupError
 
@@ -80,6 +80,14 @@ def create_policy(plugin_dir):
     return TailWindowPolicy()
 """
 
+_EVENT_TRANSPORT_MODULE = """
+from core.events import InProcessTransport
+
+
+def create_transport(plugin_dir):
+    return InProcessTransport()
+"""
+
 _MODEL_ROUTER_MODULE = """
 from core.model import ModelRouteDecision, ModelRouter
 
@@ -146,6 +154,17 @@ def _write_builtin(
 
 
 def _write_builtins(root: Path) -> None:
+    _write_builtin(
+        root,
+        "event_transports",
+        "in-process",
+        {
+            "name": "in-process",
+            "type": "event-transport",
+            "entry": {"module": "transport.py", "factory": "create_transport"},
+        },
+        {"transport.py": _EVENT_TRANSPORT_MODULE},
+    )
     _write_builtin(
         root,
         "model",
@@ -343,8 +362,23 @@ async def test_runtime_loads_enabled_package_and_records_status(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_runtime_rejects_unknown_event_transport(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+    runtime = HarnessRuntime(
+        replace(_config(), event_transport="missing"),
+        plugin_manager=_manager(tmp_path),
+    )
+
+    with pytest.raises(RuntimeStartupError, match="unknown event transport plugin"):
+        await runtime.start()
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_preloads_only_host_selected_skills(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("EVENT_LOG", raising=False)
+    event_log = tmp_path / "events.jsonl"
+    monkeypatch.setenv("EVENT_LOG", str(event_log))
     manager = _manager(tmp_path)
     manager.install(_write_skill_package(tmp_path / "source", legacy_preload=True))
     manager.enable("quality")
@@ -352,8 +386,6 @@ async def test_runtime_preloads_only_host_selected_skills(tmp_path, monkeypatch)
         _config(skill_preload=("quality--lint",)),
         plugin_manager=manager,
     )
-    events: list[Event] = []
-    runtime.events.subscribe("*", events.append)
 
     async with runtime:
         snapshot = runtime.snapshot()
@@ -364,7 +396,8 @@ async def test_runtime_preloads_only_host_selected_skills(tmp_path, monkeypatch)
         assert status.loaded is True
         assert status.bytes > 0
         assert "# lint" in runtime.system_prompt
-        assert [event.name for event in events] == ["skill.preloaded"]
+        records = [json.loads(line) for line in event_log.read_text(encoding="utf-8").splitlines()]
+        assert [record["name"] for record in records] == ["skill.preloaded"]
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 # tests/test_hooks.py —— 钩子网关：执行顺序、决策折叠与 ask-once 语义
 import pytest
 
-from core.hooks import HookGateway, LifecycleHooks
+from core.hooks import HookGateway, LifecycleHooks, PromptRequest
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
 from core.tool import Tool
@@ -21,6 +21,10 @@ class Recording(LifecycleHooks):
 
     async def turn_start(self, ctx) -> None:
         self._trace.append(f"start:{self._name}")
+
+    async def user_prompt_submit(self, request):
+        self._trace.append(f"prompt:{self._name}")
+        return self._decision
 
     async def tool_before(self, ctx, tool_call):
         self._trace.append(f"before:{self._name}")
@@ -44,6 +48,48 @@ async def test_hooks_execute_by_priority_then_registration_order() -> None:
 
     await gateway.turn_start(_ctx())
     assert trace == ["start:early", "start:middle-a", "start:middle-b", "start:late"]
+
+
+async def test_user_prompt_deny_wins_and_all_policies_see_the_request() -> None:
+    trace: list[str] = []
+    gateway = HookGateway()
+    gateway.add(Recording("gate", trace, decision="deny"), priority=10)
+    gateway.add(Recording("audit", trace), priority=100)
+
+    allowed = await gateway.user_prompt_submit(PromptRequest("hello", session_id="s1"))
+
+    assert allowed is False
+    assert trace == ["prompt:gate", "prompt:audit"]
+
+
+async def test_user_prompt_ask_confirms_once() -> None:
+    gateway = HookGateway()
+    gateway.add(Recording("policy-a", [], decision="ask"))
+    gateway.add(Recording("policy-b", [], decision="ask"))
+    confirmations: list[str] = []
+
+    async def confirm(request) -> bool:
+        confirmations.append(request.text)
+        return True
+
+    allowed = await gateway.user_prompt_submit(
+        PromptRequest("hello", session_id="s1"),
+        confirm=confirm,
+    )
+
+    assert allowed is True
+    assert confirmations == ["hello"]
+
+
+async def test_user_prompt_policy_exception_fails_closed() -> None:
+    class Exploding(LifecycleHooks):
+        async def user_prompt_submit(self, request):
+            raise RuntimeError("boom")
+
+    gateway = HookGateway()
+    gateway.add(Exploding())
+
+    assert await gateway.user_prompt_submit(PromptRequest("hello")) is False
 
 
 async def test_deny_wins_and_later_hooks_still_see_the_attempt() -> None:

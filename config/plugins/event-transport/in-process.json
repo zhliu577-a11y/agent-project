@@ -1,0 +1,4 @@
+{
+  "queueSize": 1024,
+  "overflow": "block"
+}

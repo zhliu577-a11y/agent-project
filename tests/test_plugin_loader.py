@@ -171,6 +171,23 @@ def test_load_hook_plugins_instantiates_factory(tmp_path) -> None:
     assert isinstance(hook, LifecycleHooks)
 
 
+def test_load_hook_plugins_accepts_user_prompt_control_event(tmp_path) -> None:
+    manifest = _hook_manifest("prompt-policy")
+    manifest["hook"] = {"events": ["user_prompt_submit"]}
+    _write_plugin(
+        tmp_path,
+        "hooks",
+        "prompt-policy",
+        manifest,
+        files={"hook.py": _RECORDER_HOOK},
+    )
+
+    loaded = load_hook_plugins(tmp_path)
+
+    assert loaded[0][0].hook is not None
+    assert loaded[0][0].hook.events == ("user_prompt_submit",)
+
+
 def test_load_hook_plugins_rejects_bad_factory_return(tmp_path) -> None:
     _write_plugin(
         tmp_path,

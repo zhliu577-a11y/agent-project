@@ -6,13 +6,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from core.events import Event, EventBus
+from core.events import Event, EventGateway, EventIdentity, EventSubscriber
 from core.types import ModelResponse, ToolCall, TurnContext
 
 logger = logging.getLogger(__name__)
 
 HookDecision = Literal["allow", "ask", "deny"]
 HookEvent = Literal[
+    "user_prompt_submit",
     "turn_start",
     "llm_response",
     "tool_before",
@@ -22,6 +23,7 @@ HookEvent = Literal[
 HookFailurePolicy = Literal["allow", "deny"]
 
 HOOK_EVENTS: tuple[HookEvent, ...] = (
+    "user_prompt_submit",
     "turn_start",
     "llm_response",
     "tool_before",
@@ -32,6 +34,17 @@ HOOK_EVENTS: tuple[HookEvent, ...] = (
 ConfirmFn = Callable[[TurnContext, ToolCall], Awaitable[bool]]
 
 _BRIDGED_EVENTS = ("turn.start", "model.response", "tool.after", "turn.end")
+
+
+@dataclass(frozen=True)
+class PromptRequest:
+    """A user prompt presented to the control-plane policy chain."""
+
+    text: str
+    session_id: str | None = None
+
+
+PromptConfirmFn = Callable[[PromptRequest], Awaitable[bool]]
 
 
 @dataclass(frozen=True)
@@ -53,7 +66,7 @@ class HookSpec:
     def failure_decision(self, event: HookEvent) -> HookFailurePolicy:
         if self.on_error is not None:
             return self.on_error
-        return "deny" if event == "tool_before" else "allow"
+        return "deny" if event in {"tool_before", "user_prompt_submit"} else "allow"
 
 
 @dataclass(frozen=True)
@@ -70,6 +83,12 @@ class LifecycleHooks:
     async def setup(self, context: object) -> None: ...
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
+
+    async def user_prompt_submit(
+        self,
+        request: PromptRequest,
+    ) -> HookDecision | HookResult | bool | None:
+        return "allow"
 
     async def turn_start(self, ctx: TurnContext) -> None: ...
     async def llm_response(self, ctx: TurnContext, resp: ModelResponse) -> None: ...
@@ -103,6 +122,13 @@ async def _default_confirm(ctx: TurnContext, tool_call: ToolCall) -> bool:
     return answer in {"y", "yes"}
 
 
+async def _default_prompt_confirm(request: PromptRequest) -> bool:
+    """Ask the interactive client whether one submitted prompt may continue."""
+    logger.info("requesting confirmation for user prompt")
+    answer = input("[permission] allow this user prompt? [y/N]: ").strip().lower()
+    return answer in {"y", "yes"}
+
+
 @dataclass(frozen=True)
 class _HookRegistration:
     name: str
@@ -116,7 +142,7 @@ class HookGateway:
 
     def __init__(self) -> None:
         self._hooks: list[_HookRegistration] = []
-        self._attached_buses: set[int] = set()
+        self._attached_event_views: set[int] = set()
 
     def add(
         self,
@@ -158,16 +184,31 @@ class HookGateway:
     def count(self) -> int:
         return len(self._hooks)
 
-    def attach(self, bus: EventBus, *, priority: int = 100) -> None:
-        """Bridge observation events from the shared EventBus exactly once."""
-        if id(bus) in self._attached_buses:
+    def attach(
+        self,
+        events: EventSubscriber | EventGateway,
+        *,
+        priority: int = 100,
+    ) -> None:
+        """Bridge observation events from one gateway or subscriber view once."""
+        attach_key = id(events)
+        if attach_key in self._attached_event_views:
             return
+        subscriber = (
+            events
+            if isinstance(events, EventSubscriber)
+            else events.subscriber(EventIdentity.host("hook-gateway"))
+        )
         for name in _BRIDGED_EVENTS:
-            bus.subscribe(name, self._on_bus_event, priority=priority)
-        self._attached_buses.add(id(bus))
-        logger.info("HookGateway attached to EventBus (%d events)", len(_BRIDGED_EVENTS))
+            subscriber.subscribe(name, self._on_observation_event, priority=priority)
+        self._attached_event_views.add(attach_key)
+        logger.info(
+            "HookGateway attached as %s (%d events)",
+            subscriber.identity.subject,
+            len(_BRIDGED_EVENTS),
+        )
 
-    async def _on_bus_event(self, event: Event) -> None:
+    async def _on_observation_event(self, event: Event) -> None:
         payload = event.payload
         if event.name == "turn.start":
             await self.turn_start(payload["ctx"])
@@ -205,6 +246,57 @@ class HookGateway:
             )
             raise
 
+    async def _fold_decision(
+        self,
+        event: HookEvent,
+        subject: str | None,
+        invoke: Callable[[_HookRegistration], Awaitable[object]],
+    ) -> HookDecision:
+        decision: HookDecision = "allow"
+        for registration in self._ordered(event, subject):
+            try:
+                value = await self._invoke(registration, event, invoke(registration))
+                vote = _coerce_decision(value, registration.name)
+            except Exception as exc:
+                failure = registration.spec.failure_decision(event)
+                logger.exception(
+                    "%s hook failed: %s: %s (policy=%s)",
+                    event,
+                    registration.name,
+                    exc,
+                    failure,
+                )
+                vote = failure
+
+            if vote == "deny":
+                decision = "deny"
+            elif decision == "allow" and vote == "ask":
+                decision = "ask"
+        return decision
+
+    async def user_prompt_submit(
+        self,
+        request: PromptRequest,
+        confirm: PromptConfirmFn | None = None,
+    ) -> bool:
+        """Run the control-plane policy chain before entering the agent loop."""
+        decision = await self._fold_decision(
+            "user_prompt_submit",
+            request.session_id,
+            lambda registration: registration.hook.user_prompt_submit(request),
+        )
+        if decision == "deny":
+            logger.warning("user prompt denied by hook gateway")
+            return False
+        if decision == "ask":
+            asker = confirm if confirm is not None else _default_prompt_confirm
+            try:
+                return await asker(request)
+            except Exception as exc:
+                logger.exception("user prompt confirmation failed; denying: %s", exc)
+                return False
+        return True
+
     async def turn_start(self, ctx: TurnContext) -> None:
         for registration in self._ordered("turn_start"):
             try:
@@ -230,29 +322,12 @@ class HookGateway:
         confirm: ConfirmFn | None = None,
     ) -> bool:
         """Collect decisions using deny > ask > allow, then ask at most once."""
-        decision: HookDecision = "allow"
         subject = getattr(tool_call, "name", None)
-        for registration in self._ordered("tool_before", subject):
-            try:
-                value = await self._invoke(
-                    registration,
-                    "tool_before",
-                    registration.hook.tool_before(ctx, tool_call),
-                )
-                vote = _coerce_decision(value, registration.name)
-            except Exception as exc:
-                logger.exception(
-                    "tool_before hook failed: %s: %s (policy=%s)",
-                    registration.name,
-                    exc,
-                    registration.spec.failure_decision("tool_before"),
-                )
-                vote = registration.spec.failure_decision("tool_before")
-
-            if vote == "deny":
-                decision = "deny"
-            elif decision == "allow" and vote == "ask":
-                decision = "ask"
+        decision = await self._fold_decision(
+            "tool_before",
+            subject,
+            lambda registration: registration.hook.tool_before(ctx, tool_call),
+        )
 
         if decision == "deny":
             logger.warning("tool call denied by hook gateway: %s", tool_call.name)
