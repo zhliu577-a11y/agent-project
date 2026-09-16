@@ -1,0 +1,21 @@
+{
+  "apiVersion": "1",
+  "name": "store-native",
+  "type": "memory-retriever",
+  "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "memory-retriever.v1",
+  "description": "Delegate recall to the selected memory store's native search.",
+  "enabled": true,
+  "requires": [
+    {
+      "kind": "memory",
+      "inject": "memory",
+      "required": true
+    }
+  ],
+  "entry": {
+    "module": "retriever.py",
+    "factory": "create_retriever"
+  }
+}

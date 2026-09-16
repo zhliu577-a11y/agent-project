@@ -58,7 +58,9 @@ PLUGIN_KINDS: dict[str, KindLoader] = {
 | `session` | 会话持久化/恢复 | SessionGateway + SessionStore | 已落地（M4a） |
 | `memory` | 跨会话语义事实 | MemoryGateway + MemoryStore | 已落地 |
 | `memory-index` | 派生记忆候选索引 | MemoryGateway 召回候选 | 已落地 |
+| `memory-retriever` | 可替换召回策略 | MemoryRetriever + MemoryGateway | 已落地 |
 | `memory-policy` | 记忆写入准入与召回排序 | MemoryGateway 写入/召回策略 | 已落地 |
+| `memory-extractor` | 从已提交对话提取记忆候选 | MemoryExtractionGateway 调用，只经 MemoryGateway 写入 | 已落地 |
 | `embedding` | 向量嵌入提供方 | 向量 memory store 依赖注入 | 已落地 |
 
 约定：
@@ -98,6 +100,8 @@ PLUGIN_KINDS: dict[str, KindLoader] = {
 TypeScript/Node 工具可以在不改变 kind 与 loop 的前提下接入。
 “除 Agent loop 外万物皆插件”在本仓库闭环：
 模型、工具（本地 + MCP）、行为（hooks）全部来自插件目录。
+长期记忆进一步拆成 Store、Retriever、Policy、Extractor 四个独立 kind；
+`memory-index` 作为旧版派生索引协议继续兼容。
 
 ## 后果
 

@@ -34,7 +34,9 @@
         "session",
         "memory",
         "memory-index",
+        "memory-retriever",
         "memory-policy",
+        "memory-extractor",
         "embedding",
         "listener",
         "event-transport"

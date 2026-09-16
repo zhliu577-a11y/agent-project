@@ -1,0 +1,14 @@
+{
+  "apiVersion": "1",
+  "name": "lexical",
+  "type": "memory-retriever",
+  "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "memory-retriever.v1",
+  "description": "In-process lexical derived-memory retriever.",
+  "enabled": true,
+  "entry": {
+    "module": "retriever.py",
+    "factory": "create_retriever"
+  }
+}

@@ -72,6 +72,27 @@ def create_store(plugin_dir):
     return FakeMemory()
 """
 
+_MEMORY_EXTRACTOR_MODULE = """
+from core.memory_extraction import MemoryExtractionResult
+
+
+class FakeMemoryExtractor:
+    async def extract(self, request):
+        return MemoryExtractionResult()
+
+
+def create_extractor(plugin_dir, context=None):
+    return FakeMemoryExtractor()
+"""
+
+_MEMORY_RETRIEVER_MODULE = """
+from core.memory import StoreMemoryRetriever
+
+
+def create_retriever(plugin_dir, memory):
+    return StoreMemoryRetriever(memory)
+"""
+
 _CONTEXT_MODULE = """
 from core.context import TailWindowPolicy
 
@@ -197,6 +218,29 @@ def _write_builtins(root: Path) -> None:
             "entry": {"module": "store.py", "factory": "create_store"},
         },
         {"store.py": _MEMORY_MODULE},
+    )
+    _write_builtin(
+        root,
+        "memory-extractor",
+        "explicit",
+        {
+            "name": "explicit",
+            "type": "memory-extractor",
+            "entry": {"module": "extractor.py", "factory": "create_extractor"},
+        },
+        {"extractor.py": _MEMORY_EXTRACTOR_MODULE},
+    )
+    _write_builtin(
+        root,
+        "memory-retriever",
+        "store-native",
+        {
+            "name": "store-native",
+            "type": "memory-retriever",
+            "requires": [{"kind": "memory", "inject": "memory"}],
+            "entry": {"module": "retriever.py", "factory": "create_retriever"},
+        },
+        {"retriever.py": _MEMORY_RETRIEVER_MODULE},
     )
     _write_builtin(
         root,

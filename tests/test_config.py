@@ -15,7 +15,13 @@ _CONFIG_KEYS = (
     "SESSION_COMPACTION",
     "MEMORY_STORE",
     "MEMORY_INDEX",
+    "MEMORY_RETRIEVER",
     "MEMORY_POLICY",
+    "MEMORY_EXTRACTOR",
+    "MEMORY_SCOPE",
+    "MEMORY_OWNER_ID",
+    "MEMORY_AGENT_ID",
+    "MEMORY_TENANT_ID",
     "EMBEDDING_PROVIDER",
     "CONTEXT_MAX_TOKENS",
     "CONTEXT_STRATEGY",
@@ -79,7 +85,16 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     )
     _write(
         config_dir / "memory.json",
-        {"store": "jsonl", "index": "lexical", "policy": "default"},
+        {
+            "store": "jsonl",
+            "index": "lexical",
+            "policy": "default",
+            "extractor": "explicit",
+            "scope": "agent",
+            "ownerId": "owner-a",
+            "agentId": "agent-a",
+            "tenantId": "tenant-a",
+        },
     )
     _write(config_dir / "embedding.json", {"provider": "openai-embedding"})
     _write(config_dir / "context.json", {"maxTokens": 12345, "strategy": "compact"})
@@ -107,6 +122,11 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     assert config.memory_store == "jsonl"
     assert config.memory_index == "lexical"
     assert config.memory_policy == "default"
+    assert config.memory_extractor == "explicit"
+    assert config.memory_scope == "agent"
+    assert config.memory_owner_id == "owner-a"
+    assert config.memory_agent_id == "agent-a"
+    assert config.memory_tenant_id == "tenant-a"
     assert config.embedding_provider == "openai-embedding"
     assert config.context_max_tokens == 12345
     assert config.context_strategy == "compact"
@@ -126,6 +146,11 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     monkeypatch.setenv("SESSION_COMPACTION", "")
     monkeypatch.setenv("MEMORY_INDEX", "")
     monkeypatch.setenv("MEMORY_POLICY", "strict")
+    monkeypatch.setenv("MEMORY_EXTRACTOR", "off")
+    monkeypatch.setenv("MEMORY_SCOPE", "user")
+    monkeypatch.setenv("MEMORY_OWNER_ID", "owner-b")
+    monkeypatch.setenv("MEMORY_AGENT_ID", "agent-b")
+    monkeypatch.setenv("MEMORY_TENANT_ID", "tenant-b")
     monkeypatch.setenv("MCP_PRELOAD", "filesystem")
     monkeypatch.setenv("SKILL_PRELOAD", "commit-message")
     monkeypatch.setenv("SKILL_MAX_CONTENT_BYTES", "3000")
@@ -137,6 +162,11 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     assert config.session_compaction is None
     assert config.memory_index is None
     assert config.memory_policy == "strict"
+    assert config.memory_extractor == "off"
+    assert config.memory_scope == "user"
+    assert config.memory_owner_id == "owner-b"
+    assert config.memory_agent_id == "agent-b"
+    assert config.memory_tenant_id == "tenant-b"
     assert config.mcp_preload == ("filesystem",)
     assert config.skill_preload == ("commit-message",)
     assert config.skill_max_content_bytes == 3000
@@ -155,6 +185,50 @@ def test_plugin_config_is_loaded_by_kind_and_name(tmp_path) -> None:
     assert config.plugin_config("skill", "quality--lint") == {"feature": "on"}
     with pytest.raises(ValueError, match="invalid plugin config kind"):
         config.plugin_config("../hook", "permission")
+
+
+def test_memory_retriever_config_and_legacy_index_compatibility(tmp_path, monkeypatch) -> None:
+    _clean_env(monkeypatch)
+    config_dir = tmp_path / "config"
+    _write(
+        config_dir / "config.json",
+        {"memory": {"store": "sqlite", "retriever": "lexical"}},
+    )
+
+    config = AppConfig.load(config_dir)
+
+    assert config.memory_index is None
+    assert config.memory_retriever == "lexical"
+
+
+def test_memory_legacy_index_disables_default_retriever(tmp_path, monkeypatch) -> None:
+    _clean_env(monkeypatch)
+    config_dir = tmp_path / "config"
+    _write(
+        config_dir / "config.json",
+        {"memory": {"store": "sqlite", "index": "recent"}},
+    )
+
+    config = AppConfig.load(config_dir)
+
+    assert config.memory_index == "recent"
+    assert config.memory_retriever is None
+
+
+def test_memory_index_and_retriever_cannot_be_configured_together(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _clean_env(monkeypatch)
+    config_dir = tmp_path / "config"
+    _write(
+        config_dir / "config.json",
+        {"memory": {"store": "sqlite", "retriever": "lexical"}},
+    )
+    monkeypatch.setenv("MEMORY_INDEX", "recent")
+
+    with pytest.raises(ValueError, match="not both"):
+        AppConfig.load(config_dir)
 
 
 def test_model_routing_config_is_loaded_and_env_overrides_names(tmp_path, monkeypatch) -> None:
@@ -215,6 +289,12 @@ def test_config_missing_file_uses_defaults(tmp_path, monkeypatch) -> None:
     assert config.session_store == "jsonl"
     assert config.session_compaction is None
     assert config.memory_store == "sqlite"
+    assert config.memory_retriever == "store-native"
+    assert config.memory_extractor == "explicit"
+    assert config.memory_scope == "user"
+    assert config.memory_owner_id == ""
+    assert config.memory_agent_id == ""
+    assert config.memory_tenant_id == ""
     assert config.context_max_tokens == 20000
     assert config.context_strategy == "tail-window"
     assert config.mcp_preload == ()

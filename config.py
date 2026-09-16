@@ -59,7 +59,13 @@ class AppConfig:
     session_compaction: str | None = None
     memory_store: str = "sqlite"
     memory_index: str | None = None
+    memory_retriever: str | None = "store-native"
     memory_policy: str | None = None
+    memory_extractor: str | None = "explicit"
+    memory_scope: str = "user"
+    memory_owner_id: str = ""
+    memory_agent_id: str = ""
+    memory_tenant_id: str = ""
     embedding_provider: str = "debug"
     context_max_tokens: int = 20000
     context_strategy: str = "tail-window"
@@ -89,6 +95,26 @@ class AppConfig:
         event = cls._nested(raw, "event")
         event_transport = cls._nested(raw, "event_transport")
         model_options = cls._nested(raw, "_model_options")
+        memory_index = _load_optional_name(
+            memory.get("index"),
+            os.getenv("MEMORY_INDEX"),
+            "memory.index",
+        )
+        retriever_configured = "retriever" in memory or "MEMORY_RETRIEVER" in os.environ
+        memory_retriever = _load_optional_name(
+            memory.get("retriever"),
+            os.getenv("MEMORY_RETRIEVER"),
+            "memory.retriever",
+        )
+        if not retriever_configured:
+            # Old installations may still select a memory-index plugin.
+            # Otherwise the default is an explicit store-native retriever.
+            memory_retriever = None if memory_index is not None else "store-native"
+        if memory_index is not None and memory_retriever is not None:
+            raise ValueError(
+                "config: 'memory.index' is deprecated; "
+                "select either memory.index or memory.retriever, not both"
+            )
 
         return cls(
             event_transport=os.getenv(
@@ -139,15 +165,33 @@ class AppConfig:
             memory_store=os.getenv(
                 "MEMORY_STORE", _expect_str(memory.get("store", "sqlite"), "memory.store")
             ),
-            memory_index=_load_optional_name(
-                memory.get("index"),
-                os.getenv("MEMORY_INDEX"),
-                "memory.index",
-            ),
+            memory_index=memory_index,
+            memory_retriever=memory_retriever,
             memory_policy=_load_optional_name(
                 memory.get("policy"),
                 os.getenv("MEMORY_POLICY"),
                 "memory.policy",
+            ),
+            memory_extractor=_load_optional_name(
+                memory.get("extractor", "explicit"),
+                os.getenv("MEMORY_EXTRACTOR"),
+                "memory.extractor",
+            ),
+            memory_scope=os.getenv(
+                "MEMORY_SCOPE",
+                _expect_str(memory.get("scope", "user"), "memory.scope"),
+            ),
+            memory_owner_id=os.getenv(
+                "MEMORY_OWNER_ID",
+                _expect_text(memory.get("ownerId", ""), "memory.ownerId"),
+            ),
+            memory_agent_id=os.getenv(
+                "MEMORY_AGENT_ID",
+                _expect_text(memory.get("agentId", ""), "memory.agentId"),
+            ),
+            memory_tenant_id=os.getenv(
+                "MEMORY_TENANT_ID",
+                _expect_text(memory.get("tenantId", ""), "memory.tenantId"),
             ),
             embedding_provider=os.getenv(
                 "EMBEDDING_PROVIDER",
@@ -291,6 +335,12 @@ def _nested_copy(raw: dict[str, Any], key: str) -> dict[str, Any]:
 def _expect_str(value: Any, key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"config: '{key}' must be a non-empty string")
+    return value
+
+
+def _expect_text(value: Any, key: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"config: '{key}' must be a string")
     return value
 
 

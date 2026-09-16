@@ -14,8 +14,9 @@
 - 固定异步 agent loop（调模型 → 执行工具 → 回填 → 判断结束），支持流式输出与多个工具的并行执行
 - **插件目录（drop-in）**：`plugins/` 下每个插件是一个自包含目录 + `plugin.json`，
   拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model`、`model-router`、
-  `skill`、`session`、`memory`、`memory-index`、`memory-policy`、`embedding`、
-  `listener`、`event-transport`、`context`、`compaction` 十五类
+  `skill`、`session`、`memory`、`memory-index`、`memory-retriever`、`memory-policy`、
+  `memory-extractor`、`embedding`、`listener`、`event-transport`、`context`、
+  `compaction` 十七类
 - **功能包**：一个包可用 `contributes[]` 同时提供 skill、hook、tool 等能力，
   发现阶段统一展开为 contribution 后按受控 kind 注册表装配
 - **MCP 网关**：Agent 只面向网关这一个通道；网关统一维护各 MCP 插件的连接、
@@ -36,8 +37,9 @@
 - **会话插件**：短期记忆分为 `session` 存储、`context` 请求视图和
   `compaction` 提交策略三层；`SessionGateway` 统一负责 revision、原子提交、
   checkpoint 和压缩失败回滚
-- **长期记忆插件**：持久事实、派生索引、读写策略三层分离
-  （`plugins/memory/*`、`plugins/memory-index/*`、`plugins/memory-policy/*`），
+- **长期记忆插件**：持久事实、召回方式、读写策略、自动提取四层分离
+  （`plugins/memory/*`、`plugins/memory-retriever/*`、`plugins/memory-policy/*`、
+  `plugins/memory-extractor/*`），支持去重、替代、过期、访问统计和身份隔离；
   模型通过 `remember / recall / update_note / forget` 主动读写
 - **上下文策略插件**：完整历史由 Session 保存，模型请求前由可替换的
   `context` 插件生成上下文视图；`CONTEXT_STRATEGY` 可切换策略
@@ -140,15 +142,22 @@ plugins/
 ├── memory/                     # 长期记忆插件（跨会话语义笔记）
 │   ├── sqlite/                 #   生产默认：事务 + WAL + 参数化查询
 │   ├── jsonl/                  #   人眼可读的示例后端
-│   └── vector/                 #   语义检索后端（存 embedding + 余弦排序）
-│       ├── plugin.json         #   { "type": "memory", ... }
-│       └── store.py            #   MemoryStore 实现
-├── memory-index/               # 派生记忆索引（可重建，不拥有事实）
-│   ├── lexical/                #   默认：正文/标签字面匹配
+│   └── vector/                 #   功能包：vector store + vector-native retriever
+│       ├── plugin.json         #   一次贡献 memory 和 memory-retriever
+│       ├── store.py            #   MemoryStore 实现（持久化 embedding）
+│       └── retriever.py        #   基于该 store 的原生召回
+├── memory-retriever/           # 可替换召回策略（查询 Store 或派生索引）
+│   ├── store-native/           #   默认：直接调用所选 Store 的检索接口
+│   ├── lexical/                #   正文/标签字面召回
+│   └── recent/                 #   按更新时间倒序召回
+├── memory-index/               # 旧版派生记忆索引协议（兼容路径）
+│   ├── lexical/                #   正文/标签字面匹配
 │   └── recent/                 #   按更新时间倒序提供候选
 ├── memory-policy/              # 写入准入与召回排序策略
 │   ├── default/                #   默认：重要度 + 置信度 + 时间
 │   └── strict/                 #   拒绝弱记录，置信度优先排序
+├── memory-extractor/           # 自动记忆提取策略（只产出候选）
+│   └── explicit/               #   提取“记住/偏好/约束”等显式陈述
 ├── embedding/                  # 嵌入提供方插件（向量记忆后端使用）
 │   ├── debug/                  #   确定性哈希（离线开发/测试）
 │   └── openai-embedding/       #   OpenAI API（真实语义，需 OPENAI_API_KEY）
@@ -187,8 +196,9 @@ plugins/
 
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
 `mcp` / `hook` / `tool` / `model` / `model-router` / `skill` / `session` /
-`memory` / `memory-index` / `memory-policy` / `embedding` / `listener` /
-`event-transport` / `context` / `compaction`；
+`memory` / `memory-index` / `memory-retriever` / `memory-policy` /
+`memory-extractor` / `embedding` / `listener` / `event-transport` / `context` /
+`compaction`；
 `apiVersion` 固定为 `"1"`，`protocolVersion` 当前为 `1`，`contract` 必须与
 `<type>.v<protocolVersion>` 一致（例如 `mcp.v1`、`tool.v1`）；
 `enabled: false` 的插件
@@ -610,15 +620,27 @@ async def compact(request: CompactionRequest) -> CompactionResult: ...
 `recall` 先把 query 转成向量、按余弦相似度取 Top-K；相似度低于阈值自动回退
 子串/标签搜索。嵌入来源由 `EMBEDDING_PROVIDER` 选择：`debug`（确定性哈希，
 离线跑通链路）或 `openai-embedding`（真实语义，需 `OPENAI_API_KEY`）。
+`memory/vector` 是功能包：同一个 `plugin.json` 同时贡献 `vector` store 和
+匹配它的 `vector-native` retriever。
 
-长期记忆运行时由三层组成：
+长期记忆运行时由四层组成：
 
 - `MemoryStore`（`MEMORY_STORE`）：唯一的事实来源，负责持久化；
-- `MemoryIndex`（`MEMORY_INDEX`）：派生的候选召回视图，可从 Store 重建。
-  内置 `lexical` 做正文/标签子串匹配，`recent` 按更新时间提供近因优先候选；
+- `MemoryRetriever`（`MEMORY_RETRIEVER`）：把查询转成候选记录。可以实现
+  Store-native、词法、近因、向量或混合召回；内置 `store-native` 直接调用
+  Store，`lexical` 和 `recent` 提供可重建的派生召回；
 - `MemoryPolicy`（`MEMORY_POLICY`）：写入门槛与召回排序。内置 `default` 按
   重要度、置信度、时间排序；`strict` 拒绝过短、低置信度或低重要度记录，
-  并在召回时优先选择高置信度内容。
+  并在召回时优先选择高置信度内容。策略还负责内容归一化去重、显式替代和过期筛选；
+- `MemoryExtractor`（`MEMORY_EXTRACTOR`）：在 Session 成功提交一轮后读取新增消息，
+  只产出候选，不直接写存储。内置 `explicit` 会提取“记住……”“remember that ...”
+  和显式偏好/约束；候选仍需经过 `MemoryGateway` 的身份、ACL、策略和生命周期检查。
+
+`memory-index` 是旧版派生索引协议，会由 `LegacyMemoryIndexRetriever` 自动适配；
+只配置 `MEMORY_INDEX` 的安装仍可运行，但新配置应使用 `MEMORY_RETRIEVER`。
+`MemoryRecord` 会持久化 `scope / owner_id / agent_id / tenant_id`，召回和写入都按
+完整身份过滤。`recall` 会更新 `last_accessed_at` 与 `metadata.accessCount`；到期记录
+由 `MemoryGateway.maintain()` 标记为 `expired` 并从召回视图移除，不做硬删除。
 
 模型侧提供四个工具：
 
@@ -771,8 +793,13 @@ $env:CONTEXT_STRATEGY="tail-window"
   },
   "memory": {
     "store": "sqlite",
-    "index": "lexical",
-    "policy": "default"
+    "retriever": "store-native",
+    "policy": "default",
+    "extractor": "explicit",
+    "scope": "user",
+    "ownerId": "",
+    "agentId": "",
+    "tenantId": ""
   },
   "embedding": { "provider": "debug" },
   "context": { "maxTokens": 20000, "strategy": "memory-tail-window" }
@@ -806,8 +833,14 @@ Skill 的宿主预载和内容预算由 `config/skill.json` 管理。
 | `SESSION_COMPACTION` | `rolling-summary` | 激活的持久化压缩插件；空字符串关闭 |
 | `SESSION_DATA_DIR` | `.sessions/` | jsonl 会话数据目录 |
 | `MEMORY_STORE` | `sqlite` | 激活的长期记忆插件名（plugins/memory/* 里选） |
-| `MEMORY_INDEX` | `lexical` | 派生记忆索引插件（`lexical` / `recent`） |
+| `MEMORY_RETRIEVER` | `store-native` | 召回策略插件（`store-native` / `lexical` / `recent`） |
+| `MEMORY_INDEX` | 无 | 已弃用的旧版索引兼容项；不可与 `MEMORY_RETRIEVER` 同时设置 |
 | `MEMORY_POLICY` | `default` | 记忆写入与召回策略插件（`default` / `strict`） |
+| `MEMORY_EXTRACTOR` | `explicit` | 提交对话后自动提取记忆的插件；空字符串关闭 |
+| `MEMORY_SCOPE` | `user` | 默认记忆作用域 |
+| `MEMORY_OWNER_ID` | 空 | 默认记忆所有者标识 |
+| `MEMORY_AGENT_ID` | 空 | 默认 Agent 标识 |
+| `MEMORY_TENANT_ID` | 空 | 默认租户标识 |
 | `MEMORY_DB_PATH` | `.memory/memory.db` | sqlite 后端的数据文件路径 |
 | `MEMORY_DATA_DIR` | `.memory/` | jsonl 长期记忆数据目录 |
 | `MEMORY_VECTOR_DB_PATH` | `.memory/vector.db` | vector 后端数据文件 |
@@ -1042,8 +1075,10 @@ Runtime 不再按手写顺序逐个创建 context、session、memory。选中的
 
 ```text
 MemoryStore (memory)
-  <- MemoryIndex (memory-index, optional)
+  <- MemoryRetriever (memory-retriever)
+  <- MemoryIndex (memory-index, legacy compatibility)
   <- MemoryPolicy (memory-policy, optional)
+  <- MemoryExtractor (memory-extractor, optional)
   <- EmbeddingProvider (embedding, required by vector memory)
 
 SessionGateway
@@ -1073,18 +1108,21 @@ ContextGateway
 `name` 省略时使用当前配置选中的同 kind 插件；`inject` 省略时使用 kind 名（连字符转下划线）
 作为工厂参数名。缺少必需依赖、契约不匹配或出现依赖环都会在 Runtime 启动阶段失败。
 
-`memory-index` 只保存派生索引，可从 `MemoryStore` 重建；`memory-policy` 负责写入筛选和召回排序，
-两者都不拥有事实记录。`MemoryRecord` 的 `scope` 与 `owner_id` 由 `MemoryGateway` 做读写 ACL，
-为后续多 Agent 隔离预留边界。
+`memory-retriever` 负责把查询转换成候选记录，可以查询 Store 或维护派生视图；
+`memory-index` 是旧版兼容协议；`memory-policy` 负责写入筛选、去重、替代和召回排序；
+`memory-extractor` 只把已提交对话转换成候选。它们都不拥有事实记录。
+`MemoryRecord` 的 `scope / owner_id / agent_id / tenant_id` 由 `MemoryGateway` 做读写隔离，
+为多 Agent 和租户场景预留边界。
 
 `context`、`compaction`、`memory` 保持三套独立协议：Context 只决定本次模型看到什么，
 Compaction 只生成会话历史的替换方案，Memory 负责跨会话事实。`ContextGateway` 只依赖
 `MemoryRecallPort`，召回失败时降级为空记忆并继续原 ContextPolicy，不会绕过压缩、
 修改会话或让记忆故障拖垮模型调用。
 
-当前内置选择为 `MEMORY_INDEX=lexical`、`MEMORY_POLICY=default`。例如希望项目最近更新
-优先进入候选，再由默认策略排序，可使用 `MEMORY_INDEX=recent`；希望长期记忆更偏精确、
-减少低质量写入，可使用 `MEMORY_POLICY=strict`。索引与策略可以独立切换。
+当前内置选择为 `MEMORY_RETRIEVER=store-native`、`MEMORY_POLICY=default`。例如希望项目
+最近更新优先进入候选，再由默认策略排序，可使用 `MEMORY_RETRIEVER=recent`；希望长期记忆
+更偏精确、减少低质量写入，可使用 `MEMORY_POLICY=strict`。召回策略与策略插件可以独立切换；
+旧安装仍可使用 `MEMORY_INDEX=lexical`，但不能同时设置两个召回配置。
 
 ## Roadmap
 
@@ -1092,5 +1130,4 @@ Compaction 只生成会话历史的替换方案，Memory 负责跨会话事实�
 - 插件更新与热重载：版本替换、运行时卸载与错误回滚
 - 远程 HTTP MCP 插件（`transport: "http"` + URL + 服务器级信任）
 - 钩子事件扩展（会话开始/结束等，对齐 Codex/Claude Code 拦截点）
-- 长期记忆插件（`type: "memory"`：跨会话语义笔记 + recall 注入）
 - MCP 网关进程化：把 `McpGateway` 换成独立代理进程/远程网关客户端（同一窄接口）

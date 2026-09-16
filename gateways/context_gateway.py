@@ -22,6 +22,8 @@ class ContextGateway:
         memory: MemoryRecallPort | None = None,
         default_scope: str = "user",
         default_owner_id: str = "",
+        default_agent_id: str = "",
+        default_tenant_id: str = "",
         recall_limit: int = 8,
     ) -> None:
         if recall_limit <= 0:
@@ -30,6 +32,8 @@ class ContextGateway:
         self._memory = memory
         self._default_scope = default_scope
         self._default_owner_id = default_owner_id
+        self._default_agent_id = default_agent_id
+        self._default_tenant_id = default_tenant_id
         self._recall_limit = recall_limit
         self._cache_key: tuple[str | None, int, str] | None = None
         self._cache_records: list[dict[str, Any]] = []
@@ -51,6 +55,8 @@ class ContextGateway:
                 query,
                 scope=self._default_scope,
                 owner_id=self._default_owner_id,
+                agent_id=self._default_agent_id,
+                tenant_id=self._default_tenant_id,
                 limit=self._recall_limit,
             )
         except Exception as exc:
@@ -72,4 +78,6 @@ class ContextGateway:
         state["memory.records"] = records
         state["memory.scope"] = self._default_scope
         state["memory.owner_id"] = self._default_owner_id
+        state["memory.agent_id"] = self._default_agent_id
+        state["memory.tenant_id"] = self._default_tenant_id
         return await self._policy.prepare(replace(request, state=state))

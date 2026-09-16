@@ -7,8 +7,13 @@
   },
   "memory": {
     "store": "sqlite",
-    "index": "lexical",
-    "policy": "default"
+    "retriever": "store-native",
+    "policy": "default",
+    "extractor": "explicit",
+    "scope": "user",
+    "ownerId": "",
+    "agentId": "",
+    "tenantId": ""
   },
   "embedding": {
     "provider": "debug"

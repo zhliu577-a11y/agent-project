@@ -1,21 +1,44 @@
 {
   "apiVersion": "1",
-  "name": "vector",
-  "type": "memory",
+  "name": "memory-vector",
   "version": "1.0.0",
   "protocolVersion": 1,
-  "contract": "memory.v1",
   "description": "向量记忆后端：语义检索（配合 embedding 提供方），弱结果自动回退字面搜索",
   "enabled": true,
-  "requires": [
+  "contributes": [
     {
-      "kind": "embedding",
-      "inject": "embedding",
-      "required": true
+      "id": "vector",
+      "kind": "memory",
+      "contract": "memory.v1",
+      "requires": [
+        {
+          "kind": "embedding",
+          "inject": "embedding",
+          "required": true
+        }
+      ],
+      "entry": {
+        "module": "store.py",
+        "factory": "create_store"
+      }
+    },
+    {
+      "id": "vector-native",
+      "kind": "memory-retriever",
+      "contract": "memory-retriever.v1",
+      "description": "Vector-store native recall paired with the vector memory backend.",
+      "requires": [
+        {
+          "kind": "memory",
+          "name": "vector",
+          "inject": "memory",
+          "required": true
+        }
+      ],
+      "entry": {
+        "module": "retriever.py",
+        "factory": "create_retriever"
+      }
     }
-  ],
-  "entry": {
-    "module": "store.py",
-    "factory": "create_store"
-  }
+  ]
 }

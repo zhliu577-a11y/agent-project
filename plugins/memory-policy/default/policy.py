@@ -1,20 +1,17 @@
 """Default semantic-memory policy."""
 
-from datetime import UTC, datetime
-
-from core.memory import MemoryPolicy, MemoryQuery, MemoryRecord
+from core.memory import (
+    MemoryPolicy,
+    MemoryQuery,
+    MemoryRecord,
+    MemoryWriteDecision,
+    normalize_memory_text,
+    record_is_expired,
+)
 
 
 def _is_expired(record: MemoryRecord) -> bool:
-    if not record.expires_at:
-        return False
-    try:
-        expires = datetime.fromisoformat(record.expires_at)
-    except ValueError:
-        return True
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=UTC)
-    return expires <= datetime.now(UTC)
+    return record_is_expired(record)
 
 
 class DefaultMemoryPolicy(MemoryPolicy):
@@ -27,6 +24,40 @@ class DefaultMemoryPolicy(MemoryPolicy):
         if record.status in {"deleted", "expired"}:
             return None
         return record
+
+    def reconcile(
+        self,
+        candidate: MemoryRecord,
+        existing: list[MemoryRecord],
+    ) -> MemoryWriteDecision:
+        normalized = normalize_memory_text(candidate.content)
+        for record in existing:
+            if record.id == candidate.id or record.status != "active":
+                continue
+            if (
+                record.scope == candidate.scope
+                and record.owner_id == candidate.owner_id
+                and record.agent_id == candidate.agent_id
+                and record.tenant_id == candidate.tenant_id
+                and normalize_memory_text(record.content) == normalized
+            ):
+                return MemoryWriteDecision(
+                    action="skip",
+                    target_id=record.id,
+                    reason="duplicate-content",
+                )
+        if candidate.supersedes:
+            target = next(
+                (record for record in existing if record.id == candidate.supersedes),
+                None,
+            )
+            if target is not None and target.status == "active":
+                return MemoryWriteDecision(
+                    action="supersede",
+                    target_id=target.id,
+                    reason="explicit-supersedes",
+                )
+        return MemoryWriteDecision()
 
     def rank(
         self,

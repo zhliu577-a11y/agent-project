@@ -19,7 +19,7 @@ class RecordingPolicy:
 
 class FakeMemory:
     def __init__(self) -> None:
-        self.queries: list[tuple[str, str, str]] = []
+        self.queries: list[tuple[str, str, str, str, str]] = []
 
     async def context_records(
         self,
@@ -27,9 +27,11 @@ class FakeMemory:
         *,
         scope: str,
         owner_id: str,
+        agent_id: str,
+        tenant_id: str,
         limit: int,
     ) -> list[dict[str, Any]]:
-        self.queries.append((query, scope, owner_id))
+        self.queries.append((query, scope, owner_id, agent_id, tenant_id))
         return [{"id": "m1", "content": "remembered", "limit": str(limit)}]
 
 
@@ -43,6 +45,8 @@ class FailingMemory:
         *,
         scope: str,
         owner_id: str,
+        agent_id: str,
+        tenant_id: str,
         limit: int,
     ) -> list[dict[str, Any]]:
         self.calls += 1
@@ -67,7 +71,7 @@ async def test_context_gateway_exposes_recall_results_to_policy() -> None:
 
     result = await gateway.prepare(request)
 
-    assert memory.queries == [("what did we decide?", "user", "")]
+    assert memory.queries == [("what did we decide?", "user", "", "", "")]
     assert result.metadata["memory.records"][0]["id"] == "m1"
     assert policy.requests[0].state["memory.scope"] == "user"
 

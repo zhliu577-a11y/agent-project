@@ -12,6 +12,7 @@ from core.hooks import PromptRequest
 from core.state import capture
 from core.tracing import begin_trace, setup_logging
 from core.types import Message
+from gateways.memory_extraction_gateway import MemoryExtractionGateway
 from gateways.session_gateway import SessionGateway
 from loop import run_agent
 from runtime import HarnessRuntime, RuntimeStartupError
@@ -29,6 +30,7 @@ async def chat(
     max_context_tokens: int = 20000,
     events: EventGateway | None = None,
     context_policy: ContextPolicy | None = None,
+    memory_extraction: MemoryExtractionGateway | None = None,
 ) -> list[Message]:
     """交互循环；返回本会话最终历史（不含 system），供持久化/恢复。"""
     logger.info("对话已启动，输入 exit / quit / 退出 结束。")
@@ -77,6 +79,7 @@ async def chat(
             print("[policy] 本轮输入未通过策略检查")
             continue
         await _publish("user_prompt.accepted", session_id=session_id)
+        previous_ids = {message.id for message in history}
         ctx = await run_agent(
             model,
             tools,
@@ -90,10 +93,17 @@ async def chat(
             max_context_tokens=max_context_tokens,
             session_id=session_id,
         )
-        history = ctx.messages[1:]  # 去掉 system，其余全部进入下一轮上下文
+        history = ctx.messages[1:]
+        new_messages = [
+            message
+            for message in history
+            if message.id not in previous_ids and message.metadata.get("compaction") != "summary"
+        ]
         if session is not None:
             committed = await session.commit_turn(history, capture(ctx))
             history = list(committed.messages)
+            if memory_extraction is not None:
+                await memory_extraction.process_turn(committed, new_messages)
 
         if not streamed["active"]:
             # 没有流式输出（例如被拒绝或出错），整段补打
@@ -132,6 +142,7 @@ async def main() -> None:
             max_context_tokens=config.context_max_tokens,
             events=runtime.events,
             context_policy=runtime.context_gateway or runtime.context_policy,
+            memory_extraction=runtime.memory_extraction,
         )
     finally:
         await runtime.close()

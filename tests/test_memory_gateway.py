@@ -5,7 +5,15 @@ import pytest
 
 from core.errors import PluginError
 from core.memory import MemoryQuery, MemoryRecallPort, MemoryRecord
+from core.memory_extraction import (
+    MemoryCandidate,
+    MemoryExtractionRequest,
+    MemoryExtractionResult,
+)
 from core.registry import ToolRegistry
+from core.session import SessionMetadata, SessionSnapshot
+from core.types import Message
+from gateways.memory_extraction_gateway import MemoryExtractionGateway
 from gateways.memory_gateway import (
     ForgetTool,
     MemoryGateway,
@@ -15,11 +23,13 @@ from gateways.memory_gateway import (
 )
 from plugins.loader import (
     load_embedding_plugins,
+    load_memory_extractor_plugins,
     load_memory_index_plugins,
     load_memory_plugins,
     load_memory_policy_plugins,
+    load_memory_retriever_plugins,
 )
-from plugins.services import RuntimeServices
+from plugins.services import RuntimeServices, candidate_service_names
 
 REPO_PLUGINS = Path(__file__).resolve().parents[1] / "plugins"
 
@@ -108,9 +118,180 @@ def test_repo_offers_production_and_readable_memory_backends() -> None:
 
 def test_repo_offers_replaceable_memory_indexes_and_policies() -> None:
     index_names = {plugin.manifest.name for plugin in load_memory_index_plugins(REPO_PLUGINS)}
+    retriever_names = {
+        plugin.manifest.name for plugin in load_memory_retriever_plugins(REPO_PLUGINS)
+    }
     policy_names = {plugin.manifest.name for plugin in load_memory_policy_plugins(REPO_PLUGINS)}
+    extractor_names = {
+        plugin.manifest.name for plugin in load_memory_extractor_plugins(REPO_PLUGINS)
+    }
     assert {"lexical", "recent"} <= index_names
+    assert {"lexical", "recent", "store-native"} <= retriever_names
     assert {"default", "strict"} <= policy_names
+    assert "explicit" in extractor_names
+
+
+def _jsonl_store(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MEMORY_DATA_DIR", str(tmp_path))
+    return next(
+        plugin for plugin in load_memory_plugins(REPO_PLUGINS) if plugin.manifest.name == "jsonl"
+    ).create()
+
+
+def _default_policy():
+    return next(
+        plugin
+        for plugin in load_memory_policy_plugins(REPO_PLUGINS)
+        if plugin.manifest.name == "default"
+    ).create()
+
+
+@pytest.mark.asyncio
+async def test_memory_policy_skips_normalized_duplicates(tmp_path, monkeypatch) -> None:
+    store = _jsonl_store(tmp_path, monkeypatch)
+    gateway = MemoryGateway(
+        store,
+        policy=_default_policy(),
+    )
+
+    first = await gateway.remember("Use ruff for Python linting")
+    duplicate = await gateway.remember("  use   RUFF for Python linting  ")
+
+    assert duplicate.id == first.id
+    assert [record.id for record in await store.list_notes()] == [first.id]
+
+
+@pytest.mark.asyncio
+async def test_memory_policy_supersedes_explicit_target(tmp_path, monkeypatch) -> None:
+    store = _jsonl_store(tmp_path, monkeypatch)
+    gateway = MemoryGateway(store, policy=_default_policy())
+
+    old = await gateway.remember("Use black for formatting")
+    new = await gateway.remember("Use ruff for formatting", supersedes=old.id)
+    records = {record.id: record for record in await store.list_notes()}
+
+    assert records[old.id].status == "superseded"
+    assert new.supersedes == old.id
+    assert await gateway.recall("black") == []
+    assert [record.id for record in await gateway.recall("ruff")] == [new.id]
+
+
+@pytest.mark.asyncio
+async def test_memory_maintenance_expires_records_without_deleting_them(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = _jsonl_store(tmp_path, monkeypatch)
+    gateway = MemoryGateway(store, policy=_default_policy())
+
+    expired = await gateway.remember(
+        "Temporary deployment marker",
+        expires_at="2000-01-01T00:00:00+00:00",
+    )
+    active = await gateway.remember("Durable project rule")
+
+    result = await gateway.maintain()
+    records = {record.id: record for record in await store.list_notes()}
+
+    assert result == {"checked": 2, "expired": 1}
+    assert records[expired.id].status == "expired"
+    assert records[active.id].status == "active"
+    assert await gateway.recall("Temporary") == []
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_persists_access_statistics(tmp_path, monkeypatch) -> None:
+    store = _jsonl_store(tmp_path, monkeypatch)
+    gateway = MemoryGateway(store)
+
+    note = await gateway.remember("Use ruff")
+    await gateway.recall("ruff")
+    await gateway.recall("ruff")
+    stored = (await store.list_notes())[0]
+
+    assert stored.id == note.id
+    assert stored.metadata["accessCount"] == 2
+    assert stored.last_accessed_at
+
+
+@pytest.mark.asyncio
+async def test_memory_identity_is_propagated_and_enforced(tmp_path, monkeypatch) -> None:
+    store = _jsonl_store(tmp_path, monkeypatch)
+    gateway = MemoryGateway(
+        store,
+        default_scope="agent",
+        default_owner_id="owner-a",
+        default_agent_id="agent-a",
+        default_tenant_id="tenant-a",
+        allowed_scopes={"agent"},
+        allowed_owner_ids={"owner-a"},
+        allowed_agent_ids={"agent-a"},
+        allowed_tenant_ids={"tenant-a"},
+    )
+
+    note = await gateway.remember("inside")
+    assert note.scope == "agent"
+    assert note.owner_id == "owner-a"
+    assert note.agent_id == "agent-a"
+    assert note.tenant_id == "tenant-a"
+
+    with pytest.raises(PluginError, match="agent"):
+        await gateway.remember("other agent", agent_id="agent-b")
+    with pytest.raises(PluginError, match="tenant"):
+        await gateway.recall(tenant_id="tenant-b")
+
+    other = MemoryGateway(
+        store,
+        default_scope="agent",
+        default_owner_id="owner-a",
+        default_agent_id="agent-b",
+        default_tenant_id="tenant-a",
+    )
+    assert await other.recall("") == []
+
+
+class _StaticExtractor:
+    async def extract(self, request: MemoryExtractionRequest) -> MemoryExtractionResult:
+        assert request.agent_id == "agent-a"
+        return MemoryExtractionResult(
+            candidates=[
+                MemoryCandidate(
+                    content="Use ruff for linting",
+                    tags=["auto", "preference"],
+                    kind="preference",
+                    confidence=0.9,
+                    metadata={"evidenceMessageIds": [request.new_messages[0].id]},
+                )
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_memory_extraction_gateway_writes_candidates_through_gateway(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = _jsonl_store(tmp_path, monkeypatch)
+    memory = MemoryGateway(
+        store,
+        policy=_default_policy(),
+        default_agent_id="agent-a",
+    )
+    extraction = MemoryExtractionGateway(_StaticExtractor(), memory)
+    message = Message(role="user", content="remember that I use ruff")
+    snapshot = SessionSnapshot(
+        session_id="test",
+        messages=[message],
+        metadata=SessionMetadata(revision=1, message_count=1),
+    )
+
+    written = await extraction.process_turn(snapshot, [message])
+    records = await store.list_notes()
+
+    assert written == [records[0].id]
+    assert records[0].content == "Use ruff for linting"
+    assert records[0].source == "extracted"
+    assert records[0].agent_id == "agent-a"
 
 
 @pytest.mark.asyncio
@@ -198,6 +379,23 @@ async def test_memory_gateway_uses_replaceable_index_and_policy(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_memory_gateway_uses_replaceable_retriever(tmp_path, monkeypatch) -> None:
+    store = _jsonl_store(tmp_path, monkeypatch)
+    retriever = next(
+        plugin
+        for plugin in load_memory_retriever_plugins(REPO_PLUGINS)
+        if plugin.manifest.name == "lexical"
+    ).create()
+    gateway = MemoryGateway(store, retriever=retriever)
+
+    record = await gateway.remember("prefer ruff", tags=["style"])
+
+    assert [hit.id for hit in await gateway.recall("ruff")] == [record.id]
+    assert await gateway.forget(record.id) is True
+    assert await gateway.recall("ruff") == []
+
+
+@pytest.mark.asyncio
 async def test_memory_gateway_enforces_scope_and_owner_acl(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MEMORY_DATA_DIR", str(tmp_path))
     store = next(
@@ -231,12 +429,25 @@ def _vector_gateway(tmp_path: Path, monkeypatch) -> MemoryGateway:
     services.select("embedding", "debug")
     debug = next(p for p in load_embedding_plugins(REPO_PLUGINS) if p.manifest.name == "debug")
     services.register("embedding", "debug", debug.create())
-    plugin = next(
+    memory_plugin = next(
         p
         for p in load_memory_plugins(REPO_PLUGINS, services=services)
-        if p.manifest.name == "vector"
+        if p.manifest.contribution_id == "vector"
     )
-    return MemoryGateway(plugin.create())
+    store = memory_plugin.create()
+    services.select("memory", "vector")
+    services.register(
+        "memory",
+        memory_plugin.manifest.name,
+        store,
+        aliases=candidate_service_names(memory_plugin.manifest),
+    )
+    retriever_plugin = next(
+        p
+        for p in load_memory_retriever_plugins(REPO_PLUGINS, services=services)
+        if p.manifest.contribution_id == "vector-native"
+    )
+    return MemoryGateway(store, retriever=retriever_plugin.create())
 
 
 @pytest.mark.asyncio

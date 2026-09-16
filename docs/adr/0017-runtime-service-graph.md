@@ -3,6 +3,7 @@
 - Status: accepted
 - Date: 2026-09-16
 - Depends on: ADR 0002, ADR 0013, ADR 0016
+- Refined by: ADR 0019 (memory recall strategy separation)
 
 ## Context
 
@@ -41,8 +42,9 @@ SessionGateway
 
 MemoryGateway
   -> MemoryStore plugin
-  -> optional MemoryIndex plugin
+  -> MemoryRetriever plugin (or legacy MemoryIndex adapter)
   -> optional MemoryPolicy plugin
+  -> optional MemoryExtractor plugin
   -> optional EmbeddingProvider used by the selected store
 
 ContextGateway
@@ -50,17 +52,18 @@ ContextGateway
   -> optional MemoryRecallPort
 ```
 
-`MemoryIndex` owns derived representation and can always be rebuilt from
-`MemoryStore`. `MemoryPolicy` owns write acceptance and recall ranking. Neither
-owns the source record.
+`MemoryRetriever` owns candidate recall; it may query `MemoryStore` directly or
+maintain derived representation that can be rebuilt from it. `MemoryPolicy`
+owns write acceptance and recall ranking. Neither owns the source record.
+`MemoryIndex` remains available as a legacy adapter.
 
 The three memory-facing protocols remain separate:
 
 - `ContextPolicy` is read-only and selects the messages for one model call.
 - `CompactionPolicy` proposes a replacement for persisted session history; only
   `SessionGateway` commits it.
-- `MemoryStore`, `MemoryIndex`, and `MemoryPolicy` own durable facts, derived
-  recall data, and admission or ranking rules across sessions.
+- `MemoryStore`, `MemoryRetriever`, and `MemoryPolicy` own durable facts,
+  recall candidates, and admission or ranking rules across sessions.
 
 `ContextGateway` depends only on `MemoryRecallPort`, which exposes
 `context_records()` but no write operation. A recall failure is isolated:
@@ -73,17 +76,16 @@ those records, and appends them to the system context as reference data. Pure
 `tail-window` and `summary-window` remain available when automatic memory
 injection is not desired.
 
-Built-in index plugins are `lexical` (substring candidate selection) and
-`recent` (reverse update-time candidates). Built-in policy plugins are
-`default` (importance, confidence, recency) and `strict` (quality admission or
-confidence-first ranking).
+Built-in retriever plugins are `store-native`, `lexical`, and `recent`.
+Built-in policy plugins are `default` (importance, confidence, recency) and
+`strict` (quality admission or confidence-first ranking).
 
 ## Multi-agent isolation
 
-`MemoryRecord` carries `scope` and `owner_id`. `MemoryGateway` can restrict
-allowed scopes and owners, and applies that check to writes, recall, delete, and
-update. This is the host-controlled ACL boundary; agent prompts do not decide
-visibility.
+`MemoryRecord` carries `scope`, `owner_id`, `agent_id`, and `tenant_id`.
+`MemoryGateway` can restrict each dimension and applies the checks to writes,
+recall, delete, and update. This is the host-controlled ACL boundary; agent
+prompts do not decide visibility.
 
 ## Consequences
 

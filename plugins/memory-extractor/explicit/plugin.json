@@ -1,0 +1,14 @@
+{
+  "apiVersion": "1",
+  "name": "explicit",
+  "type": "memory-extractor",
+  "version": "1.0.0",
+  "protocolVersion": 1,
+  "contract": "memory-extractor.v1",
+  "description": "Extract conservative long-term memory from explicit remember/preference statements.",
+  "enabled": true,
+  "entry": {
+    "module": "extractor.py",
+    "factory": "create_extractor"
+  }
+}

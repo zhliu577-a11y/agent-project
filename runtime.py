@@ -10,12 +10,15 @@ from core.compaction import CompactionPolicy
 from core.context import ContextPolicy
 from core.events import Event, EventGateway, EventIdentity, jsonl_sink
 from core.hooks import HookGateway
+from core.memory import MemoryRetriever
+from core.memory_extraction import MemoryExtractor
 from core.model import ModelAdapter, ModelRouter
 from core.prompt import build_system_prompt
 from core.registry import ToolRegistry
 from core.types import Message
 from gateways.context_gateway import ContextGateway
 from gateways.mcp_gateway import McpGateway, UsePlugin
+from gateways.memory_extraction_gateway import MemoryExtractionGateway
 from gateways.memory_gateway import (
     ForgetTool,
     MemoryGateway,
@@ -39,6 +42,7 @@ from plugins.services import (
     RuntimeServices,
     ServiceRef,
     ServiceResolutionError,
+    candidate_service_names,
     resolve_dependency_order,
 )
 
@@ -138,10 +142,13 @@ class HarnessRuntime:
         self.session_store: object | None = None
         self.memory_store: object | None = None
         self.memory_index: object | None = None
+        self.memory_retriever: MemoryRetriever | None = None
         self.memory_policy: object | None = None
+        self.memory_extractor: MemoryExtractor | None = None
         self.session: SessionGateway | None = None
         self.session_checkpoint: dict[str, Any] | None = None
         self.memory: MemoryGateway | None = None
+        self.memory_extraction: MemoryExtractionGateway | None = None
         self.skills: SkillGateway | None = None
         self.mcp_gateway: McpGateway | None = None
         self._use_plugin: UsePlugin | None = None
@@ -169,6 +176,7 @@ class HarnessRuntime:
             self._create_memory_gateway()
             await self._initialize_memory_index()
             self._create_context_gateway()
+            self._create_memory_extraction_gateway()
             self._register_tools()
             self.mcp_gateway = McpGateway(self._assembly.mcp)
             self._use_plugin = UsePlugin(self.mcp_gateway, self.tools)
@@ -513,7 +521,9 @@ class HarnessRuntime:
             self._assembly.sessions,
             self._assembly.memories,
             self._assembly.memory_indexes,
+            self._assembly.memory_retrievers,
             self._assembly.memory_policies,
+            self._assembly.memory_extractors,
             self._assembly.embeddings,
         ):
             for plugin in collection:
@@ -531,8 +541,12 @@ class HarnessRuntime:
             selected["compaction"] = self.config.session_compaction
         if self.config.memory_index is not None:
             selected["memory-index"] = self.config.memory_index
+        if self.config.memory_retriever is not None:
+            selected["memory-retriever"] = self.config.memory_retriever
         if self.config.memory_policy is not None:
             selected["memory-policy"] = self.config.memory_policy
+        if self.config.memory_extractor is not None:
+            selected["memory-extractor"] = self.config.memory_extractor
         return selected
 
     def _service_roots(self) -> list[ServiceRef]:
@@ -545,8 +559,12 @@ class HarnessRuntime:
             roots.append(ServiceRef("compaction", self.config.session_compaction))
         if self.config.memory_index is not None:
             roots.append(ServiceRef("memory-index", self.config.memory_index))
+        if self.config.memory_retriever is not None:
+            roots.append(ServiceRef("memory-retriever", self.config.memory_retriever))
         if self.config.memory_policy is not None:
             roots.append(ServiceRef("memory-policy", self.config.memory_policy))
+        if self.config.memory_extractor is not None:
+            roots.append(ServiceRef("memory-extractor", self.config.memory_extractor))
         return roots
 
     def _service_plugin(self, ref: ServiceRef):
@@ -556,7 +574,9 @@ class HarnessRuntime:
             "session": self._assembly.sessions,
             "memory": self._assembly.memories,
             "memory-index": self._assembly.memory_indexes,
+            "memory-retriever": self._assembly.memory_retrievers,
             "memory-policy": self._assembly.memory_policies,
+            "memory-extractor": self._assembly.memory_extractors,
             "embedding": self._assembly.embeddings,
         }
         plugin = next(
@@ -594,7 +614,12 @@ class HarnessRuntime:
             for ref in order:
                 current_plugin = self._service_plugin(ref)
                 instance = current_plugin.create()
-                self.services.register(ref.kind, ref.name, instance)
+                self.services.register(
+                    ref.kind,
+                    ref.name,
+                    instance,
+                    aliases=candidate_service_names(current_plugin.manifest),
+                )
                 created.append((current_plugin.manifest, instance))
         except Exception as exc:
             await self._rollback_service_instances(created)
@@ -617,8 +642,12 @@ class HarnessRuntime:
                 self.memory_store = instance
             elif ref.kind == "memory-index":
                 self.memory_index = instance
+            elif ref.kind == "memory-retriever":
+                self.memory_retriever = instance  # type: ignore[assignment]
             elif ref.kind == "memory-policy":
                 self.memory_policy = instance
+            elif ref.kind == "memory-extractor":
+                self.memory_extractor = instance  # type: ignore[assignment]
 
     async def _rollback_service_instances(
         self,
@@ -662,8 +691,13 @@ class HarnessRuntime:
         self.memory = MemoryGateway(
             self.memory_store,  # type: ignore[arg-type]
             events=self._require_events().publisher(EventIdentity.host("memory-gateway")),
+            retriever=self.memory_retriever,
             index=self.memory_index,  # type: ignore[arg-type]
             policy=self.memory_policy,  # type: ignore[arg-type]
+            default_scope=self.config.memory_scope,
+            default_owner_id=self.config.memory_owner_id,
+            default_agent_id=self.config.memory_agent_id,
+            default_tenant_id=self.config.memory_tenant_id,
         )
 
     def _create_context_gateway(self) -> None:
@@ -672,16 +706,33 @@ class HarnessRuntime:
         self.context_gateway = ContextGateway(
             self.context_policy,
             memory=self.memory,
+            default_scope=self.config.memory_scope,
+            default_owner_id=self.config.memory_owner_id,
+            default_agent_id=self.config.memory_agent_id,
+            default_tenant_id=self.config.memory_tenant_id,
+        )
+
+    def _create_memory_extraction_gateway(self) -> None:
+        if self.memory_extractor is None or self.memory is None:
+            self.memory_extraction = None
+            return
+        self.memory_extraction = MemoryExtractionGateway(
+            self.memory_extractor,
+            self.memory,
+            events=self._require_events().publisher(
+                EventIdentity.host("memory-extraction-gateway")
+            ),
         )
 
     async def _initialize_memory_index(self) -> None:
-        if self.memory_store is None or self.memory_index is None:
+        if self.memory_store is None or self.memory is None:
             return
         try:
             records = await self.memory_store.list_notes()  # type: ignore[attr-defined]
-            await self.memory_index.rebuild(records)  # type: ignore[attr-defined]
+            await self.memory.retriever.rebuild(records)
+            await self.memory.maintain()
         except Exception as exc:
-            raise RuntimeStartupError(f"memory index initialization failed: {exc}") from exc
+            raise RuntimeStartupError(f"memory retriever initialization failed: {exc}") from exc
 
     def _register_tools(self) -> None:
         self.tools = ToolRegistry()
@@ -825,6 +876,10 @@ def _merge_assemblies(target: PluginAssembly, source: PluginAssembly) -> None:
     target.skills.extend(source.skills)
     target.sessions.extend(source.sessions)
     target.memories.extend(source.memories)
+    target.memory_indexes.extend(source.memory_indexes)
+    target.memory_retrievers.extend(source.memory_retrievers)
+    target.memory_policies.extend(source.memory_policies)
+    target.memory_extractors.extend(source.memory_extractors)
     target.embeddings.extend(source.embeddings)
     target.listeners.extend(source.listeners)
     target.event_transports.extend(source.event_transports)

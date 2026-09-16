@@ -9,6 +9,7 @@ from plugins.services import (
     RuntimeServices,
     ServiceRef,
     ServiceResolutionError,
+    candidate_service_names,
     resolve_dependency_order,
 )
 
@@ -18,6 +19,8 @@ def _manifest(
     name: str,
     *,
     requires: tuple[PluginRequirement, ...] = (),
+    package_name: str | None = None,
+    contribution_id: str | None = None,
 ) -> PluginManifest:
     return PluginManifest(
         name=name,
@@ -29,6 +32,8 @@ def _manifest(
         entry={},
         contract=f"{kind}.v1",
         requires=requires,
+        package_name=package_name,
+        contribution_id=contribution_id,
     )
 
 
@@ -41,6 +46,81 @@ def test_runtime_services_resolve_selected_and_named_instances() -> None:
     assert services.get("embedding") is provider
     assert services.require("embedding", "debug") is provider
     assert services.available("embedding") == (("embedding", "debug"),)
+
+
+def test_runtime_services_resolve_package_contribution_aliases() -> None:
+    services = RuntimeServices()
+    store = object()
+    services.register(
+        "memory",
+        "memory-vector--vector",
+        store,
+        aliases=("memory-vector--vector", "vector", "memory-vector--vector"),
+    )
+
+    assert services.get("memory", "vector") is store
+    assert services.get("memory", "memory-vector--vector") is store
+
+
+def test_runtime_services_rejects_alias_collision_without_partial_registration() -> None:
+    services = RuntimeServices()
+    services.register("memory", "first", object(), aliases=("shared",))
+
+    with pytest.raises(ServiceResolutionError, match="alias already registered"):
+        services.register("memory", "second", object(), aliases=("shared",))
+
+    assert services.get("memory", "second") is None
+
+
+def test_candidate_service_names_include_package_and_contribution_names() -> None:
+    manifest = PluginManifest(
+        name="memory-vector--vector",
+        type="memory",
+        version="1.0.0",
+        description="",
+        enabled=True,
+        directory=Path("."),
+        entry={},
+        contract="memory.v1",
+        package_name="memory-vector",
+        contribution_id="vector",
+    )
+
+    assert candidate_service_names(manifest) == (
+        "memory-vector--vector",
+        "vector",
+    )
+
+
+def test_dependency_graph_resolves_contribution_aliases_to_canonical_names() -> None:
+    memory = _manifest(
+        "memory",
+        "memory-vector--vector",
+        package_name="memory-vector",
+        contribution_id="vector",
+    )
+    retriever = _manifest(
+        "memory-retriever",
+        "memory-vector--vector-native",
+        requires=(PluginRequirement(kind="memory", name="vector"),),
+        package_name="memory-vector",
+        contribution_id="vector-native",
+    )
+    catalog = {
+        ("memory", memory.name): memory,
+        ("memory-retriever", retriever.name): retriever,
+    }
+
+    order = resolve_dependency_order(
+        [ServiceRef("memory-retriever", "vector-native")],
+        catalog=catalog,
+        selected={"memory": "vector"},
+    )
+
+    assert order == [
+        ServiceRef("memory", "memory-vector--vector"),
+        ServiceRef("memory-retriever", "memory-vector--vector-native"),
+    ]
 
 
 def test_dependency_graph_is_dependency_first() -> None:

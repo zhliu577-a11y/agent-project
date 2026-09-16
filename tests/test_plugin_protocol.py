@@ -69,7 +69,13 @@ def test_builtin_manifests_declare_the_platform_protocol_explicitly() -> None:
         raw = json.loads(path.read_text(encoding="utf-8"))
         assert raw["apiVersion"] == MANIFEST_API_VERSION
         assert raw["protocolVersion"] == PLUGIN_PROTOCOL_VERSION
-        assert raw["contract"] == f"{raw['type']}.v{PLUGIN_PROTOCOL_VERSION}"
+        if "contributes" in raw:
+            for contribution in raw["contributes"]:
+                assert (
+                    contribution["contract"] == f"{contribution['kind']}.v{PLUGIN_PROTOCOL_VERSION}"
+                )
+        else:
+            assert raw["contract"] == f"{raw['type']}.v{PLUGIN_PROTOCOL_VERSION}"
 
 
 class LifecyclePlugin:

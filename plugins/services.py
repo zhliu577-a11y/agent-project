@@ -62,6 +62,7 @@ class RuntimeServices:
     def __init__(self) -> None:
         self._selected: dict[str, str] = {}
         self._instances: dict[tuple[str, str], object] = {}
+        self._aliases: dict[tuple[str, str], tuple[str, str]] = {}
 
     def select(self, kind: str, name: str) -> None:
         self._selected[kind] = name
@@ -69,26 +70,53 @@ class RuntimeServices:
     def selected_name(self, kind: str) -> str | None:
         return self._selected.get(kind)
 
-    def register(self, kind: str, name: str, instance: object) -> None:
+    def register(
+        self,
+        kind: str,
+        name: str,
+        instance: object,
+        *,
+        aliases: Sequence[str] = (),
+    ) -> None:
         key = (kind, name)
         if key in self._instances:
             raise ServiceResolutionError(f"service already registered: {kind}/{name}")
+        aliases_to_add: list[tuple[str, str]] = []
+        for alias in aliases:
+            alias_key = (kind, alias)
+            if alias_key == key:
+                continue
+            existing = self._aliases.get(alias_key)
+            if existing is not None and existing != key:
+                raise ServiceResolutionError(f"service alias already registered: {kind}/{alias}")
+            if alias_key in self._instances:
+                raise ServiceResolutionError(f"service alias already registered: {kind}/{alias}")
+            if alias_key not in aliases_to_add:
+                aliases_to_add.append((alias_key, key))
         self._instances[key] = instance
+        for alias_key, target in aliases_to_add:
+            self._aliases[alias_key] = target
+
+    def _resolve_key(self, kind: str, name: str) -> tuple[str, str]:
+        key = (kind, name)
+        return self._aliases.get(key, key)
 
     def unregister(self, kind: str, name: str) -> None:
-        self._instances.pop((kind, name), None)
+        key = self._resolve_key(kind, name)
+        self._instances.pop(key, None)
+        self._aliases = {alias: target for alias, target in self._aliases.items() if target != key}
 
     def get(self, kind: str, name: str | None = None) -> object | None:
         resolved_name = name or self._selected.get(kind)
         if resolved_name is None:
             return None
-        return self._instances.get((kind, resolved_name))
+        return self._instances.get(self._resolve_key(kind, resolved_name))
 
     def require(self, kind: str, name: str | None = None) -> object:
         resolved_name = name or self._selected.get(kind)
         if resolved_name is None:
             raise ServiceResolutionError(f"no selected service for kind '{kind}'")
-        service = self._instances.get((kind, resolved_name))
+        service = self._instances.get(self._resolve_key(kind, resolved_name))
         if service is None:
             raise ServiceResolutionError(f"service not initialized: {kind}/{resolved_name}")
         return service
@@ -111,6 +139,11 @@ def _candidate_names(manifest: ServiceManifest) -> tuple[str, ...]:
         names.append(f"{manifest.package_name}--{manifest.contribution_id}")
     # Preserve order while removing duplicates.
     return tuple(dict.fromkeys(names))
+
+
+def candidate_service_names(manifest: ServiceManifest) -> tuple[str, ...]:
+    """Return canonical and compatibility names accepted for one service."""
+    return _candidate_names(manifest)
 
 
 def _find_manifest(
@@ -172,16 +205,16 @@ def resolve_dependency_order(
     visited: set[ServiceRef] = set()
 
     def visit(ref: ServiceRef) -> None:
+        manifest = _find_manifest(catalog, kind=ref.kind, name=ref.name)
+        if manifest is None:
+            raise ServiceResolutionError(f"service not found: {ref.kind}/{ref.name}")
+        ref = ServiceRef(kind=ref.kind, name=manifest.name)
         if ref in visited:
             return
         if ref in visiting:
             cycle = [*visiting[visiting.index(ref) :], ref]
             path = " -> ".join(f"{item.kind}/{item.name}" for item in cycle)
             raise DependencyCycleError(f"plugin dependency cycle: {path}")
-
-        manifest = _find_manifest(catalog, kind=ref.kind, name=ref.name)
-        if manifest is None:
-            raise ServiceResolutionError(f"service not found: {ref.kind}/{ref.name}")
 
         visiting.append(ref)
         for requirement in manifest.requires:

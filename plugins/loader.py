@@ -104,7 +104,8 @@ from core.events import (
     coerce_subscriptions,
 )
 from core.hooks import HOOK_EVENTS, HookSpec, LifecycleHooks
-from core.memory import MemoryIndex, MemoryPolicy, MemoryStore
+from core.memory import MemoryIndex, MemoryPolicy, MemoryRetriever, MemoryStore
+from core.memory_extraction import MemoryExtractor
 from core.model import ModelAdapter, ModelMetadata, ModelRouter
 from core.session import SessionStore
 from core.tool import Tool
@@ -482,6 +483,27 @@ class MemoryIndexPlugin:
 
 
 @dataclass(frozen=True)
+class MemoryRetrieverPlugin:
+    """Recall strategy plugin selected by MEMORY_RETRIEVER."""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> MemoryRetriever:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            retriever = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: memory retriever factory failed: {exc}") from exc
+        _expect(
+            isinstance(retriever, MemoryRetriever),
+            where,
+            f"memory retriever factory must return MemoryRetriever, got {type(retriever).__name__}",
+        )
+        return retriever
+
+
+@dataclass(frozen=True)
 class MemoryPolicyPlugin:
     """Semantic-memory policy plugin selected by MEMORY_POLICY."""
 
@@ -500,6 +522,27 @@ class MemoryPolicyPlugin:
             f"memory policy factory must return MemoryPolicy, got {type(policy).__name__}",
         )
         return policy
+
+
+@dataclass(frozen=True)
+class MemoryExtractorPlugin:
+    """Long-term memory extraction policy selected by MEMORY_EXTRACTOR."""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> MemoryExtractor:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            extractor = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: memory extractor factory failed: {exc}") from exc
+        _expect(
+            isinstance(extractor, MemoryExtractor),
+            where,
+            f"memory extractor factory must return MemoryExtractor, got {type(extractor).__name__}",
+        )
+        return extractor
 
 
 @dataclass(frozen=True)
@@ -1287,7 +1330,9 @@ def _validate_static_entry(manifest: PluginManifest) -> None:
         "session",
         "memory",
         "memory-index",
+        "memory-retriever",
         "memory-policy",
+        "memory-extractor",
         "embedding",
         "listener",
         "event-transport",
@@ -1877,6 +1922,20 @@ def load_memory_index_plugin(
     )
 
 
+def load_memory_retriever_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
+) -> MemoryRetrieverPlugin:
+    """Validate a memory recall strategy without instantiating it."""
+    factory = _load_entry_factory(manifest, "memory-retriever")
+    context = _plugin_context(manifest, config, services)
+    return MemoryRetrieverPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
+
+
 def load_memory_policy_plugin(
     manifest: PluginManifest,
     config: AppConfig | None = None,
@@ -1886,6 +1945,20 @@ def load_memory_policy_plugin(
     factory = _load_entry_factory(manifest, "memory-policy")
     context = _plugin_context(manifest, config, services)
     return MemoryPolicyPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
+
+
+def load_memory_extractor_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
+) -> MemoryExtractorPlugin:
+    """Validate an automatic memory extraction policy without instantiating it."""
+    factory = _load_entry_factory(manifest, "memory-extractor")
+    context = _plugin_context(manifest, config, services)
+    return MemoryExtractorPlugin(
         manifest=manifest,
         factory=lambda _directory: _call_plugin_factory(factory, context),
     )
@@ -2105,6 +2178,21 @@ def load_memory_index_plugins(
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
+def load_memory_retriever_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
+) -> list[MemoryRetrieverPlugin]:
+    """Load enabled memory recall strategies without instantiating them."""
+    plugins: list[MemoryRetrieverPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "memory-retriever":
+            continue
+        plugins.append(load_memory_retriever_plugin(manifest, config, services))
+        logger.info("memory retriever plugin discovered: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
 def load_memory_policy_plugins(
     root: str | Path | Sequence[str | Path] | None = None,
     config: AppConfig | None = None,
@@ -2117,6 +2205,21 @@ def load_memory_policy_plugins(
             continue
         plugins.append(load_memory_policy_plugin(manifest, config, services))
         logger.info("memory policy plugin discovered: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
+def load_memory_extractor_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
+) -> list[MemoryExtractorPlugin]:
+    """Load enabled memory extraction policies without instantiating them."""
+    plugins: list[MemoryExtractorPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "memory-extractor":
+            continue
+        plugins.append(load_memory_extractor_plugin(manifest, config, services))
+        logger.info("memory extractor plugin discovered: %s", manifest.name)
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
@@ -2181,7 +2284,9 @@ class PluginAssembly:
     sessions: list[SessionPlugin] = field(default_factory=list)
     memories: list[MemoryPlugin] = field(default_factory=list)
     memory_indexes: list[MemoryIndexPlugin] = field(default_factory=list)
+    memory_retrievers: list[MemoryRetrieverPlugin] = field(default_factory=list)
     memory_policies: list[MemoryPolicyPlugin] = field(default_factory=list)
+    memory_extractors: list[MemoryExtractorPlugin] = field(default_factory=list)
     embeddings: list[EmbeddingPlugin] = field(default_factory=list)
     listeners: list[ListenerPlugin] = field(default_factory=list)
     event_transports: list[EventTransportPlugin] = field(default_factory=list)
@@ -2248,12 +2353,28 @@ def _apply_memory_index(
     assembly.memory_indexes.append(plugin)
 
 
+def _apply_memory_retriever(
+    assembly: PluginAssembly,
+    manifest: PluginManifest,
+    plugin: MemoryRetrieverPlugin,
+) -> None:
+    assembly.memory_retrievers.append(plugin)
+
+
 def _apply_memory_policy(
     assembly: PluginAssembly,
     manifest: PluginManifest,
     plugin: MemoryPolicyPlugin,
 ) -> None:
     assembly.memory_policies.append(plugin)
+
+
+def _apply_memory_extractor(
+    assembly: PluginAssembly,
+    manifest: PluginManifest,
+    plugin: MemoryExtractorPlugin,
+) -> None:
+    assembly.memory_extractors.append(plugin)
 
 
 def _apply_embedding(
@@ -2289,7 +2410,21 @@ register_kind(KindHandler("skill", load_skill_plugin, _apply_skill))
 register_kind(KindHandler("session", load_session_plugin, _apply_session))
 register_kind(KindHandler("memory", load_memory_plugin, _apply_memory))
 register_kind(KindHandler("memory-index", load_memory_index_plugin, _apply_memory_index))
+register_kind(
+    KindHandler(
+        "memory-retriever",
+        load_memory_retriever_plugin,
+        _apply_memory_retriever,
+    )
+)
 register_kind(KindHandler("memory-policy", load_memory_policy_plugin, _apply_memory_policy))
+register_kind(
+    KindHandler(
+        "memory-extractor",
+        load_memory_extractor_plugin,
+        _apply_memory_extractor,
+    )
+)
 register_kind(KindHandler("embedding", load_embedding_plugin, _apply_embedding))
 register_kind(KindHandler("listener", load_listener_plugin, _apply_listener))
 register_kind(

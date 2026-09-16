@@ -28,6 +28,8 @@ class MemoryRecord:
     kind: str = "fact"
     scope: str = "user"
     owner_id: str = ""
+    agent_id: str = ""
+    tenant_id: str = ""
     source: str = "explicit"
     confidence: float = 1.0
     importance: float = 0.5
@@ -49,9 +51,48 @@ class MemoryQuery:
     text: str = ""
     scope: str | None = None
     owner_id: str | None = None
+    agent_id: str | None = None
+    tenant_id: str | None = None
     kinds: tuple[str, ...] = ()
     limit: int = 20
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MemoryIdentity:
+    """Trusted identity assigned to memory reads and writes."""
+
+    scope: str = "user"
+    owner_id: str = ""
+    agent_id: str = ""
+    tenant_id: str = ""
+
+
+@dataclass(frozen=True)
+class MemoryWriteDecision:
+    """Lifecycle action selected by a memory policy."""
+
+    action: str = "insert"
+    target_id: str | None = None
+    reason: str = ""
+
+
+def normalize_memory_text(value: str) -> str:
+    """Normalize content for exact duplicate detection."""
+    return " ".join(value.split()).casefold()
+
+
+def record_is_expired(record: MemoryRecord, *, now: datetime | None = None) -> bool:
+    """Return whether a record has an invalid or elapsed expiration time."""
+    if not record.expires_at:
+        return False
+    try:
+        expires = datetime.fromisoformat(record.expires_at)
+    except ValueError:
+        return True
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    return expires <= (now or datetime.now(UTC))
 
 
 @runtime_checkable
@@ -64,6 +105,8 @@ class MemoryRecallPort(Protocol):
         *,
         scope: str | None = None,
         owner_id: str | None = None,
+        agent_id: str | None = None,
+        tenant_id: str | None = None,
         limit: int = 8,
     ) -> list[dict[str, Any]]:
         """Return context-ready records without exposing write operations."""
@@ -79,6 +122,8 @@ def record_to_dict(record: MemoryRecord) -> dict[str, Any]:
         "kind": record.kind,
         "scope": record.scope,
         "owner_id": record.owner_id,
+        "agent_id": record.agent_id,
+        "tenant_id": record.tenant_id,
         "source": record.source,
         "confidence": record.confidence,
         "importance": record.importance,
@@ -101,6 +146,8 @@ def record_from_dict(raw: dict[str, Any]) -> MemoryRecord:
         kind=str(raw.get("kind", "fact")),
         scope=str(raw.get("scope", "user")),
         owner_id=str(raw.get("owner_id", "")),
+        agent_id=str(raw.get("agent_id", "")),
+        tenant_id=str(raw.get("tenant_id", "")),
         source=str(raw.get("source", "explicit")),
         confidence=float(raw.get("confidence", 1.0)),
         importance=float(raw.get("importance", 0.5)),
@@ -179,6 +226,60 @@ class MemoryIndex(ABC):
     async def search(self, query: MemoryQuery) -> list[MemoryRecord]: ...
 
 
+class MemoryRetriever(ABC):
+    """Turn a memory query into candidate records.
+
+    A retriever may query storage directly, search a derived index, call a
+    vector service, or combine several sources. Optional maintenance methods
+    let retrievers keep derived state in sync with MemoryGateway writes.
+    """
+
+    @abstractmethod
+    async def retrieve(self, query: MemoryQuery) -> list[MemoryRecord]:
+        """Return candidate records for policy ranking."""
+
+    async def rebuild(self, records: list[MemoryRecord]) -> None:
+        """Rebuild optional derived state from durable records."""
+        return None
+
+    async def add(self, record: MemoryRecord) -> None:
+        """Observe a durable record write."""
+        return None
+
+    async def remove(self, record_id: str) -> None:
+        """Observe a durable record removal."""
+        return None
+
+
+class StoreMemoryRetriever(MemoryRetriever):
+    """Default retriever that delegates to the storage backend's search."""
+
+    def __init__(self, store: MemoryStore) -> None:
+        self._store = store
+
+    async def retrieve(self, query: MemoryQuery) -> list[MemoryRecord]:
+        return await self._store.search_notes(query.text)
+
+
+class LegacyMemoryIndexRetriever(MemoryRetriever):
+    """Adapt a v1 MemoryIndex plugin to the retriever contract."""
+
+    def __init__(self, index: MemoryIndex) -> None:
+        self._index = index
+
+    async def retrieve(self, query: MemoryQuery) -> list[MemoryRecord]:
+        return await self._index.search(query)
+
+    async def rebuild(self, records: list[MemoryRecord]) -> None:
+        await self._index.rebuild(records)
+
+    async def add(self, record: MemoryRecord) -> None:
+        await self._index.add(record)
+
+    async def remove(self, record_id: str) -> None:
+        await self._index.remove(record_id)
+
+
 class MemoryPolicy(ABC):
     """Replaceable semantic-memory policy for writes and recall ranking."""
 
@@ -190,6 +291,14 @@ class MemoryPolicy(ABC):
     ) -> MemoryRecord | None:
         """Return a record to persist, or None to reject the candidate."""
         return record
+
+    def reconcile(
+        self,
+        candidate: MemoryRecord,
+        existing: list[MemoryRecord],
+    ) -> MemoryWriteDecision:
+        """Choose how a candidate should be reconciled with existing records."""
+        return MemoryWriteDecision()
 
     @abstractmethod
     def rank(
