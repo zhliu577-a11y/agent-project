@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -79,6 +80,7 @@ class MemoryGateway:
         self._allowed_tenant_ids = (
             frozenset(allowed_tenant_ids) if allowed_tenant_ids is not None else None
         )
+        self._write_lock = asyncio.Lock()
 
     @property
     def identity(self) -> MemoryIdentity:
@@ -127,6 +129,19 @@ class MemoryGateway:
             record.tenant_id,
         )
 
+    @staticmethod
+    def _is_recallable(record: MemoryNote, request: MemoryQuery) -> bool:
+        """Apply lifecycle and identity invariants independently of policy."""
+        return (
+            record.status == "active"
+            and not record_is_expired(record)
+            and (request.scope is None or record.scope == request.scope)
+            and (request.owner_id is None or record.owner_id == request.owner_id)
+            and (request.agent_id is None or record.agent_id == request.agent_id)
+            and (request.tenant_id is None or record.tenant_id == request.tenant_id)
+            and (not request.kinds or record.kind in request.kinds)
+        )
+
     async def _emit(self, name: str, **payload: object) -> None:
         if self._events is None:
             return
@@ -163,7 +178,7 @@ class MemoryGateway:
             requested_tenant_id,
         )
 
-        note = await self._store.add_note(content, tags or [])
+        note = self._store.create_record(content, tags or [])
         note.kind = kind
         note.scope = requested_scope
         note.owner_id = requested_owner_id
@@ -177,11 +192,115 @@ class MemoryGateway:
         note.metadata = dict(metadata or {})
         note.updated_at = note.created_at
 
+        async with self._write_lock:
+            if self._store.supports_atomic_commit:
+                result, event_name, event_payload = await self._remember_atomic(note)
+            else:
+                result, event_name, event_payload = await self._remember_legacy(note)
+        if event_name is not None:
+            await self._emit(event_name, **event_payload)
+        return result
+
+    async def _remember_atomic(
+        self,
+        note: MemoryNote,
+    ) -> tuple[MemoryNote, str | None, dict[str, object]]:
+        if self._policy is not None:
+            candidate = self._policy.prepare_write(note)
+            if candidate is None:
+                return note, None, {}
+            note = candidate
+            self._authorize(
+                note.scope,
+                note.owner_id,
+                note.agent_id,
+                note.tenant_id,
+            )
+
+        existing = [record for record in await self._store.list_notes() if record.id != note.id]
+        decision = self._policy.reconcile(note, existing) if self._policy is not None else None
+        if decision is not None and decision.action == "skip":
+            target = next(
+                (record for record in existing if record.id == decision.target_id),
+                None,
+            )
+            return (
+                target or note,
+                "memory.skipped",
+                {
+                    "note_id": note.id,
+                    "target_id": decision.target_id,
+                    "reason": decision.reason,
+                },
+            )
+        if decision is not None and decision.action == "update":
+            target = next(
+                (record for record in existing if record.id == decision.target_id),
+                None,
+            )
+            if target is not None:
+                updated = self._merge_record(target, note)
+                await self._store.commit_records([updated])
+                await self._retriever.add(updated)
+                return (
+                    updated,
+                    "memory.update",
+                    {
+                        "note_id": updated.id,
+                        "reason": decision.reason,
+                        "tags": updated.tags,
+                    },
+                )
+        if decision is not None and decision.action == "supersede":
+            target = next(
+                (record for record in existing if record.id == decision.target_id),
+                None,
+            )
+            if target is not None:
+                target.status = "superseded"
+                target.updated_at = _now()
+                note.supersedes = target.id
+                await self._store.commit_records([target, note])
+                await self._retriever.remove(target.id)
+                await self._retriever.add(note)
+                return (
+                    note,
+                    "memory.write",
+                    {"note_id": note.id, "tags": note.tags, "scope": note.scope},
+                )
+
+        await self._store.commit_records([note])
+        await self._retriever.add(note)
+        return (
+            note,
+            "memory.write",
+            {"note_id": note.id, "tags": note.tags, "scope": note.scope},
+        )
+
+    async def _remember_legacy(
+        self,
+        note: MemoryNote,
+    ) -> tuple[MemoryNote, str | None, dict[str, object]]:
+        candidate = note
+        note = await self._store.add_note(candidate.content, candidate.tags)
+        note.kind = candidate.kind
+        note.scope = candidate.scope
+        note.owner_id = candidate.owner_id
+        note.agent_id = candidate.agent_id
+        note.tenant_id = candidate.tenant_id
+        note.source = candidate.source
+        note.confidence = candidate.confidence
+        note.importance = candidate.importance
+        note.expires_at = candidate.expires_at
+        note.supersedes = candidate.supersedes
+        note.metadata = dict(candidate.metadata)
+        note.updated_at = note.created_at
+
         if self._policy is not None:
             candidate = self._policy.prepare_write(note)
             if candidate is None:
                 await self._store.delete_note(note.id)
-                return note
+                return note, None, {}
             note = candidate
             try:
                 self._authorize(
@@ -199,17 +318,19 @@ class MemoryGateway:
             decision = self._policy.reconcile(note, existing) if self._policy is not None else None
             if decision is not None and decision.action == "skip":
                 await self._store.delete_note(note.id)
-                await self._emit(
-                    "memory.skipped",
-                    note_id=note.id,
-                    target_id=decision.target_id,
-                    reason=decision.reason,
-                )
                 target = next(
                     (record for record in existing if record.id == decision.target_id),
                     None,
                 )
-                return target or note
+                return (
+                    target or note,
+                    "memory.skipped",
+                    {
+                        "note_id": note.id,
+                        "target_id": decision.target_id,
+                        "reason": decision.reason,
+                    },
+                )
             if decision is not None and decision.action == "update":
                 target = next(
                     (record for record in existing if record.id == decision.target_id),
@@ -220,13 +341,15 @@ class MemoryGateway:
                     await self._store.save_record(updated)
                     await self._retriever.add(updated)
                     await self._store.delete_note(note.id)
-                    await self._emit(
+                    return (
+                        updated,
                         "memory.update",
-                        note_id=updated.id,
-                        reason=decision.reason,
-                        tags=updated.tags,
+                        {
+                            "note_id": updated.id,
+                            "reason": decision.reason,
+                            "tags": updated.tags,
+                        },
                     )
-                    return updated
             if decision is not None and decision.action == "supersede":
                 target = next(
                     (record for record in existing if record.id == decision.target_id),
@@ -244,8 +367,11 @@ class MemoryGateway:
             await self._store.delete_note(note.id)
             await self._retriever.remove(note.id)
             raise
-        await self._emit("memory.write", note_id=note.id, tags=note.tags, scope=note.scope)
-        return note
+        return (
+            note,
+            "memory.write",
+            {"note_id": note.id, "tags": note.tags, "scope": note.scope},
+        )
 
     @staticmethod
     def _merge_record(target: MemoryNote, candidate: MemoryNote) -> MemoryNote:
@@ -291,30 +417,25 @@ class MemoryGateway:
             requested_agent_id,
             requested_tenant_id,
         )
-        candidates = await self._retriever.retrieve(request)
-        candidates = [
-            record
-            for record in candidates
-            if (request.scope is None or record.scope == request.scope)
-            and (request.owner_id is None or record.owner_id == request.owner_id)
-            and (request.agent_id is None or record.agent_id == request.agent_id)
-            and (request.tenant_id is None or record.tenant_id == request.tenant_id)
-            and (not request.kinds or record.kind in request.kinds)
-        ]
-        if self._policy is not None:
-            candidates = self._policy.rank(request, list(candidates))
+        async with self._write_lock:
+            candidates = await self._retriever.retrieve(request)
+            candidates = [record for record in candidates if self._is_recallable(record, request)]
+            if self._policy is not None:
+                candidates = self._policy.rank(request, list(candidates))
+            candidates = [record for record in candidates if self._is_recallable(record, request)]
 
-        accessed_at = _now()
-        for record in candidates:
-            record.last_accessed_at = accessed_at
-            access_count = int(record.metadata.get("accessCount", 0)) + 1
-            record.metadata["accessCount"] = access_count
+            selected = candidates[:limit]
+            if not selected:
+                return []
+
+            accessed_at = _now()
             try:
-                await self._store.save_record(record)
-                await self._retriever.add(record)
+                await self._store.touch_records(selected, accessed_at=accessed_at)
+                for record in selected:
+                    await self._retriever.add(record)
             except Exception as exc:
                 logger.warning("memory access statistics update failed: %s", exc)
-        return candidates[:limit]
+            return selected
 
     async def context_records(
         self,
@@ -338,30 +459,35 @@ class MemoryGateway:
 
     async def maintain(self) -> dict[str, int]:
         """Mark expired records and remove them from the derived index."""
-        records = await self._store.list_notes()
-        expired = [
-            record for record in records if record.status == "active" and record_is_expired(record)
-        ]
-        for record in expired:
-            previous = record.status
-            record.status = "expired"
-            record.updated_at = _now()
-            try:
-                await self._store.save_record(record)
-                await self._retriever.remove(record.id)
-            except Exception:
-                record.status = previous
-                logger.exception("memory expiration maintenance failed: %s", record.id)
+        async with self._write_lock:
+            records = await self._store.list_notes()
+            expired = [
+                record
+                for record in records
+                if record.status == "active" and record_is_expired(record)
+            ]
+            for record in expired:
+                record.status = "expired"
+                record.updated_at = _now()
+            if expired:
+                try:
+                    await self._store.commit_records(expired)
+                    for record in expired:
+                        await self._retriever.remove(record.id)
+                except Exception:
+                    logger.exception("memory expiration maintenance failed")
+                    return {"checked": len(records), "expired": 0}
         if expired:
             await self._emit("memory.expired", count=len(expired))
         return {"checked": len(records), "expired": len(expired)}
 
     @boundary("删除长期记忆失败", fallback=ToolError)
     async def forget(self, note_id: str) -> bool:
-        await self._authorize_record(note_id)
-        removed = await self._store.delete_note(note_id)
-        if removed:
-            await self._retriever.remove(note_id)
+        async with self._write_lock:
+            await self._authorize_record(note_id)
+            removed = await self._store.delete_note(note_id)
+            if removed:
+                await self._retriever.remove(note_id)
         if removed:
             await self._emit("memory.delete", note_id=note_id)
         return removed
@@ -373,10 +499,11 @@ class MemoryGateway:
         content: str | None = None,
         tags: list[str] | None = None,
     ) -> MemoryNote | None:
-        await self._authorize_record(note_id)
-        note = await self._store.update_note(note_id, content, tags)
-        if note is not None:
-            await self._retriever.add(note)
+        async with self._write_lock:
+            await self._authorize_record(note_id)
+            note = await self._store.update_note(note_id, content, tags)
+            if note is not None:
+                await self._retriever.add(note)
         if note is not None:
             await self._emit("memory.update", note_id=note.id, tags=note.tags)
         return note

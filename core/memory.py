@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
+from uuid import uuid4
 
 
 def _now() -> str:
@@ -171,6 +172,17 @@ def note_from_dict(raw: dict[str, Any]) -> MemoryNote:
 class MemoryStore(ABC):
     """Persistence contract for durable semantic memory."""
 
+    supports_atomic_commit = False
+
+    def create_record(self, content: str, tags: list[str]) -> MemoryRecord:
+        """Build an unstored record; persistence happens through commit_records."""
+        return MemoryRecord(
+            id=uuid4().hex[:12],
+            content=content,
+            tags=list(tags),
+            created_at=_now(),
+        )
+
     @abstractmethod
     async def list_notes(self) -> list[MemoryNote]:
         """Return all records in stable creation order."""
@@ -204,6 +216,40 @@ class MemoryStore(ABC):
     async def save_record(self, record: MemoryRecord) -> None:
         """Persist extended record fields when the backend supports them."""
         return None
+
+    async def touch_records(
+        self,
+        records: list[MemoryRecord],
+        *,
+        accessed_at: str,
+    ) -> None:
+        """Update access metadata without replacing record content.
+
+        Backends with a native field-level update should override this method.
+        The compatibility implementation updates the supplied objects and
+        persists them through ``save_record``.
+        """
+        for record in records:
+            record.last_accessed_at = accessed_at
+            record.metadata["accessCount"] = int(record.metadata.get("accessCount", 0)) + 1
+            await self.save_record(record)
+
+    async def commit_records(
+        self,
+        records: list[MemoryRecord],
+        *,
+        delete_ids: tuple[str, ...] | list[str] = (),
+    ) -> None:
+        """Atomically persist upserts and deletes when the backend supports it.
+
+        The compatibility implementation applies operations sequentially.
+        Backends that can guarantee a single transaction set
+        ``supports_atomic_commit`` to true and override this method.
+        """
+        for record in records:
+            await self.save_record(record)
+        for record_id in delete_ids:
+            await self.delete_note(record_id)
 
 
 class MemoryIndex(ABC):

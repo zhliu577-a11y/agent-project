@@ -10,7 +10,6 @@ import os
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
 
 from core.memory import MemoryNote, MemoryStore, note_from_dict, note_to_dict
 
@@ -20,7 +19,9 @@ CREATE TABLE IF NOT EXISTS memory_notes (
     content    TEXT NOT NULL,
     tags       TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    record     TEXT
+    record     TEXT,
+    last_accessed_at TEXT,
+    access_count     INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory_notes (created_at);
 """
@@ -28,6 +29,8 @@ CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory_notes (created_at);
 
 class SqliteMemoryStore(MemoryStore):
     """把语义笔记存在 SQLite 里：事务写入、可扩展、可并发。"""
+
+    supports_atomic_commit = True
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
@@ -40,20 +43,57 @@ class SqliteMemoryStore(MemoryStore):
         conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(_SCHEMA)
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_notes)")}
+        migrated = False
         if "record" not in columns:
             conn.execute("ALTER TABLE memory_notes ADD COLUMN record TEXT")
+            migrated = True
+        if "last_accessed_at" not in columns:
+            conn.execute("ALTER TABLE memory_notes ADD COLUMN last_accessed_at TEXT")
+            migrated = True
+        if "access_count" not in columns:
+            conn.execute("ALTER TABLE memory_notes ADD COLUMN access_count INTEGER")
+            migrated = True
+        if migrated:
+            SqliteMemoryStore._backfill_access_columns(conn)
         return conn
+
+    @staticmethod
+    def _backfill_access_columns(conn: sqlite3.Connection) -> None:
+        rows = conn.execute("SELECT id, record, last_accessed_at, access_count FROM memory_notes")
+        with conn:
+            for row in rows.fetchall():
+                try:
+                    record = note_from_dict(json.loads(row["record"])) if row["record"] else None
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    record = None
+                access_count = row["access_count"]
+                last_accessed_at = row["last_accessed_at"]
+                if record is not None:
+                    if access_count is None:
+                        access_count = int(record.metadata.get("accessCount", 0))
+                    if last_accessed_at is None:
+                        last_accessed_at = record.last_accessed_at
+                conn.execute(
+                    "UPDATE memory_notes SET access_count = ?, last_accessed_at = ? WHERE id = ?",
+                    (int(access_count or 0), last_accessed_at or "", row["id"]),
+                )
 
     @staticmethod
     def _row_to_note(row: sqlite3.Row) -> MemoryNote:
         if "record" in row.keys() and row["record"]:
-            return note_from_dict(json.loads(row["record"]))
-        return MemoryNote(
-            id=row["id"],
-            content=row["content"],
-            tags=json.loads(row["tags"]),
-            created_at=row["created_at"],
-        )
+            note = note_from_dict(json.loads(row["record"]))
+        else:
+            note = MemoryNote(
+                id=row["id"],
+                content=row["content"],
+                tags=json.loads(row["tags"]),
+                created_at=row["created_at"],
+            )
+        if "access_count" in row.keys() and row["access_count"] is not None:
+            note.metadata["accessCount"] = int(row["access_count"])
+        if "last_accessed_at" in row.keys() and row["last_accessed_at"]:
+            note.last_accessed_at = row["last_accessed_at"]
+        return note
 
     @staticmethod
     def _escape_like(value: str) -> str:
@@ -63,7 +103,7 @@ class SqliteMemoryStore(MemoryStore):
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, content, tags, created_at, record"
+                "SELECT id, content, tags, created_at, record, last_accessed_at, access_count"
                 " FROM memory_notes ORDER BY created_at, id"
             ).fetchall()
             return [self._row_to_note(row) for row in rows]
@@ -71,26 +111,11 @@ class SqliteMemoryStore(MemoryStore):
             conn.close()
 
     async def add_note(self, content: str, tags: list[str]) -> MemoryNote:
-        note = MemoryNote(
-            id=uuid4().hex[:12],
-            content=content,
-            tags=list(tags),
-            created_at=datetime.now(UTC).isoformat(timespec="seconds"),
-        )
+        note = self.create_record(content, tags)
         conn = self._connect()
         try:
             with conn:
-                conn.execute(
-                    "INSERT INTO memory_notes (id, content, tags, created_at, record)"
-                    " VALUES (?, ?, ?, ?, ?)",
-                    (
-                        note.id,
-                        note.content,
-                        json.dumps(note.tags, ensure_ascii=False),
-                        note.created_at,
-                        json.dumps(note_to_dict(note), ensure_ascii=False),
-                    ),
-                )
+                self._upsert_unlocked(conn, note)
             return note
         finally:
             conn.close()
@@ -127,42 +152,89 @@ class SqliteMemoryStore(MemoryStore):
         try:
             with conn:
                 cursor = conn.execute(sql, params)
-            if cursor.rowcount == 0:
-                return None
-            row = conn.execute(
-                "SELECT id, content, tags, created_at, record FROM memory_notes WHERE id = ?",
-                (note_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            note = self._row_to_note(row)
-            if content is not None:
-                note.content = content
-            if tags is not None:
-                note.tags = list(tags)
-            conn.execute(
-                "UPDATE memory_notes SET record = ? WHERE id = ?",
-                (json.dumps(note_to_dict(note), ensure_ascii=False), note_id),
-            )
-            return note
+                if cursor.rowcount == 0:
+                    return None
+                row = conn.execute(
+                    "SELECT id, content, tags, created_at, record, last_accessed_at, access_count"
+                    " FROM memory_notes WHERE id = ?",
+                    (note_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                note = self._row_to_note(row)
+                if content is not None:
+                    note.content = content
+                if tags is not None:
+                    note.tags = list(tags)
+                note.updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+                self._upsert_unlocked(conn, note)
+                return note
         finally:
             conn.close()
 
     async def save_record(self, record: MemoryNote) -> None:
+        await self.commit_records([record])
+
+    @staticmethod
+    def _upsert_unlocked(conn: sqlite3.Connection, record: MemoryNote) -> None:
+        conn.execute(
+            "INSERT INTO memory_notes"
+            " (id, content, tags, created_at, record, last_accessed_at, access_count)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET"
+            " content = excluded.content,"
+            " tags = excluded.tags,"
+            " created_at = excluded.created_at,"
+            " record = excluded.record,"
+            " last_accessed_at = excluded.last_accessed_at,"
+            " access_count = excluded.access_count",
+            (
+                record.id,
+                record.content,
+                json.dumps(record.tags, ensure_ascii=False),
+                record.created_at,
+                json.dumps(note_to_dict(record), ensure_ascii=False),
+                record.last_accessed_at,
+                int(record.metadata.get("accessCount", 0)),
+            ),
+        )
+
+    async def touch_records(
+        self,
+        records: list[MemoryNote],
+        *,
+        accessed_at: str,
+    ) -> None:
         conn = self._connect()
         try:
             with conn:
-                conn.execute(
-                    "UPDATE memory_notes SET content = ?, tags = ?, created_at = ?, record = ?"
-                    " WHERE id = ?",
-                    (
-                        record.content,
-                        json.dumps(record.tags, ensure_ascii=False),
-                        record.created_at,
-                        json.dumps(note_to_dict(record), ensure_ascii=False),
-                        record.id,
-                    ),
-                )
+                for record in records:
+                    conn.execute(
+                        "UPDATE memory_notes"
+                        " SET last_accessed_at = ?,"
+                        " access_count = COALESCE(access_count, 0) + 1"
+                        " WHERE id = ?",
+                        (accessed_at, record.id),
+                    )
+        finally:
+            conn.close()
+        for record in records:
+            record.last_accessed_at = accessed_at
+            record.metadata["accessCount"] = int(record.metadata.get("accessCount", 0)) + 1
+
+    async def commit_records(
+        self,
+        records: list[MemoryNote],
+        *,
+        delete_ids: tuple[str, ...] | list[str] = (),
+    ) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                for record in records:
+                    self._upsert_unlocked(conn, record)
+                for record_id in delete_ids:
+                    conn.execute("DELETE FROM memory_notes WHERE id = ?", (record_id,))
         finally:
             conn.close()
 
@@ -171,13 +243,14 @@ class SqliteMemoryStore(MemoryStore):
         try:
             if not query:
                 rows = conn.execute(
-                    "SELECT id, content, tags, created_at, record"
+                    "SELECT id, content, tags, created_at, record, last_accessed_at, access_count"
                     " FROM memory_notes ORDER BY created_at, id"
                 ).fetchall()
             else:
                 pattern = f"%{self._escape_like(query)}%"
                 rows = conn.execute(
-                    "SELECT id, content, tags, created_at, record FROM memory_notes"
+                    "SELECT id, content, tags, created_at, record, last_accessed_at, access_count"
+                    " FROM memory_notes"
                     " WHERE content LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\'"
                     " ORDER BY created_at, id",
                     (pattern, pattern),
