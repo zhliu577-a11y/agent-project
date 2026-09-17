@@ -14,10 +14,24 @@ from core.tracing import begin_trace, setup_logging
 from core.types import Message
 from gateways.memory_extraction_gateway import MemoryExtractionGateway
 from gateways.session_gateway import SessionGateway
+from gateways.skill_gateway import SkillPermissionDecision
 from loop import run_agent
 from runtime import HarnessRuntime, RuntimeStartupError
 
 logger = logging.getLogger("main")
+
+
+async def _approve_skill(
+    name: str,
+    resource: str | None,
+    decision: SkillPermissionDecision,
+) -> bool:
+    target = f"{name} ({resource})" if resource else name
+    rule = decision.matched_pattern or decision.source
+    answer = (
+        input(f"Skill {target} requires approval (rule {rule!r}). Allow? [y/N] ").strip().lower()
+    )
+    return answer in {"y", "yes"}
 
 
 async def chat(
@@ -122,7 +136,7 @@ async def main() -> None:
     config = AppConfig.load()
     os.environ.setdefault("EMBEDDING_PROVIDER", config.embedding_provider)
     try:
-        runtime = HarnessRuntime(config)
+        runtime = HarnessRuntime(config, skill_approver=_approve_skill)
     except (OSError, ValueError) as exc:
         logger.error("Runtime 初始化失败: %s", exc)
         return

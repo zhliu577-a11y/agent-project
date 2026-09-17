@@ -12,4 +12,5 @@ __pycache__/
 timeline.jsonl
 data/plugin-registry.json
 data/plugin-store/
+data/tool-metrics.json
 .env

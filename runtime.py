@@ -15,6 +15,7 @@ from core.memory_extraction import MemoryExtractor
 from core.model import ModelAdapter, ModelRouter
 from core.prompt import build_system_prompt
 from core.registry import ToolRegistry
+from core.retry import RetryExecutor, RetryingTool
 from core.types import Message
 from gateways.context_gateway import ContextGateway
 from gateways.mcp_gateway import McpGateway, UsePlugin
@@ -123,6 +124,7 @@ class HarnessRuntime:
         self.config = config
         self.plugin_manager = plugin_manager or PluginManager()
         self._skill_approver = skill_approver
+        self.retry_executor: RetryExecutor | None = None
         self._external_names = {record.name for record in self.plugin_manager.list_installed()}
         self._plugin_states: dict[tuple[str, str], PluginRuntimeStatus] = {
             ("external", record.name): PluginRuntimeStatus(
@@ -182,6 +184,7 @@ class HarnessRuntime:
             self._assembly = self._assemble_plugins()
             self._create_event_transport()
             self._setup_events()
+            self._create_retry_executor()
             await self._create_model()
             await self._create_runtime_services()
             await self._create_session_gateway()
@@ -190,7 +193,10 @@ class HarnessRuntime:
             self._create_context_gateway()
             self._create_memory_extraction_gateway()
             self._register_tools()
-            self.mcp_gateway = McpGateway(self._assembly.mcp)
+            self.mcp_gateway = McpGateway(
+                self._assembly.mcp,
+                retry=self.retry_executor,
+            )
             self._use_plugin = UsePlugin(self.mcp_gateway, self.tools)
             self.tools.register(self._use_plugin)
             await self._preload_mcp_plugins()
@@ -489,6 +495,46 @@ class HarnessRuntime:
             raise RuntimeStartupError("event gateway is not initialized")
         return self.events
 
+    def _create_retry_executor(self) -> None:
+        routes = dict(self.config.retry_operation_policies)
+        if self.config.retry_policy is None and not routes:
+            self.retry_executor = None
+            return
+        required = {*routes.values()}
+        if self.config.retry_policy is not None:
+            required.add(self.config.retry_policy)
+        available = {plugin.manifest.name: plugin for plugin in self._assembly.retry_policies}
+        missing = sorted(required - set(available))
+        if missing:
+            raise RuntimeStartupError(
+                f"unknown retry policy plugins: {missing}; available: {sorted(available)}"
+            )
+
+        policies: dict[str, object] = {}
+        for name in sorted(required):
+            plugin = available[name]
+            try:
+                policies[name] = plugin.create()
+                self._track_plugin(plugin.manifest, policies[name])
+            except Exception as exc:
+                self._mark_manifest_error(plugin.manifest, exc)
+                raise RuntimeStartupError(
+                    f"retry policy plugin {name} initialization failed: {exc}"
+                ) from exc
+
+        try:
+            self.retry_executor = RetryExecutor(
+                policies,  # type: ignore[arg-type]
+                default_policy=self.config.retry_policy,
+                routes=routes,
+                max_attempts=self.config.retry_max_attempts,
+                max_delay=self.config.retry_max_delay,
+                total_timeout=self.config.retry_total_timeout,
+                events=self._require_events().publisher(EventIdentity.host("retry-executor")),
+            )
+        except Exception as exc:
+            raise RuntimeStartupError(f"retry executor initialization failed: {exc}") from exc
+
     async def _create_model(self) -> None:
         available = [candidate.manifest.name for candidate in self._assembly.models]
         if self.config.model not in available:
@@ -525,6 +571,7 @@ class HarnessRuntime:
                 fallback=self.config.model_fallback,
                 routes=dict(self.config.model_routes),
                 router=router,
+                retry=self.retry_executor,
             )
             self.models = gateway
             self.model = gateway
@@ -757,9 +804,16 @@ class HarnessRuntime:
 
     def _register_tools(self) -> None:
         self.tools = ToolRegistry()
-        for _, tools in self._assembly.tools:
+        for manifest, tools in self._assembly.tools:
             for tool in tools:
-                self.tools.register(tool)
+                registered = tool
+                if self.retry_executor is not None and manifest.retry_safe:
+                    registered = RetryingTool(
+                        tool,
+                        self.retry_executor,
+                        component=f"{manifest.type}:{manifest.name}",
+                    )
+                self.tools.register(registered)
         for manifest, tools in self._assembly.tools:
             for tool in tools:
                 self._track_plugin(manifest, tool)
@@ -920,6 +974,7 @@ def _merge_assemblies(target: PluginAssembly, source: PluginAssembly) -> None:
     target.embeddings.extend(source.embeddings)
     target.listeners.extend(source.listeners)
     target.event_transports.extend(source.event_transports)
+    target.retry_policies.extend(source.retry_policies)
     target.contributions.extend(source.contributions)
     target.hooks.sort(key=lambda pair: (pair[0].priority, pair[0].name))
 

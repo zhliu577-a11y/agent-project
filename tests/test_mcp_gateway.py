@@ -6,11 +6,13 @@ import pytest
 
 from core.errors import DeclaredPluginError, ToolError
 from core.registry import ToolRegistry
+from core.retry import RetryDecision, RetryExecutor, RetryRequest
 from gateways.mcp_gateway import (
     McpGateway,
     McpTool,
     PluginConnection,
     UsePlugin,
+    _tool_retry_safe,
     result_to_text,
 )
 from plugins.loader import DeclaredError, McpPluginSpec, PluginManifest
@@ -241,3 +243,137 @@ async def test_mcp_is_error_matches_code_wrapped_by_sdk_message() -> None:
     with pytest.raises(DeclaredPluginError) as info:
         await tool.execute()
     assert info.value.code == "rate_limited"
+
+
+class FlakySession:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def call_tool(self, name, arguments):
+        self.calls += 1
+        if self.calls == 1:
+            raise TimeoutError("transient")
+        return FakeResult([FakeContent("text", "ok")])
+
+
+class FlakyErrorSession:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def call_tool(self, name, arguments):
+        self.calls += 1
+        if self.calls == 1:
+            return FakeResult(
+                [FakeContent("text", "[rate_limited] upstream busy")],
+                is_error=True,
+            )
+        return FakeResult([FakeContent("text", "ok")])
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_uses_retry_and_recovery_callback() -> None:
+    class AllowRetry:
+        async def decide(self, request: RetryRequest) -> RetryDecision:
+            return RetryDecision(retry=True, delay=0, reason="test")
+
+    executor = RetryExecutor(
+        {"allow": AllowRetry()},
+        default_policy="allow",
+        max_attempts=2,
+        max_delay=0,
+        total_timeout=1,
+    )
+    recovered = 0
+
+    async def recover(request: RetryRequest) -> None:
+        nonlocal recovered
+        recovered += 1
+
+    session = FlakySession()
+    tool = McpTool(
+        session,
+        "time",
+        "get_current_time",
+        "时间",
+        {},
+        timeout=1,
+        retry=executor,
+        retry_safe=True,
+        recover=recover,
+    )
+
+    assert await tool.execute(timezone="UTC") == "ok"
+    assert session.calls == 2
+    assert recovered == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_declared_retryable_error_uses_retry_policy() -> None:
+    class AllowRetry:
+        async def decide(self, request: RetryRequest) -> RetryDecision:
+            return RetryDecision(retry=True, delay=0, reason="test")
+
+    executor = RetryExecutor(
+        {"allow": AllowRetry()},
+        default_policy="allow",
+        max_attempts=2,
+        max_delay=0,
+        total_timeout=1,
+    )
+    session = FlakyErrorSession()
+    tool = McpTool(
+        session,
+        "upstream",
+        "query",
+        "query",
+        {},
+        timeout=1,
+        declarations={"rate_limited": _RATE_LIMIT},
+        retry=executor,
+        retry_safe=True,
+    )
+
+    assert await tool.execute() == "ok"
+    assert session.calls == 2
+
+
+def test_mcp_retry_safe_uses_server_annotations() -> None:
+    spec = _spec("time")
+    assert _tool_retry_safe(spec, None) is False
+    assert _tool_retry_safe(spec, {"readOnlyHint": True}) is True
+    assert _tool_retry_safe(spec, {"idempotentHint": True}) is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_gateway_reconnects_before_retrying_read_only_tool() -> None:
+    class AllowRetry:
+        async def decide(self, request: RetryRequest) -> RetryDecision:
+            return RetryDecision(retry=True, delay=0, reason="test")
+
+    class RecoveringGateway(McpGateway):
+        def __init__(self, spec: McpPluginSpec) -> None:
+            super().__init__(
+                [spec],
+                retry=RetryExecutor(
+                    {"allow": AllowRetry()},
+                    default_policy="allow",
+                    max_attempts=2,
+                    max_delay=0,
+                    total_timeout=1,
+                ),
+            )
+            self.connect_count = 0
+
+        async def connect_plugin(self, spec):
+            self.connect_count += 1
+            session = FlakySession() if self.connect_count == 1 else FakeSession("ok")
+            return (
+                PluginConnection(session=session, cleanup=[]),
+                [("query", "query", {}, {"readOnlyHint": True})],
+            )
+
+    gateway = RecoveringGateway(_spec("time"))
+    tool = (await gateway.mount("time"))[0]
+
+    assert await tool.execute() == "ok:query"
+    assert gateway.connect_count == 2

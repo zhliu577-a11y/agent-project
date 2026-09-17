@@ -1,0 +1,7 @@
+{
+  "baseDelay": 0.2,
+  "maxDelay": 2.0,
+  "categories": [
+    "retryable"
+  ]
+}

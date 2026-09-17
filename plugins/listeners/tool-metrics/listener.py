@@ -1,13 +1,14 @@
 """Built-in listener.v1 implementation for per-tool outcome metrics."""
 
 import json
+import os
 from pathlib import Path
 
 from core.events import Event, Subscription
 
 
 def create_listener(plugin_dir):
-    output_path = Path(plugin_dir) / "tool-metrics.json"
+    output_path = _output_path()
     state = {
         "total": 0,
         "ok": 0,
@@ -41,6 +42,13 @@ def create_listener(plugin_dir):
     ]
 
 
+def _output_path() -> Path:
+    configured = os.getenv("TOOL_METRICS_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.cwd() / "data" / "tool-metrics.json"
+
+
 def _tool_name(tool_call: object) -> str:
     name = getattr(tool_call, "name", None)
     return name if isinstance(name, str) and name else "unknown"
@@ -63,6 +71,7 @@ def _increment(state: dict, tool_name: str, outcome: str) -> None:
 
 
 def _write(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

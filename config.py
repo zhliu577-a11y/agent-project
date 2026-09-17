@@ -8,6 +8,7 @@
 #   config/embedding.json
 #   config/event.json
 #   config/event_transport.json
+#   config/retry.json
 #   config/context.json
 #   config/mcp.json
 #   config/skill.json
@@ -40,6 +41,7 @@ _SKILL_AGENT_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _SECTION_FILES = {
     "event": "event.json",
     "event_transport": "event_transport.json",
+    "retry": "retry.json",
     "model": "model.json",
     "session": "session.json",
     "memory": "memory.json",
@@ -54,6 +56,11 @@ _SECTION_FILES = {
 class AppConfig:
     event_transport: str = "in-process"
     event_handler_timeout: float | None = None
+    retry_policy: str | None = None
+    retry_operation_policies: tuple[tuple[str, str], ...] = ()
+    retry_max_attempts: int = 3
+    retry_max_delay: float = 2.0
+    retry_total_timeout: float = 30.0
     model: str = "deepseek"
     model_fallback: tuple[str, ...] = ()
     model_routes: tuple[tuple[str, tuple[str, ...]], ...] = ()
@@ -106,6 +113,7 @@ class AppConfig:
         skill = cls._nested(raw, "skill")
         event = cls._nested(raw, "event")
         event_transport = cls._nested(raw, "event_transport")
+        retry = cls._nested(raw, "retry")
         model_options = cls._nested(raw, "_model_options")
         memory_index = _load_optional_name(
             memory.get("index"),
@@ -143,6 +151,27 @@ class AppConfig:
                 event.get("handlerTimeout"),
                 os.getenv("EVENT_HANDLER_TIMEOUT"),
                 "event.handlerTimeout",
+            ),
+            retry_policy=_load_optional_name(
+                retry.get("default"),
+                os.getenv("RETRY_POLICY"),
+                "retry.default",
+            ),
+            retry_operation_policies=_load_retry_routes(retry.get("operations", {})),
+            retry_max_attempts=_load_positive_int(
+                retry.get("maxAttempts", 3),
+                os.getenv("RETRY_MAX_ATTEMPTS"),
+                "retry.maxAttempts",
+            ),
+            retry_max_delay=_load_nonnegative_float(
+                retry.get("maxDelay", 2.0),
+                os.getenv("RETRY_MAX_DELAY"),
+                "retry.maxDelay",
+            ),
+            retry_total_timeout=_load_positive_float(
+                retry.get("totalTimeout", 30.0),
+                os.getenv("RETRY_TOTAL_TIMEOUT"),
+                "retry.totalTimeout",
             ),
             model=os.getenv("AGENT_MODEL", _expect_str(raw.get("model", "deepseek"), "model")),
             model_fallback=_load_model_name_list(
@@ -539,6 +568,30 @@ def _load_positive_int(configured: Any, env_value: str | None, key: str) -> int:
     return raw
 
 
+def _load_positive_float(configured: Any, env_value: str | None, key: str) -> float:
+    raw = env_value if env_value is not None else configured
+    if isinstance(raw, str) and env_value is not None:
+        try:
+            raw = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"config: '{key}' must be a positive number") from exc
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        raise ValueError(f"config: '{key}' must be a positive number")
+    return float(raw)
+
+
+def _load_nonnegative_float(configured: Any, env_value: str | None, key: str) -> float:
+    raw = env_value if env_value is not None else configured
+    if isinstance(raw, str) and env_value is not None:
+        try:
+            raw = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"config: '{key}' must be a non-negative number") from exc
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+        raise ValueError(f"config: '{key}' must be a non-negative number")
+    return float(raw)
+
+
 def _load_optional_positive_float(
     configured: Any,
     env_value: str | None,
@@ -608,6 +661,25 @@ def _load_model_routes(configured: Any) -> tuple[tuple[str, tuple[str, ...]], ..
                 ),
             )
         )
+    return tuple(routes)
+
+
+def _load_retry_routes(configured: Any) -> tuple[tuple[str, str], ...]:
+    if not isinstance(configured, dict):
+        raise ValueError("config: 'retry.operations' must be an object")
+
+    routes: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw_operation, raw_policy in configured.items():
+        if not isinstance(raw_operation, str) or not raw_operation.strip():
+            raise ValueError("config: 'retry.operations' keys must be non-empty strings")
+        operation = raw_operation.strip()
+        if operation in seen:
+            raise ValueError(f"config: duplicate retry operation: {operation}")
+        if not isinstance(raw_policy, str) or not _PLUGIN_NAME_RE.fullmatch(raw_policy):
+            raise ValueError(f"config: 'retry.operations.{operation}' must be a valid plugin name")
+        seen.add(operation)
+        routes.append((operation, raw_policy))
     return tuple(routes)
 
 

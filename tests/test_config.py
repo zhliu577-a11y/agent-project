@@ -9,6 +9,10 @@ from config import DEFAULT_CONFIG_PATH, AppConfig
 _CONFIG_KEYS = (
     "EVENT_TRANSPORT",
     "EVENT_HANDLER_TIMEOUT",
+    "RETRY_POLICY",
+    "RETRY_MAX_ATTEMPTS",
+    "RETRY_MAX_DELAY",
+    "RETRY_TOTAL_TIMEOUT",
     "AGENT_MODEL",
     "SESSION_STORE",
     "SESSION_ID",
@@ -85,6 +89,16 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     _write(config_dir / "event.json", {"handlerTimeout": 2.5})
     _write(config_dir / "event_transport.json", {"provider": "in-process"})
     _write(
+        config_dir / "retry.json",
+        {
+            "default": "transient",
+            "maxAttempts": 4,
+            "maxDelay": 1.5,
+            "totalTimeout": 12.0,
+            "operations": {"model.complete": "no-retry"},
+        },
+    )
+    _write(
         config_dir / "session.json",
         {"store": "inmemory", "id": "cli", "compaction": "rolling-summary"},
     )
@@ -137,6 +151,11 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     assert config.model == "openai"
     assert config.event_transport == "in-process"
     assert config.event_handler_timeout == 2.5
+    assert config.retry_policy == "transient"
+    assert config.retry_operation_policies == (("model.complete", "no-retry"),)
+    assert config.retry_max_attempts == 4
+    assert config.retry_max_delay == 1.5
+    assert config.retry_total_timeout == 12.0
     assert config.session_store == "inmemory"
     assert config.session_id == "cli"
     assert config.session_compaction == "rolling-summary"
@@ -173,6 +192,10 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     monkeypatch.setenv("AGENT_MODEL", "deepseek")
     monkeypatch.setenv("EVENT_TRANSPORT", "custom-transport")
     monkeypatch.setenv("EVENT_HANDLER_TIMEOUT", "3.5")
+    monkeypatch.setenv("RETRY_POLICY", "no-retry")
+    monkeypatch.setenv("RETRY_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("RETRY_MAX_DELAY", "0.5")
+    monkeypatch.setenv("RETRY_TOTAL_TIMEOUT", "9.0")
     monkeypatch.setenv("CONTEXT_STRATEGY", "tail-window")
     monkeypatch.setenv("SESSION_COMPACTION", "")
     monkeypatch.setenv("MEMORY_INDEX", "")
@@ -193,6 +216,10 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     assert config.model == "deepseek"
     assert config.event_transport == "custom-transport"
     assert config.event_handler_timeout == 3.5
+    assert config.retry_policy == "no-retry"
+    assert config.retry_max_attempts == 5
+    assert config.retry_max_delay == 0.5
+    assert config.retry_total_timeout == 9.0
     assert config.context_strategy == "tail-window"
     assert config.session_compaction is None
     assert config.memory_index is None
@@ -325,6 +352,11 @@ def test_config_missing_file_uses_defaults(tmp_path, monkeypatch) -> None:
     assert config.model == "deepseek"
     assert config.event_transport == "in-process"
     assert config.event_handler_timeout is None
+    assert config.retry_policy is None
+    assert config.retry_operation_policies == ()
+    assert config.retry_max_attempts == 3
+    assert config.retry_max_delay == 2.0
+    assert config.retry_total_timeout == 30.0
     assert config.session_store == "jsonl"
     assert config.session_compaction is None
     assert config.memory_store == "sqlite"
@@ -382,6 +414,20 @@ def test_config_rejects_invalid_mcp_preload(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MCP_PRELOAD", "time,,math")
     _write(config_dir / "config.json", {"mcp": {"preload": ["time"]}})
     with pytest.raises(ValueError, match="MCP_PRELOAD"):
+        AppConfig.load(config_dir)
+
+
+def test_retry_config_rejects_invalid_values(tmp_path) -> None:
+    config_dir = tmp_path / "config"
+    _write(config_dir / "config.json", {"retry": {"maxAttempts": 0}})
+    with pytest.raises(ValueError, match="retry.maxAttempts"):
+        AppConfig.load(config_dir)
+
+    _write(
+        config_dir / "config.json",
+        {"retry": {"operations": {"model.complete": "bad name"}}},
+    )
+    with pytest.raises(ValueError, match="retry.operations"):
         AppConfig.load(config_dir)
 
 

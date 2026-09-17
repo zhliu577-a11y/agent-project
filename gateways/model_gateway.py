@@ -17,6 +17,7 @@ from core.model import (
     ModelRouter,
     ModelRouteRequest,
 )
+from core.retry import RetryExecutor
 from core.types import Message, ModelResponse
 from plugins.loader import ModelPlugin
 
@@ -67,6 +68,7 @@ class ModelGateway(ModelAdapter):
         fallback: Sequence[str] = (),
         routes: Mapping[str, Sequence[str]] | None = None,
         router: ModelRouter | None = None,
+        retry: RetryExecutor | None = None,
     ) -> None:
         if not providers:
             raise ValueError("ModelGateway requires at least one model provider")
@@ -84,6 +86,7 @@ class ModelGateway(ModelAdapter):
             {name: tuple(candidates) for name, candidates in (routes or {}).items()}
         )
         self._router = router or _DefaultModelRouter()
+        self._retry = retry
         self._active_model: str | None = None
         self._role: contextvars.ContextVar[str | None] = contextvars.ContextVar(
             f"model_role_{id(self)}",
@@ -219,26 +222,35 @@ class ModelGateway(ModelAdapter):
 
         failures: list[str] = []
         for name in candidates:
-            try:
-                model = await self._acquire(name)
-            except Exception as exc:
-                failures.append(f"{name}: {exc}")
-                continue
+            stream_state = {"started": False}
 
-            emitted = False
-
-            def _on_token(text: str) -> None:
-                nonlocal emitted
-                emitted = True
+            def _on_token(text: str, state=stream_state) -> None:
+                state["started"] = True
                 if on_token is not None:
                     on_token(text)
 
+            async def _invoke(provider_name=name):
+                model = await self._acquire(provider_name)
+                try:
+                    return await model.complete(
+                        messages,
+                        tool_schemas,
+                        on_token=_on_token if on_token is not None else None,
+                    )
+                finally:
+                    await self._release(provider_name)
+
             try:
-                response = await model.complete(
-                    messages,
-                    tool_schemas,
-                    on_token=_on_token if on_token is not None else None,
-                )
+                if self._retry is None:
+                    response = await _invoke()
+                else:
+                    response = await self._retry.execute(
+                        _invoke,
+                        operation="model.complete",
+                        component=name,
+                        retry_safe=True,
+                        stream_started=lambda state=stream_state: bool(state["started"]),
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -247,10 +259,10 @@ class ModelGateway(ModelAdapter):
                 logger.warning(
                     "model provider %s failed%s: %s",
                     name,
-                    " after streaming output" if emitted else "",
+                    " after streaming output" if stream_state["started"] else "",
                     exc,
                 )
-                if emitted:
+                if stream_state["started"]:
                     raise translate_error(
                         exc,
                         context=f"model provider {name} failed after streaming started",
@@ -259,8 +271,6 @@ class ModelGateway(ModelAdapter):
             else:
                 self._last_errors.pop(name, None)
                 return response
-            finally:
-                await self._release(name)
 
         raise ModelError(f"all model candidates failed [{decision.reason}]: " + "; ".join(failures))
 

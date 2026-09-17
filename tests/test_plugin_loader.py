@@ -23,6 +23,7 @@ from plugins.loader import (
     load_memory_plugins,
     load_model_plugins,
     load_model_router_plugins,
+    load_retry_policy_plugins,
     load_session_plugins,
     load_skill_plugins,
     load_tool_plugins,
@@ -324,6 +325,70 @@ def test_manifest_rejects_retryable_mismatch(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="retryable"):
         discover_plugins(tmp_path)
+
+
+def test_manifest_parses_retry_safe(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "mcp",
+        "readonly",
+        _mcp_manifest(name="readonly", retrySafe=True),
+    )
+
+    manifest = discover_plugins(tmp_path)[0]
+
+    assert manifest.retry_safe is True
+
+
+_RETRY_POLICY_MODULE = """
+from core.retry import RetryDecision, RetryPolicy, RetryRequest
+
+
+class DemoPolicy(RetryPolicy):
+    async def decide(self, request: RetryRequest) -> RetryDecision:
+        return RetryDecision(retry=request.attempt < 2)
+
+
+def create_policy(plugin_dir):
+    return DemoPolicy()
+"""
+
+
+def test_load_retry_policy_plugins_validates_and_instantiates(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "retry_policies",
+        "demo",
+        {
+            "name": "demo",
+            "type": "retry-policy",
+            "entry": {"module": "policy.py", "factory": "create_policy"},
+        },
+        files={"policy.py": _RETRY_POLICY_MODULE},
+    )
+
+    plugins = load_retry_policy_plugins(tmp_path)
+
+    assert [plugin.manifest.name for plugin in plugins] == ["demo"]
+    assert plugins[0].create().__class__.__name__ == "DemoPolicy"
+
+
+def test_load_retry_policy_plugins_rejects_bad_factory_return(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "retry_policies",
+        "bad",
+        {
+            "name": "bad",
+            "type": "retry-policy",
+            "entry": {"module": "policy.py", "factory": "create_policy"},
+        },
+        files={"policy.py": "def create_policy(plugin_dir):\n    return 42\n"},
+    )
+
+    plugin = load_retry_policy_plugins(tmp_path)[0]
+    with pytest.raises(ValueError, match="RetryPolicy"):
+        plugin.create()
 
 
 _TOOL_MODULE = """

@@ -109,6 +109,7 @@ from core.hooks import HOOK_EVENTS, HookSpec, LifecycleHooks
 from core.memory import MemoryIndex, MemoryPolicy, MemoryRetriever, MemoryStore
 from core.memory_extraction import MemoryExtractor
 from core.model import ModelAdapter, ModelMetadata, ModelRouter
+from core.retry import RetryPolicy
 from core.session import SessionStore
 from core.tool import Tool
 from plugins.context import PluginContext
@@ -167,6 +168,7 @@ class PluginManifest:
     protocol_version: int = PLUGIN_PROTOCOL_VERSION
     contract: str = ""
     requires: tuple[PluginRequirement, ...] = ()
+    retry_safe: bool = False
 
 
 @dataclass(frozen=True)
@@ -642,6 +644,27 @@ class EventTransportPlugin:
         return transport
 
 
+@dataclass(frozen=True)
+class RetryPolicyPlugin:
+    """A lazily validated implementation of the retry-policy.v1 contract."""
+
+    manifest: PluginManifest
+    factory: Callable[[Path], Any]
+
+    def create(self) -> RetryPolicy:
+        where = f"{self.manifest.directory / 'plugin.json'} ('{self.manifest.name}')"
+        try:
+            policy = self.factory(self.manifest.directory)
+        except Exception as exc:
+            raise ValueError(f"{where}: retry policy factory failed: {exc}") from exc
+        _expect(
+            isinstance(policy, RetryPolicy),
+            where,
+            f"retry policy factory must return RetryPolicy, got {type(policy).__name__}",
+        )
+        return policy
+
+
 def _expect(condition: bool, where: str, message: str) -> None:
     if not condition:
         raise ValueError(f"{where}: {message}")
@@ -715,6 +738,9 @@ def _parse_manifest(path: Path) -> PluginManifest:
         "'priority' 必须是整数",
     )
 
+    retry_safe = raw.get("retrySafe", False)
+    _expect(isinstance(retry_safe, bool), where, "'retrySafe' must be a boolean")
+
     errors = _parse_declared_errors(raw, where)
     events = _parse_declared_events(raw, where)
     requires = _parse_requirements(raw, where)
@@ -738,6 +764,7 @@ def _parse_manifest(path: Path) -> PluginManifest:
         protocol_version=protocol_version,
         contract=contract,
         requires=requires,
+        retry_safe=retry_safe,
     )
 
 
@@ -1106,6 +1133,13 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
         "'priority' must be an integer",
     )
 
+    package_retry_safe = raw.get("retrySafe", False)
+    _expect(
+        isinstance(package_retry_safe, bool),
+        where,
+        "'retrySafe' must be a boolean",
+    )
+
     package_errors = _parse_declared_errors(raw, where)
     package_events = _parse_declared_events(raw, where)
     package_requires = _parse_requirements(raw, where)
@@ -1195,6 +1229,13 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
             "'priority' must be an integer",
         )
 
+        item_retry_safe = item.get("retrySafe", package_retry_safe)
+        _expect(
+            isinstance(item_retry_safe, bool),
+            item_where,
+            "'retrySafe' must be a boolean",
+        )
+
         item_errors = _parse_declared_errors(item, item_where)
         errors = _merge_declared_errors(package_errors, item_errors, item_where)
         item_events = _parse_declared_events(item, item_where)
@@ -1223,6 +1264,7 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
                 protocol_version=item_protocol_version,
                 contract=item_contract,
                 requires=requires,
+                retry_safe=item_retry_safe,
             )
         )
         seen_ids.add(contribution_id)
@@ -2385,6 +2427,20 @@ def load_event_transport_plugin(
     )
 
 
+def load_retry_policy_plugin(
+    manifest: PluginManifest,
+    config: AppConfig | None = None,
+    services: RuntimeServices | None = None,
+) -> RetryPolicyPlugin:
+    """Validate a retry decision policy without instantiating it."""
+    factory = _load_entry_factory(manifest, "retry-policy")
+    context = _plugin_context(manifest, config, services)
+    return RetryPolicyPlugin(
+        manifest=manifest,
+        factory=lambda _directory: _call_plugin_factory(factory, context),
+    )
+
+
 def _resolve_arg(plugin_dir: Path, arg: str) -> str:
     """插件目录下真实存在的相对路径参数 -> 绝对路径；其余参数原样保留。"""
     path = Path(arg)
@@ -2644,6 +2700,20 @@ def load_event_transport_plugins(
     return sorted(plugins, key=lambda plugin: plugin.manifest.name)
 
 
+def load_retry_policy_plugins(
+    root: str | Path | Sequence[str | Path] | None = None,
+    config: AppConfig | None = None,
+) -> list[RetryPolicyPlugin]:
+    """Discover enabled retry policies without instantiating them."""
+    plugins: list[RetryPolicyPlugin] = []
+    for manifest in discover_plugins(root):
+        if manifest.type != "retry-policy":
+            continue
+        plugins.append(load_retry_policy_plugin(manifest, config))
+        logger.info("retry policy plugin discovered: %s", manifest.name)
+    return sorted(plugins, key=lambda plugin: plugin.manifest.name)
+
+
 @dataclass
 class PluginAssembly:
     """一次装配的结果：按 kind 归好类的插件产物，交给对应网关/注册表。"""
@@ -2665,6 +2735,7 @@ class PluginAssembly:
     embeddings: list[EmbeddingPlugin] = field(default_factory=list)
     listeners: list[ListenerPlugin] = field(default_factory=list)
     event_transports: list[EventTransportPlugin] = field(default_factory=list)
+    retry_policies: list[RetryPolicyPlugin] = field(default_factory=list)
     contributions: list[PluginContribution] = field(default_factory=list)
 
 
@@ -2774,6 +2845,14 @@ def _apply_event_transport(
     assembly.event_transports.append(plugin)
 
 
+def _apply_retry_policy(
+    assembly: PluginAssembly,
+    manifest: PluginManifest,
+    plugin: RetryPolicyPlugin,
+) -> None:
+    assembly.retry_policies.append(plugin)
+
+
 register_kind(KindHandler("hook", load_hook_plugin, _apply_hook))
 register_kind(KindHandler("mcp", load_mcp_plugin, _apply_mcp))
 register_kind(KindHandler("tool", load_tool_plugin, _apply_tool))
@@ -2816,6 +2895,13 @@ register_kind(
         "event-transport",
         load_event_transport_plugin,
         _apply_event_transport,
+    )
+)
+register_kind(
+    KindHandler(
+        "retry-policy",
+        load_retry_policy_plugin,
+        _apply_retry_policy,
     )
 )
 

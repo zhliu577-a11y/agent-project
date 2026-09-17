@@ -5,6 +5,7 @@ import pytest
 
 from core.errors import ModelError
 from core.model import ModelAdapter, ModelMetadata, ModelRouteDecision, ModelRouter
+from core.retry import RetryDecision, RetryExecutor, RetryRequest
 from core.types import Message, ModelResponse
 from gateways.model_gateway import ModelGateway
 from plugins.context import PluginContext
@@ -236,3 +237,51 @@ async def test_gateway_stops_partially_initialized_provider() -> None:
 
     assert trace == ["setup:broken", "stop:broken"]
     assert gateway.status() == {"broken": "error"}
+
+
+async def test_gateway_uses_retry_policy_before_fallback() -> None:
+    trace: list[str] = []
+
+    class FlakyAdapter(FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__("flaky", trace)
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas, on_token=None):
+            self.calls += 1
+            self.trace.append(f"complete:{self.name}")
+            if self.calls < 2:
+                raise TimeoutError("transient")
+            return ModelResponse(content="retried", tool_calls=[])
+
+    class AllowRetry:
+        async def decide(self, request: RetryRequest) -> RetryDecision:
+            return RetryDecision(retry=True, delay=0, reason="test")
+
+    plugin = ModelPlugin(
+        manifest=_manifest("flaky"),
+        factory=lambda _directory: FlakyAdapter(),
+        context=PluginContext.create(
+            name="flaky",
+            kind="model",
+            directory=Path("."),
+        ),
+    )
+    retry = RetryExecutor(
+        {"allow": AllowRetry()},
+        default_policy="allow",
+        max_attempts=2,
+        max_delay=0,
+        total_timeout=1,
+    )
+    gateway = ModelGateway([plugin], default_model="flaky", retry=retry)
+
+    response = await gateway.complete([], [])
+
+    assert response.content == "retried"
+    assert trace == [
+        "setup:flaky",
+        "start:flaky",
+        "complete:flaky",
+        "complete:flaky",
+    ]

@@ -15,8 +15,9 @@
 - **插件目录（drop-in）**：`plugins/` 下每个插件是一个自包含目录 + `plugin.json`，
   拖入即可被 Agent 发现；目前支持 `mcp`、`hook`、`tool`、`model`、`model-router`、
   `skill`、`session`、`memory`、`memory-index`、`memory-retriever`、`memory-policy`、
-  `memory-extractor`、`embedding`、`listener`、`event-transport`、`context`、
-  `compaction` 十七类
+  `memory-extractor`、`embedding`、`listener`、`event-transport`、`retry-policy`、
+  `context`、
+  `compaction` 十八类
 - **功能包**：一个包可用 `contributes[]` 同时提供 skill、hook、tool 等能力，
   发现阶段统一展开为 contribution 后按受控 kind 注册表装配
 - **MCP 网关**：Agent 只面向网关这一个通道；网关统一维护各 MCP 插件的连接、
@@ -197,7 +198,8 @@ plugins/
 `name` 只允许 `A-Z a-z 0-9 _ -`（会进入工具命名空间）；`type` 当前支持
 `mcp` / `hook` / `tool` / `model` / `model-router` / `skill` / `session` /
 `memory` / `memory-index` / `memory-retriever` / `memory-policy` /
-`memory-extractor` / `embedding` / `listener` / `event-transport` / `context` /
+`memory-extractor` / `embedding` / `listener` / `event-transport` / `retry-policy` /
+`context` /
 `compaction`；
 `apiVersion` 固定为 `"1"`，大多数 `protocolVersion` 当前为 `1`，Skill 支持 `1`
 和 `2`；`contract` 必须与 `<type>.v<protocolVersion>` 一致（例如 `mcp.v1`、
@@ -894,6 +896,7 @@ Skill 的宿主预载和内容预算由 `config/skill.json` 管理。
 | `SKILL_MAX_LISTING_BYTES` | `8192` | Skill 目录 listing 的总字节预算 |
 | `SKILL_AGENT` | `default` | 评估 Skill 权限时使用的 Agent 名 |
 | `SKILL_NAME_ONLY` | 无 | 强制只显示名称的 Skill 通配符，逗号分隔 |
+| `TOOL_METRICS_PATH` | `data/tool-metrics.json` | tool-metrics listener 的统计输出路径 |
 
 ### 日志追踪与状态快照（tracing / checkpoint）
 
@@ -1086,6 +1089,7 @@ config/
 ├── config.json
 ├── event.json
 ├── event_transport.json
+├── retry.json
 ├── model.json
 ├── session.json
 ├── memory.json
@@ -1157,6 +1161,42 @@ Compaction 只生成会话历史的替换方案，Memory 负责跨会话事实�
 最近更新优先进入候选，再由默认策略排序，可使用 `MEMORY_RETRIEVER=recent`；希望长期记忆
 更偏精确、减少低质量写入，可使用 `MEMORY_POLICY=strict`。召回策略与策略插件可以独立切换；
 旧安装仍可使用 `MEMORY_INDEX=lexical`，但不能同时设置两个召回配置。
+
+## Retry policy 与 Host RetryExecutor
+
+重试分成三层，职责彼此独立：
+
+1. `retry-policy.v1` 插件只返回 `RetryDecision(retry, delay, reason)`，不能循环、sleep
+   或执行恢复动作。内置策略位于 `plugins/retry_policies/`，实例配置位于
+   `config/plugins/retry-policy/<name>.json`。
+2. `core/retry.py` 的 `RetryExecutor` 由 Host 持有，统一限制最大调用次数、延迟上限、
+   总 deadline、取消传播和副作用保护，并发布 `retry.scheduled`、
+   `retry.succeeded`、`retry.exhausted` 观察事件。
+3. MCP 断线重连留在 `McpGateway.recover_plugin()`，模型 fallback 留在
+   `ModelGateway.complete()`。策略插件不能直接操作连接、Provider 或 Token。
+
+`config/retry.json` 负责选择默认策略和 operation 路由。当前 operation 包括
+`model.complete`、`tool.call`、`mcp.connect`、`mcp.call`。普通工具只有
+manifest 声明 `retrySafe: true` 时才会进入 Host 重试；MCP 工具还会参考服务器返回的
+`readOnlyHint` / `idempotentHint`。不确定是否幂等的写操作默认不重试。
+
+```json
+{
+  "default": "transient",
+  "maxAttempts": 3,
+  "maxDelay": 2.0,
+  "totalTimeout": 30.0,
+  "operations": {
+    "model.complete": "transient",
+    "tool.call": "transient",
+    "mcp.connect": "transient",
+    "mcp.call": "transient"
+  }
+}
+```
+
+可用 `RETRY_POLICY`、`RETRY_MAX_ATTEMPTS`、`RETRY_MAX_DELAY` 和
+`RETRY_TOTAL_TIMEOUT` 覆盖对应字段。
 
 ## Roadmap
 

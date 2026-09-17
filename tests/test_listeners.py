@@ -1,6 +1,7 @@
 # tests/test_listeners.py —— listener 插件：订阅总线、声明校验、退订
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -159,3 +160,33 @@ def test_repo_tool_metrics_listener_is_discoverable() -> None:
         "tool.after",
         "tool.denied",
     }
+
+
+def test_tool_metrics_listener_writes_to_data_by_default(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TOOL_METRICS_PATH", raising=False)
+    plugin = next(
+        item for item in load_listener_plugins(REPO_PLUGINS) if item.manifest.name == "tool-metrics"
+    )
+    handlers = {subscription.event: subscription.handler for subscription in plugin.create()}
+    tool_call = SimpleNamespace(name="demo", id="call-1")
+
+    handlers["tool.after"](Event("tool.after", {"tool_call": tool_call, "ok": True}))
+
+    output_path = tmp_path / "data" / "tool-metrics.json"
+    assert json.loads(output_path.read_text(encoding="utf-8"))["byTool"]["demo"]["ok"] == 1
+    assert not (plugin.manifest.directory / "tool-metrics.json").exists()
+
+
+def test_tool_metrics_listener_supports_output_path_override(tmp_path, monkeypatch) -> None:
+    output_path = tmp_path / "runtime" / "metrics.json"
+    monkeypatch.setenv("TOOL_METRICS_PATH", str(output_path))
+    plugin = next(
+        item for item in load_listener_plugins(REPO_PLUGINS) if item.manifest.name == "tool-metrics"
+    )
+    handlers = {subscription.event: subscription.handler for subscription in plugin.create()}
+    tool_call = SimpleNamespace(name="demo", id="call-1")
+
+    handlers["tool.denied"](Event("tool.denied", {"tool_call": tool_call}))
+
+    assert json.loads(output_path.read_text(encoding="utf-8"))["byTool"]["demo"]["denied"] == 1

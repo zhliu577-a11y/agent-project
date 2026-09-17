@@ -1,0 +1,12 @@
+{
+  "default": "transient",
+  "maxAttempts": 3,
+  "maxDelay": 2.0,
+  "totalTimeout": 30.0,
+  "operations": {
+    "model.complete": "transient",
+    "tool.call": "transient",
+    "mcp.connect": "transient",
+    "mcp.call": "transient"
+  }
+}

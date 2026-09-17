@@ -19,7 +19,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from core.errors import DeclaredPluginError, PluginError, ToolError, translate_error
 from core.registry import ToolRegistry
-from core.retry import retry_async
+from core.retry import RetryExecutor, RetryRequest, retry_async
 from core.tool import Tool
 from plugins.loader import McpPluginSpec
 
@@ -57,13 +57,18 @@ class McpTool(Tool):
 
     def __init__(
         self,
-        session,
+        session: Any | None,
         plugin_name: str,
         tool_name: str,
         description: str,
         input_schema,
         timeout: float = 30.0,
         declarations: dict[str, Any] | None = None,
+        *,
+        retry: RetryExecutor | None = None,
+        retry_safe: bool = False,
+        call: Any | None = None,
+        recover: Any | None = None,
     ) -> None:
         self._session = session
         self._plugin_name = plugin_name
@@ -72,6 +77,10 @@ class McpTool(Tool):
         self._schema = input_schema or {"type": "object", "properties": {}}
         self._timeout = timeout
         self._declarations = declarations or {}
+        self._retry = retry
+        self._retry_safe = retry_safe
+        self._call = call
+        self._recover = recover
 
     @property
     def name(self) -> str:
@@ -94,8 +103,27 @@ class McpTool(Tool):
         return self._schema
 
     async def execute(self, **kwargs: Any) -> Any:
-        async with asyncio.timeout(self._timeout):
-            result = await self._session.call_tool(self._tool_name, kwargs)
+        async def _invoke():
+            async with asyncio.timeout(self._timeout):
+                if self._call is not None:
+                    result = await self._call(self._tool_name, kwargs)
+                else:
+                    assert self._session is not None
+                    result = await self._session.call_tool(self._tool_name, kwargs)
+            return self._normalize_result(result)
+
+        if self._retry is None:
+            return await _invoke()
+        else:
+            return await self._retry.execute(
+                _invoke,
+                operation="mcp.call",
+                component=self._plugin_name,
+                retry_safe=self._retry_safe,
+                recover=self._recover,
+            )
+
+    def _normalize_result(self, result: Any) -> str:
         if _is_error_result(result):
             text = result_to_text(result)
             code = self._match_declared_code(text)
@@ -150,6 +178,7 @@ class McpGateway:
         plugins: list[McpPluginSpec],
         connect_timeout: float | None = None,
         call_timeout: float | None = None,
+        retry: RetryExecutor | None = None,
     ) -> None:
         self._plugins = {spec.manifest.name: spec for spec in plugins}
         self._connect_timeout = (
@@ -162,6 +191,7 @@ class McpGateway:
             if call_timeout is not None
             else float(os.getenv("MCP_CALL_TIMEOUT", "30"))
         )
+        self._retry = retry
         self._connections: dict[str, PluginConnection] = {}
         self._tools: dict[str, McpTool] = {}
         self._failed: set[str] = set()
@@ -195,7 +225,7 @@ class McpGateway:
 
     async def connect_plugin(
         self, spec: McpPluginSpec
-    ) -> tuple[PluginConnection, list[tuple[str, str, dict[str, Any]]]]:
+    ) -> tuple[PluginConnection, list[tuple[Any, ...]]]:
         """连接一个 stdio MCP 插件并列出其原始工具；失败时清理半开连接。
 
         返回 (连接记录, [(原始工具名, 描述, 参数 schema), ...])。
@@ -230,7 +260,13 @@ class McpGateway:
             raise
 
         raw_tools = [
-            (tool.name, tool.description or "", tool.input_schema or {}) for tool in listed.tools
+            (
+                tool.name,
+                tool.description or "",
+                tool.input_schema or {},
+                getattr(tool, "annotations", None),
+            )
+            for tool in listed.tools
         ]
         return PluginConnection(session=session, cleanup=cleanup), raw_tools
 
@@ -256,18 +292,32 @@ class McpGateway:
                 exc, context=f"插件 {name} 连接失败", fallback=PluginError
             ) from exc
 
-        tools = [
-            McpTool(
-                connection.session,
-                plugin_name=name,
-                tool_name=raw_name,
-                description=description,
-                input_schema=schema,
-                timeout=self._call_timeout,
-                declarations={declared.code: declared for declared in spec.manifest.errors},
+        declarations = {declared.code: declared for declared in spec.manifest.errors}
+        tools = []
+        for raw_tool in raw_tools:
+            raw_name, description, schema, annotations = _normalize_raw_tool(raw_tool)
+            tools.append(
+                McpTool(
+                    connection.session,
+                    plugin_name=name,
+                    tool_name=raw_name,
+                    description=description,
+                    input_schema=schema,
+                    timeout=self._call_timeout,
+                    declarations=declarations,
+                    retry=self._retry,
+                    retry_safe=_tool_retry_safe(spec, annotations),
+                    call=lambda tool_name, arguments, plugin_name=name: self.call_tool(
+                        plugin_name,
+                        tool_name,
+                        arguments,
+                    ),
+                    recover=lambda request, plugin_name=name: self.recover_plugin(
+                        plugin_name,
+                        request,
+                    ),
+                )
             )
-            for raw_name, description, schema in raw_tools
-        ]
         self._connections[name] = connection
         self._failed.discard(name)
         for tool in tools:
@@ -281,11 +331,44 @@ class McpGateway:
         return tools
 
     async def _connect_with_retry(self, spec: McpPluginSpec):
-        """按 MCP_CONNECT_RETRIES（默认 0）对连接做指数退避重试。"""
+        """Connect through the selected retry policy, with legacy env fallback."""
+        if self._retry is not None:
+            return await self._retry.execute(
+                lambda: self.connect_plugin(spec),
+                operation="mcp.connect",
+                component=spec.manifest.name,
+                retry_safe=True,
+            )
+
+        # Compatibility path for direct gateway construction outside Runtime.
         extra_retries = int(os.getenv("MCP_CONNECT_RETRIES", "0"))
         if extra_retries <= 0:
             return await self.connect_plugin(spec)
         return await retry_async(lambda: self.connect_plugin(spec), attempts=extra_retries + 1)
+
+    async def call_tool(
+        self,
+        plugin_name: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        """Call a tool through the plugin's current live connection."""
+        connection = self._connections.get(plugin_name)
+        if connection is None:
+            raise PluginError(f"MCP plugin {plugin_name!r} is not connected")
+        return await connection.session.call_tool(tool_name, arguments)
+
+    async def recover_plugin(self, plugin_name: str, request: RetryRequest) -> None:
+        """Drop a failed connection and reconnect before the next retry."""
+        del request
+        connection = self._connections.pop(plugin_name, None)
+        if connection is not None:
+            await self._close_cleanup(connection.cleanup)
+        self._tools = {
+            name: tool for name, tool in self._tools.items() if tool.plugin_name != plugin_name
+        }
+        self._failed.discard(plugin_name)
+        await self.mount(plugin_name)
 
     async def close(self) -> None:
         """关闭全部插件连接并清空工具表（幂等，可重复调用）。"""
@@ -343,6 +426,47 @@ class UsePlugin(Tool):
             if self._registry.describe(tool.name) is None:
                 self._registry.register(tool)
         return True, f"插件 {name} 已挂载，可用工具: {[tool.name for tool in tools]}"
+
+
+def _normalize_raw_tool(raw: tuple[Any, ...]) -> tuple[str, str, dict[str, Any], Any | None]:
+    if len(raw) < 3:
+        raise ValueError("MCP tool definition must contain name, description, and schema")
+    name, description, schema = raw[:3]
+    annotations = raw[3] if len(raw) > 3 else None
+    if not isinstance(name, str) or not name:
+        raise ValueError("MCP tool name must be a non-empty string")
+    if not isinstance(description, str):
+        description = ""
+    if not isinstance(schema, dict):
+        schema = {}
+    return name, description, schema, annotations
+
+
+def _tool_retry_safe(spec: McpPluginSpec, annotations: Any | None) -> bool:
+    """Retry only tools marked read-only or idempotent by the MCP server."""
+    if spec.manifest.retry_safe:
+        return True
+    if annotations is None:
+        return False
+    for name in (
+        "readOnlyHint",
+        "read_only_hint",
+        "idempotentHint",
+        "idempotent_hint",
+    ):
+        if getattr(annotations, name, None) is True:
+            return True
+    if isinstance(annotations, dict):
+        return any(
+            annotations.get(name) is True
+            for name in (
+                "readOnlyHint",
+                "read_only_hint",
+                "idempotentHint",
+                "idempotent_hint",
+            )
+        )
+    return False
 
 
 def gateway_available(gateway: McpGateway) -> str:
