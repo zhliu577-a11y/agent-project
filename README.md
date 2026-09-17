@@ -199,8 +199,10 @@ plugins/
 `memory` / `memory-index` / `memory-retriever` / `memory-policy` /
 `memory-extractor` / `embedding` / `listener` / `event-transport` / `context` /
 `compaction`；
-`apiVersion` 固定为 `"1"`，`protocolVersion` 当前为 `1`，`contract` 必须与
-`<type>.v<protocolVersion>` 一致（例如 `mcp.v1`、`tool.v1`）；
+`apiVersion` 固定为 `"1"`，大多数 `protocolVersion` 当前为 `1`，Skill 支持 `1`
+和 `2`；`contract` 必须与 `<type>.v<protocolVersion>` 一致（例如 `mcp.v1`、
+`tool.v1`、`skill.v2`）；Skill 必须显式声明 `contract`，其他 kind 可在迁移兼容期内
+省略并由 kind 的首选版本推导；
 `enabled: false` 的插件
 结构仍会校验但不会加载。可选字段 `priority`（整数，默认 `0`）决定钩子插件的
 执行顺序：**越小越先执行**；可选字段 `errors` 声明插件已知的领域错误
@@ -511,6 +513,7 @@ input items，并把 `response.output_text.delta` 与 function-call 事件解析
 {
   "name": "code-review",
   "type": "skill",
+  "contract": "skill.v1",
   "entry": {
     "content": "SKILL.md",
     "resources": [
@@ -529,12 +532,38 @@ input items，并把 `response.output_text.delta` 与 function-call 事件解析
   （惰性读取 + 缓存），`use_skill` 同样过权限/审计钩子；
 - 附属资源默认只展示清单，模型通过 `use_skill(name, resource=path)` 按需读取；
 - 正文、资源和预载总量都有字节预算，超限明确失败，不做静默截断；
+- 技能和资源的 `description` 必须是单行可打印文本，并分别受
+  `maxDescriptionBytes` / `maxResourceDescriptionBytes` 限制，避免目录元数据
+  污染系统提示词；
+- 系统提示词中的完整 Skill 目录受 `maxListingBytes` 限制：所有名称保留，描述按
+  `priority` 从小到大分配；预算不足时低优先级 Skill 降为 name-only，正文读取
+  仍然完整且按需进行；
+- `skill.v2` 可声明 `when_to_use`、`tags`、`compatibility`、`license`、
+  `metadata` 和 `listing`；可选 `importFrontmatter` 只导入受控的基础 YAML
+  frontmatter，`plugin.json` 仍是内部事实源；
+- `config/skill.json` 的 `permissions` 支持全局和按 Agent 的
+  `allow / ask / deny` 通配符规则。`deny` 从目录和 `use_skill` 参数枚举中隐藏；
+  `ask` 由宿主审批回调决定，没有审批器时拒绝读取；
 - 全局规则类技能只能由宿主在 `config/skill.json` 的 `preload` 列表中选择，
   旧清单字段 `entry.preload` 会被忽略。
 
 读取成功会发布 `skill.loaded` / `skill.resource_loaded`，启动预载发布
-`skill.preloaded`；`RuntimeSnapshot.skills` 暴露 `status / preload / loaded /
-bytes / error`。
+`skill.preloaded`，读取失败会发布 `skill.load_failed` /
+`skill.resource_failed`。权限路径发布 `skill.denied` /
+`skill.approval_required` / `skill.approved` / `skill.approval_denied`。
+`RuntimeSnapshot.skills` 暴露 `status / access / priority / listing / usage /
+preload / loaded / bytes / error`。宿主可通过
+`SkillGateway.invalidate()`、`reload()` 和 `reload_resource()` 显式刷新缓存。
+
+手动操作可复用同一权限与预算路径：
+
+```powershell
+.venv\Scripts\python.exe -m cli skill list
+.venv\Scripts\python.exe -m cli skill show code-review
+.venv\Scripts\python.exe -m cli skill search "Python security review"
+```
+
+`skill show` 遇到 `ask` 规则时，交互式审批可用 `--approve` 显式确认。
 
 完整示例见 `plugins/skills/code-review/`。
 
@@ -860,6 +889,11 @@ Skill 的宿主预载和内容预算由 `config/skill.json` 管理。
 | `SKILL_MAX_RESOURCES` | `32` | 单个 Skill 最多声明的资源数 |
 | `SKILL_MAX_RESOURCE_BYTES` | `262144` | 单个 Skill 资源最大字节数 |
 | `SKILL_MAX_RESOURCE_TOTAL_BYTES` | `1048576` | 单个 Skill 全部资源合计最大字节数 |
+| `SKILL_MAX_DESCRIPTION_BYTES` | `512` | 单个 Skill 目录描述最大 UTF-8 字节数 |
+| `SKILL_MAX_RESOURCE_DESCRIPTION_BYTES` | `256` | 单个 Skill 资源描述最大 UTF-8 字节数 |
+| `SKILL_MAX_LISTING_BYTES` | `8192` | Skill 目录 listing 的总字节预算 |
+| `SKILL_AGENT` | `default` | 评估 Skill 权限时使用的 Agent 名 |
+| `SKILL_NAME_ONLY` | 无 | 强制只显示名称的 Skill 通配符，逗号分隔 |
 
 ### 日志追踪与状态快照（tracing / checkpoint）
 

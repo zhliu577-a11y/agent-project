@@ -464,6 +464,7 @@ def test_assemble_plugins_groups_by_kind(tmp_path) -> None:
         {
             "name": "code-review",
             "type": "skill",
+            "contract": "skill.v1",
             "description": "评审规范",
             "entry": {"content": "SKILL.md"},
         },
@@ -716,6 +717,7 @@ def _skill_manifest(name: str = "code-review", **extra) -> dict:
     manifest = {
         "name": name,
         "type": "skill",
+        "contract": "skill.v1",
         "description": "评审规范",
         "entry": {"content": "SKILL.md"},
     }
@@ -737,6 +739,156 @@ def test_load_skill_plugins_points_to_content_file(tmp_path) -> None:
     assert plugin.manifest.name == "code-review"
     assert plugin.content_path == plugin_dir / "SKILL.md"
     assert plugin.preload is False
+
+
+def test_skill_v2_imports_frontmatter_with_plugin_json_precedence(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "review",
+        _skill_manifest(
+            name="review",
+            protocolVersion=2,
+            contract="skill.v2",
+            description="内部描述",
+            entry={
+                "content": "SKILL.md",
+                "importFrontmatter": True,
+            },
+        ),
+        files={
+            "SKILL.md": (
+                "---\n"
+                "name: review\n"
+                "description: 外部描述\n"
+                "when_to_use: 检查代码质量\n"
+                "tags: [python, security]\n"
+                "compatibility: harness >= 1\n"
+                "license: MIT\n"
+                "metadata:\n"
+                "  owner: platform\n"
+                "---\n"
+                "# review\n"
+            )
+        },
+    )
+
+    plugin = load_skill_plugins(tmp_path)[0]
+
+    assert plugin.description == "内部描述"
+    assert plugin.when_to_use == "检查代码质量"
+    assert plugin.tags == ("python", "security")
+    assert plugin.compatibility == "harness >= 1"
+    assert plugin.license == "MIT"
+    assert plugin.metadata == (("owner", "platform"),)
+
+
+def test_skill_v1_rejects_v2_metadata(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "review",
+        _skill_manifest(
+            name="review",
+            entry={
+                "content": "SKILL.md",
+                "when_to_use": "检查代码",
+            },
+        ),
+        files={"SKILL.md": "# review\n"},
+    )
+
+    with pytest.raises(ValueError, match="protocolVersion 2"):
+        load_skill_plugins(tmp_path)
+
+
+def test_load_skill_plugins_requires_explicit_contract(tmp_path) -> None:
+    manifest = _skill_manifest()
+    manifest.pop("contract")
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "missing-contract",
+        manifest,
+        files={"SKILL.md": "# review\n"},
+    )
+
+    with pytest.raises(ValueError, match="missing required 'contract'"):
+        load_skill_plugins(tmp_path)
+
+
+def test_load_skill_plugins_rejects_multiline_description(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "multiline",
+        _skill_manifest(name="multiline", description="第一行\n第二行"),
+        files={"SKILL.md": "# review\n"},
+    )
+
+    with pytest.raises(ValueError, match="单行可打印文本"):
+        load_skill_plugins(tmp_path)
+
+
+def test_load_skill_plugins_enforces_description_budget(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "long-description",
+        _skill_manifest(name="long-description", description="description"),
+        files={"SKILL.md": "# review\n"},
+    )
+
+    with pytest.raises(ValueError, match="description超过大小预算"):
+        load_skill_plugins(
+            tmp_path,
+            AppConfig(skill_max_description_bytes=4),
+        )
+
+
+def test_load_skill_plugins_rejects_multiline_resource_description(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "bad-resource-description",
+        _skill_manifest(
+            name="bad-resource-description",
+            entry={
+                "content": "SKILL.md",
+                "resources": [
+                    {"path": "references/api.md", "description": "第一行\n第二行"},
+                ],
+            },
+        ),
+        files={"SKILL.md": "# review\n", "references/api.md": "# API\n"},
+    )
+
+    with pytest.raises(ValueError, match="资源 description必须是单行可打印文本"):
+        load_skill_plugins(tmp_path)
+
+
+def test_load_skill_plugins_enforces_resource_description_budget(tmp_path) -> None:
+    _write_plugin(
+        tmp_path,
+        "skills",
+        "long-resource-description",
+        _skill_manifest(
+            name="long-resource-description",
+            entry={
+                "content": "SKILL.md",
+                "resources": [
+                    {"path": "references/api.md", "description": "description"},
+                ],
+            },
+        ),
+        files={"SKILL.md": "# review\n", "references/api.md": "# API\n"},
+    )
+
+    with pytest.raises(ValueError, match="资源 description超过大小预算"):
+        load_skill_plugins(
+            tmp_path,
+            AppConfig(skill_max_resource_description_bytes=4),
+        )
 
 
 def test_load_skill_plugins_rejects_missing_content_file(tmp_path) -> None:
@@ -1170,6 +1322,7 @@ def test_package_manifest_expands_to_contributions(tmp_path) -> None:
                 {
                     "id": "lint",
                     "kind": "skill",
+                    "contract": "skill.v1",
                     "description": "lint skill",
                     "entry": {"content": "skills/lint/SKILL.md"},
                 },
@@ -1203,6 +1356,43 @@ def test_package_manifest_expands_to_contributions(tmp_path) -> None:
     ]
 
 
+def test_package_can_contribute_multiple_skills(tmp_path) -> None:
+    _write_package(
+        tmp_path,
+        "quality",
+        {
+            "apiVersion": "1",
+            "name": "quality",
+            "version": "1.0.0",
+            "contributes": [
+                {
+                    "id": "lint",
+                    "kind": "skill",
+                    "contract": "skill.v1",
+                    "entry": {"content": "skills/lint/SKILL.md"},
+                },
+                {
+                    "id": "review",
+                    "kind": "skill",
+                    "contract": "skill.v1",
+                    "entry": {"content": "skills/review/SKILL.md"},
+                },
+            ],
+        },
+        {
+            "skills/lint/SKILL.md": "# lint\n",
+            "skills/review/SKILL.md": "# review\n",
+        },
+    )
+
+    assembly = assemble_plugins(tmp_path)
+
+    assert [plugin.manifest.name for plugin in assembly.skills] == [
+        "quality--lint",
+        "quality--review",
+    ]
+
+
 def test_discover_accepts_package_root_with_manifest(tmp_path) -> None:
     package_dir = _write_package(
         tmp_path,
@@ -1215,6 +1405,7 @@ def test_discover_accepts_package_root_with_manifest(tmp_path) -> None:
                 {
                     "id": "lint",
                     "kind": "skill",
+                    "contract": "skill.v1",
                     "entry": {"content": "SKILL.md"},
                 }
             ],
@@ -1239,6 +1430,7 @@ def test_disabled_package_is_validated_but_not_returned(tmp_path) -> None:
                 {
                     "id": "lint",
                     "kind": "skill",
+                    "contract": "skill.v1",
                     "entry": {"content": "SKILL.md"},
                 }
             ],
@@ -1260,6 +1452,7 @@ def test_inspect_package_validates_entries_without_importing_code(tmp_path) -> N
                 {
                     "id": "lint",
                     "kind": "skill",
+                    "contract": "skill.v1",
                     "entry": {"content": "SKILL.md"},
                 }
             ],
@@ -1286,6 +1479,7 @@ def test_inspect_package_rejects_entry_outside_package(tmp_path) -> None:
                 {
                     "id": "lint",
                     "kind": "skill",
+                    "contract": "skill.v1",
                     "entry": {"content": "../outside.md"},
                 }
             ],
@@ -1341,11 +1535,13 @@ def test_package_rejects_duplicate_contribution_id(tmp_path) -> None:
                 {
                     "id": "same",
                     "kind": "skill",
+                    "contract": "skill.v1",
                     "entry": {"content": "SKILL.md"},
                 },
                 {
                     "id": "same",
                     "kind": "skill",
+                    "contract": "skill.v1",
                     "entry": {"content": "SKILL.md"},
                 },
             ],
@@ -1364,6 +1560,7 @@ def test_package_rejects_duplicate_package_name(tmp_path) -> None:
             {
                 "id": "lint",
                 "kind": "skill",
+                "contract": "skill.v1",
                 "entry": {"content": "SKILL.md"},
             }
         ],

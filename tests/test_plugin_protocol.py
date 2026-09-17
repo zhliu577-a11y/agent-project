@@ -3,9 +3,10 @@ from pathlib import Path
 
 import pytest
 
+from plugins import loader as plugin_loader
 from plugins.context import PluginContext
 from plugins.lifecycle import PluginLifecycleManager
-from plugins.loader import discover_plugins, load_hook_plugins
+from plugins.loader import KindHandler, discover_plugins, load_hook_plugins, register_kind
 from plugins.protocol import MANIFEST_API_VERSION, PLUGIN_PROTOCOL_VERSION
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +60,75 @@ def test_manifest_rejects_contract_version_mismatch(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="contract mismatch"):
         discover_plugins(tmp_path)
+
+
+def test_kind_negotiates_multiple_protocol_versions(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(plugin_loader, "_KIND_REGISTRY", dict(plugin_loader._KIND_REGISTRY))
+    monkeypatch.setattr(plugin_loader, "SUPPORTED_KINDS", plugin_loader.SUPPORTED_KINDS)
+    register_kind(
+        KindHandler(
+            "multi",
+            lambda manifest: manifest.name,
+            lambda _assembly, _manifest, _payload: None,
+            protocol_version=2,
+            protocol_versions=(1, 2),
+            explicit_contract=True,
+        ),
+        replace=True,
+    )
+    plugin_dir = tmp_path / "multi" / "legacy"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "legacy",
+                "type": "multi",
+                "protocolVersion": 1,
+                "contract": "multi.v1",
+                "entry": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = discover_plugins(tmp_path)[0]
+
+    assert manifest.protocol_version == 1
+    assert manifest.contract == "multi.v1"
+
+
+def test_kind_uses_preferred_protocol_version_when_omitted(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(plugin_loader, "_KIND_REGISTRY", dict(plugin_loader._KIND_REGISTRY))
+    monkeypatch.setattr(plugin_loader, "SUPPORTED_KINDS", plugin_loader.SUPPORTED_KINDS)
+    register_kind(
+        KindHandler(
+            "multi-default",
+            lambda manifest: manifest.name,
+            lambda _assembly, _manifest, _payload: None,
+            protocol_version=2,
+            protocol_versions=(1, 2),
+            explicit_contract=True,
+        ),
+        replace=True,
+    )
+    plugin_dir = tmp_path / "multi-default" / "current"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "current",
+                "type": "multi-default",
+                "contract": "multi-default.v2",
+                "entry": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = discover_plugins(tmp_path)[0]
+
+    assert manifest.protocol_version == 2
+    assert manifest.contract == "multi-default.v2"
 
 
 def test_builtin_manifests_declare_the_platform_protocol_explicitly() -> None:

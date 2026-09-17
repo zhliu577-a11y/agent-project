@@ -86,7 +86,9 @@ from typing import Any
 
 from config import (
     DEFAULT_SKILL_MAX_CONTENT_BYTES,
+    DEFAULT_SKILL_MAX_DESCRIPTION_BYTES,
     DEFAULT_SKILL_MAX_RESOURCE_BYTES,
+    DEFAULT_SKILL_MAX_RESOURCE_DESCRIPTION_BYTES,
     DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES,
     DEFAULT_SKILL_MAX_RESOURCES,
     AppConfig,
@@ -114,7 +116,8 @@ from plugins.external import ExternalTool, ExternalToolDefinition, StdioJsonRpcH
 from plugins.protocol import (
     MANIFEST_API_VERSION,
     PLUGIN_PROTOCOL_VERSION,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    SKILL_PROTOCOL_VERSION,
+    SKILL_PROTOCOL_VERSIONS,
     capability_contract,
 )
 from plugins.services import (
@@ -209,6 +212,23 @@ class KindHandler:
     load: Callable[..., Any]
     apply: Callable[["PluginAssembly", PluginManifest, Any], None]
     protocol_version: int = PLUGIN_PROTOCOL_VERSION
+    protocol_versions: tuple[int, ...] | None = None
+    explicit_contract: bool = False
+
+    def supported_protocol_versions(self) -> tuple[int, ...]:
+        """Return the host-supported versions, with protocol_version as preferred."""
+        versions = self.protocol_versions or (self.protocol_version,)
+        if self.protocol_version not in versions:
+            raise ValueError(
+                f"preferred protocolVersion {self.protocol_version!r} "
+                f"must be present in supported versions {versions!r}"
+            )
+        if len(set(versions)) != len(versions):
+            raise ValueError(f"duplicate protocolVersion values: {versions!r}")
+        for version in versions:
+            if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+                raise ValueError(f"invalid protocolVersion: {version!r}")
+        return tuple(sorted(versions))
 
 
 _KIND_REGISTRY: dict[str, KindHandler] = {}
@@ -219,10 +239,7 @@ def register_kind(handler: KindHandler, *, replace: bool = False) -> None:
     global SUPPORTED_KINDS
     if not _NAME_RE.fullmatch(handler.kind):
         raise ValueError(f"invalid kind name: {handler.kind!r}")
-    if handler.protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
-        raise ValueError(
-            f"unsupported protocolVersion for kind {handler.kind!r}: {handler.protocol_version!r}"
-        )
+    handler.supported_protocol_versions()
     if handler.kind in _KIND_REGISTRY and not replace:
         raise ValueError(f"kind already registered: {handler.kind}")
     _KIND_REGISTRY[handler.kind] = handler
@@ -417,6 +434,13 @@ class SkillPlugin:
     content_path: Path
     preload: bool
     resources: tuple[SkillResource, ...] = ()
+    description: str = ""
+    when_to_use: str = ""
+    tags: tuple[str, ...] = ()
+    compatibility: str = ""
+    license: str = ""
+    metadata: tuple[tuple[str, str], ...] = ()
+    listing: str = "full"
 
 
 @dataclass(frozen=True)
@@ -650,15 +674,33 @@ def _parse_manifest(path: Path) -> PluginManifest:
         f"unsupported 'apiVersion' {api_version!r}; supported: '{MANIFEST_API_VERSION}'",
     )
 
-    protocol_version = _parse_protocol_version(raw.get("protocolVersion"), where)
+    handler = _KIND_REGISTRY[kind]
+    protocol_version = _parse_protocol_version(
+        raw.get("protocolVersion"),
+        where,
+        default=handler.protocol_version,
+    )
+    _expect(
+        protocol_version in handler.supported_protocol_versions(),
+        where,
+        f"unsupported 'protocolVersion' {protocol_version!r}; "
+        f"kind '{kind}' supports {list(handler.supported_protocol_versions())}",
+    )
     contract = capability_contract(kind, protocol_version).name
-    _validate_declared_contract(raw.get("contract"), contract, where)
+    _validate_declared_contract(
+        raw.get("contract"),
+        contract,
+        where,
+        required=handler.explicit_contract,
+    )
 
     version = raw.get("version", "")
     _expect(isinstance(version, str), where, "'version' 必须是字符串")
 
     description = raw.get("description", "")
     _expect(isinstance(description, str), where, "'description' 必须是字符串")
+    if kind == "skill":
+        _validate_skill_description(description, where, max_bytes=None, label="description")
 
     enabled = raw.get("enabled", True)
     _expect(isinstance(enabled, bool), where, "'enabled' 必须是布尔值")
@@ -757,25 +799,31 @@ def _parse_string_list(value: Any, where: str) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _parse_protocol_version(value: Any, where: str) -> int:
+def _parse_protocol_version(
+    value: Any,
+    where: str,
+    *,
+    default: int = PLUGIN_PROTOCOL_VERSION,
+) -> int:
     if value is None:
-        return PLUGIN_PROTOCOL_VERSION
+        value = default
     _expect(
-        isinstance(value, int) and not isinstance(value, bool),
+        isinstance(value, int) and not isinstance(value, bool) and value > 0,
         where,
-        "'protocolVersion' must be an integer",
-    )
-    _expect(
-        value in SUPPORTED_PROTOCOL_VERSIONS,
-        where,
-        f"unsupported 'protocolVersion' {value!r}; "
-        f"supported: {sorted(SUPPORTED_PROTOCOL_VERSIONS)}",
+        "'protocolVersion' must be a positive integer",
     )
     return value
 
 
-def _validate_declared_contract(value: Any, expected: str, where: str) -> None:
+def _validate_declared_contract(
+    value: Any,
+    expected: str,
+    where: str,
+    *,
+    required: bool = False,
+) -> None:
     if value is None:
+        _expect(not required, where, "missing required 'contract'")
         return
     _expect(
         isinstance(value, str) and value == expected,
@@ -1028,7 +1076,12 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
         f"'apiVersion' must be '{MANIFEST_API_VERSION}'",
     )
     _expect("type" not in raw, where, "manifest cannot contain both 'type' and 'contributes'")
-    package_protocol_version = _parse_protocol_version(raw.get("protocolVersion"), where)
+    raw_package_protocol_version = raw.get("protocolVersion")
+    package_protocol_version = (
+        _parse_protocol_version(raw_package_protocol_version, where)
+        if raw_package_protocol_version is not None
+        else None
+    )
 
     package_name = raw.get("name")
     _expect(
@@ -1087,12 +1140,30 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
             item_where,
             f"invalid 'kind' {kind!r}; supported: {', '.join(registered_kinds())}",
         )
+        handler = _KIND_REGISTRY[kind]
+        default_protocol_version = (
+            package_protocol_version
+            if package_protocol_version is not None
+            else handler.protocol_version
+        )
         item_protocol_version = _parse_protocol_version(
-            item.get("protocolVersion", package_protocol_version),
+            item.get("protocolVersion"),
             item_where,
+            default=default_protocol_version,
+        )
+        _expect(
+            item_protocol_version in handler.supported_protocol_versions(),
+            item_where,
+            f"unsupported 'protocolVersion' {item_protocol_version!r}; "
+            f"kind '{kind}' supports {list(handler.supported_protocol_versions())}",
         )
         item_contract = capability_contract(kind, item_protocol_version).name
-        _validate_declared_contract(item.get("contract"), item_contract, item_where)
+        _validate_declared_contract(
+            item.get("contract"),
+            item_contract,
+            item_where,
+            required=handler.explicit_contract,
+        )
 
         entry = item.get("entry")
         _expect(isinstance(entry, dict), item_where, "missing 'entry' object")
@@ -1106,6 +1177,13 @@ def _parse_package_contributions(path: Path, raw: dict[str, Any]) -> list[Plugin
             item_where,
             "'description' must be a string",
         )
+        if kind == "skill":
+            _validate_skill_description(
+                item_description,
+                item_where,
+                max_bytes=None,
+                label="description",
+            )
 
         item_enabled = item.get("enabled", True)
         _expect(isinstance(item_enabled, bool), item_where, "'enabled' must be bool")
@@ -1262,7 +1340,264 @@ def inspect_package(root: str | Path) -> PackageInspection:
     )
 
 
-def _parse_skill_resources(manifest: PluginManifest) -> tuple[SkillResource, ...]:
+def _validate_skill_description(
+    value: Any,
+    where: str,
+    *,
+    max_bytes: int | None,
+    label: str,
+) -> str:
+    _expect(isinstance(value, str), where, f"{label}必须是字符串")
+    _expect(value.isprintable(), where, f"{label}必须是单行可打印文本")
+    if max_bytes is not None:
+        size = len(value.encode("utf-8"))
+        _expect(
+            size <= max_bytes,
+            where,
+            f"{label}超过大小预算: {size} > {max_bytes} bytes",
+        )
+    return value
+
+
+def _parse_skill_tags(value: Any, where: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",")]
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise ValueError(f"{where}: 'tags' must be a string array")
+
+    tags: list[str] = []
+    for index, item in enumerate(items, start=1):
+        item_where = f"{where} tags[{index}]"
+        _expect(isinstance(item, str) and bool(item.strip()), item_where, "tag must be non-empty")
+        tag = item.strip()
+        _expect(tag.isprintable(), item_where, "tag must be printable text")
+        _expect(len(tag.encode("utf-8")) <= 64, item_where, "tag exceeds 64 bytes")
+        _expect(tag not in tags, item_where, f"duplicate tag: {tag}")
+        tags.append(tag)
+    _expect(len(tags) <= 32, where, "too many tags: maximum is 32")
+    return tuple(tags)
+
+
+def _parse_skill_metadata(value: Any, where: str) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    _expect(isinstance(value, dict), where, "'metadata' must be an object")
+    metadata: list[tuple[str, str]] = []
+    for raw_key, raw_value in value.items():
+        _expect(
+            isinstance(raw_key, str) and bool(raw_key.strip()),
+            where,
+            "metadata keys must be non-empty strings",
+        )
+        _expect(
+            isinstance(raw_value, (str, int, float, bool)),
+            where,
+            "metadata values must be scalar values",
+        )
+        metadata.append((raw_key.strip(), str(raw_value)))
+    return tuple(metadata)
+
+
+def _parse_yaml_scalar(value: str, where: str) -> Any:
+    raw = value.strip()
+    if not raw:
+        return ""
+    if raw.startswith('"') and raw.endswith('"'):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{where}: invalid quoted scalar: {exc}") from exc
+    if raw.startswith("'") and raw.endswith("'"):
+        return raw[1:-1].replace("''", "'")
+    if raw in {"true", "false"}:
+        return raw == "true"
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return []
+        return [
+            _parse_yaml_scalar(item.strip(), where) for item in inner.split(",") if item.strip()
+        ]
+    return raw
+
+
+def _parse_skill_frontmatter(path: Path, where: str) -> dict[str, Any]:
+    """Parse the Agent Skills frontmatter subset used by the import layer."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"{where}: frontmatter read failed: {exc}") from exc
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    try:
+        end = next(index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---")
+    except StopIteration as exc:
+        raise ValueError(f"{where}: frontmatter is missing closing '---'") from exc
+
+    result: dict[str, Any] = {}
+    index = 1
+    while index < end:
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            index += 1
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9_-]+):(?:\s*(.*))?", line)
+        if match is None:
+            raise ValueError(f"{where}: invalid frontmatter line {index + 1}: {line!r}")
+        key, raw_value = match.group(1), match.group(2) or ""
+        if raw_value.strip():
+            result[key] = _parse_yaml_scalar(raw_value, f"{where} frontmatter.{key}")
+            index += 1
+            continue
+
+        block: list[tuple[str | None, Any]] = []
+        cursor = index + 1
+        while cursor < end and (lines[cursor].startswith(" ") or lines[cursor].startswith("\t")):
+            nested = lines[cursor].strip()
+            if not nested or nested.startswith("#"):
+                cursor += 1
+                continue
+            if nested.startswith("- "):
+                block.append((None, _parse_yaml_scalar(nested[2:], where)))
+            else:
+                nested_match = re.fullmatch(r"([A-Za-z0-9_-]+):(?:\s*(.*))?", nested)
+                if nested_match is None:
+                    raise ValueError(
+                        f"{where}: invalid nested frontmatter line {cursor + 1}: {nested!r}"
+                    )
+                block.append(
+                    (
+                        nested_match.group(1),
+                        _parse_yaml_scalar(
+                            nested_match.group(2) or "",
+                            f"{where} frontmatter.{key}.{nested_match.group(1)}",
+                        ),
+                    )
+                )
+            cursor += 1
+
+        if not block:
+            result[key] = {}
+        elif block[0][0] is None:
+            result[key] = [value for _, value in block]
+        else:
+            result[key] = {name: value for name, value in block if name is not None}
+        index = cursor
+    return result
+
+
+def _skill_metadata(
+    manifest: PluginManifest,
+    content_path: Path,
+    *,
+    max_description_bytes: int,
+) -> dict[str, Any]:
+    where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
+    entry = manifest.entry
+    import_frontmatter = entry.get(
+        "import_frontmatter",
+        entry.get("importFrontmatter", False),
+    )
+    _expect(isinstance(import_frontmatter, bool), where, "'import_frontmatter' must be bool")
+
+    frontmatter: dict[str, Any] = {}
+    if import_frontmatter:
+        frontmatter = _parse_skill_frontmatter(
+            content_path,
+            f"{where} {content_path.name}",
+        )
+        front_name = frontmatter.get("name")
+        if front_name is not None:
+            _expect(isinstance(front_name, str), where, "frontmatter 'name' must be a string")
+            expected = {manifest.name}
+            if manifest.contribution_id is not None:
+                expected.add(manifest.contribution_id)
+            _expect(
+                front_name in expected,
+                where,
+                f"frontmatter name {front_name!r} must match one of {sorted(expected)}",
+            )
+
+    imported_description = frontmatter.get("description", "")
+    _expect(
+        isinstance(imported_description, str),
+        where,
+        "frontmatter 'description' must be a string",
+    )
+    description = manifest.description or imported_description
+    _validate_skill_description(
+        description,
+        where,
+        max_bytes=max_description_bytes,
+        label="description",
+    )
+
+    raw_when_to_use = entry.get(
+        "when_to_use",
+        entry.get("whenToUse", frontmatter.get("when_to_use", "")),
+    )
+    when_to_use = _validate_skill_description(
+        raw_when_to_use,
+        where,
+        max_bytes=max_description_bytes,
+        label="when_to_use",
+    )
+    tags = _parse_skill_tags(entry.get("tags", frontmatter.get("tags", [])), where)
+    compatibility = _validate_skill_description(
+        entry.get("compatibility", frontmatter.get("compatibility", "")),
+        where,
+        max_bytes=max_description_bytes,
+        label="compatibility",
+    )
+    _expect(len(compatibility) <= 500, where, "compatibility exceeds 500 characters")
+    license_text = entry.get("license", frontmatter.get("license", ""))
+    _expect(isinstance(license_text, str), where, "'license' must be a string")
+    metadata = _parse_skill_metadata(
+        entry.get("metadata", frontmatter.get("metadata", {})),
+        where,
+    )
+    listing = entry.get("listing", "full")
+    if entry.get("name_only", entry.get("nameOnly", False)):
+        listing = "name-only"
+    _expect(listing in {"full", "name-only"}, where, "'listing' must be 'full' or 'name-only'")
+
+    advanced = bool(
+        import_frontmatter
+        or when_to_use
+        or tags
+        or compatibility
+        or license_text
+        or metadata
+        or listing != "full"
+    )
+    if advanced:
+        _expect(
+            manifest.protocol_version >= 2,
+            where,
+            "advanced Skill metadata requires protocolVersion 2 and contract skill.v2",
+        )
+
+    return {
+        "description": description,
+        "when_to_use": when_to_use,
+        "tags": tags,
+        "compatibility": compatibility,
+        "license": license_text,
+        "metadata": metadata,
+        "listing": listing,
+    }
+
+
+def _parse_skill_resources(
+    manifest: PluginManifest,
+    *,
+    max_description_bytes: int | None = None,
+) -> tuple[SkillResource, ...]:
     """Validate Skill resource declarations without reading their contents."""
     where = f"{manifest.directory / 'plugin.json'} ('{manifest.name}')"
     raw_resources = manifest.entry.get("resources", [])
@@ -1282,6 +1617,19 @@ def _parse_skill_resources(manifest: PluginManifest) -> tuple[SkillResource, ...
         )
         description = item.get("description", "")
         _expect(isinstance(description, str), item_where, "'description' 必须是字符串")
+        _validate_skill_description(
+            description,
+            item_where,
+            max_bytes=None,
+            label="资源 description",
+        )
+        if max_description_bytes is not None:
+            _validate_skill_description(
+                description,
+                item_where,
+                max_bytes=max_description_bytes,
+                label="资源 description",
+            )
 
         resource_path = _resolve_inside(manifest.directory, resource_rel, item_where)
         _expect(resource_path.is_file(), item_where, f"资源文件不存在: {resource_path}")
@@ -1371,13 +1719,14 @@ def _validate_capability_contract(manifest: PluginManifest) -> None:
     handler = _KIND_REGISTRY.get(manifest.type)
     _expect(handler is not None, where, f"kind '{manifest.type}' is not registered")
     assert handler is not None
+    supported_versions = handler.supported_protocol_versions()
     _expect(
-        handler.protocol_version == manifest.protocol_version,
+        manifest.protocol_version in supported_versions,
         where,
         f"protocol mismatch: plugin declares {manifest.protocol_version}, "
-        f"host kind '{manifest.type}' supports {handler.protocol_version}",
+        f"host kind '{manifest.type}' supports {list(supported_versions)}",
     )
-    expected = capability_contract(manifest.type, handler.protocol_version).name
+    expected = capability_contract(manifest.type, manifest.protocol_version).name
     _expect(
         manifest.contract == expected,
         where,
@@ -1824,7 +2173,6 @@ def load_skill_plugin(
 
     content_path = _resolve_inside(manifest.directory, content_rel, where)
     _expect(content_path.is_file(), where, f"正文文件不存在: {content_path}")
-    resources = _parse_skill_resources(manifest)
 
     max_content_bytes = (
         config.skill_max_content_bytes if config is not None else DEFAULT_SKILL_MAX_CONTENT_BYTES
@@ -1839,6 +2187,26 @@ def load_skill_plugin(
         config.skill_max_resource_total_bytes
         if config is not None
         else DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES
+    )
+    max_description_bytes = (
+        config.skill_max_description_bytes
+        if config is not None
+        else DEFAULT_SKILL_MAX_DESCRIPTION_BYTES
+    )
+    max_resource_description_bytes = (
+        config.skill_max_resource_description_bytes
+        if config is not None
+        else DEFAULT_SKILL_MAX_RESOURCE_DESCRIPTION_BYTES
+    )
+
+    skill_metadata = _skill_metadata(
+        manifest,
+        content_path,
+        max_description_bytes=max_description_bytes,
+    )
+    resources = _parse_skill_resources(
+        manifest,
+        max_description_bytes=max_resource_description_bytes,
     )
 
     content_size = _skill_file_size(content_path, where)
@@ -1877,6 +2245,13 @@ def load_skill_plugin(
         content_path=content_path,
         preload=preload,
         resources=resources,
+        description=skill_metadata["description"],
+        when_to_use=skill_metadata["when_to_use"],
+        tags=skill_metadata["tags"],
+        compatibility=skill_metadata["compatibility"],
+        license=skill_metadata["license"],
+        metadata=skill_metadata["metadata"],
+        listing=skill_metadata["listing"],
     )
 
 
@@ -2406,7 +2781,16 @@ register_kind(KindHandler("model", load_model_plugin, _apply_model))
 register_kind(KindHandler("model-router", load_model_router_plugin, _apply_model_router))
 register_kind(KindHandler("context", load_context_plugin, _apply_context))
 register_kind(KindHandler("compaction", load_compaction_plugin, _apply_compaction))
-register_kind(KindHandler("skill", load_skill_plugin, _apply_skill))
+register_kind(
+    KindHandler(
+        "skill",
+        load_skill_plugin,
+        _apply_skill,
+        protocol_version=SKILL_PROTOCOL_VERSION,
+        protocol_versions=SKILL_PROTOCOL_VERSIONS,
+        explicit_contract=True,
+    )
+)
 register_kind(KindHandler("session", load_session_plugin, _apply_session))
 register_kind(KindHandler("memory", load_memory_plugin, _apply_memory))
 register_kind(KindHandler("memory-index", load_memory_index_plugin, _apply_memory_index))

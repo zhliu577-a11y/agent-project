@@ -15,7 +15,7 @@ def build_system_prompt(
     preloads：需要全量注入的全局技能（名字, 正文）。
     """
     mcp_catalog = "\n".join(f"- {name}: {desc}" for name, desc in mcp) or "（暂无）"
-    skill_catalog = "\n".join(f"- {name}: {desc}" for name, desc in skills)
+    skill_catalog = "\n".join(f"- {name}: {desc}" if desc else f"- {name}" for name, desc in skills)
 
     prompt = (
         "你是一个乐于助人的助手。工具名格式为 <插件名>__<工具名>；"

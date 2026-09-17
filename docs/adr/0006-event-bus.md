@@ -62,7 +62,7 @@ After a decision, the system may publish observations such as
 | `model.request` / `model.response` / `model.error` | agent loop |
 | `tool.start` / `tool.after` / `tool.denied` | agent loop |
 | `memory.write` / `memory.update` / `memory.delete` | memory gateway |
-| `skill.loaded` / `skill.preloaded` / `skill.resource_loaded` | skill runtime |
+| `skill.loaded` / `skill.preloaded` / `skill.resource_loaded` / `skill.load_failed` / `skill.resource_failed` | skill runtime |
 | `session.start` / `session.end` | CLI or future API |
 | `user_prompt.accepted` / `user_prompt.rejected` | CLI or future API |
 

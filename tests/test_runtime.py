@@ -320,6 +320,7 @@ def _config(
     mcp_preload: tuple[str, ...] = (),
     skill_preload: tuple[str, ...] = (),
     skill_max_preload_bytes: int = 524288,
+    skill_permissions: tuple[tuple[str, str], ...] = (),
     model_router: str | None = None,
 ) -> AppConfig:
     return AppConfig(
@@ -333,6 +334,7 @@ def _config(
         mcp_preload=mcp_preload,
         skill_preload=skill_preload,
         skill_max_preload_bytes=skill_max_preload_bytes,
+        skill_permissions=skill_permissions,
         model_router=model_router,
     )
 
@@ -349,6 +351,7 @@ def _write_skill_package(root: Path, *, legacy_preload: bool = False) -> Path:
                 {
                     "id": "lint",
                     "kind": "skill",
+                    "contract": "skill.v1",
                     "entry": {
                         "content": "SKILL.md",
                         "preload": legacy_preload,
@@ -398,6 +401,10 @@ async def test_runtime_loads_enabled_package_and_records_status(tmp_path, monkey
         skill_status = next(status for status in snapshot.skills if status.name == "quality--lint")
         assert skill_status.status == "ready"
         assert skill_status.loaded is False
+        assert skill_status.access == "allow"
+        assert skill_status.priority == 0
+        assert skill_status.listing == "full"
+        assert skill_status.usage.requests == 0
         assert "external__echo" in snapshot.tools
         assert type(runtime.context_policy).__name__ == "TailWindowPolicy"
         assert runtime.context_gateway is not None
@@ -405,6 +412,36 @@ async def test_runtime_loads_enabled_package_and_records_status(tmp_path, monkey
         assert manager.list_installed()[0].runtime_status == "active"
 
     assert manager.list_installed()[0].runtime_status == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_runtime_hides_denied_skills_from_prompt_and_tool(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("EVENT_LOG", raising=False)
+    manager = _manager(tmp_path)
+    manager.install(_write_skill_package(tmp_path / "source"))
+    manager.enable("quality")
+    runtime = HarnessRuntime(
+        _config(skill_permissions=(("*", "deny"),)),
+        plugin_manager=manager,
+    )
+
+    async with runtime:
+        assert runtime.skills is not None
+        assert runtime.skills.available() == []
+        assert runtime.snapshot().skills == ()
+        assert "quality--lint" not in runtime.system_prompt
+        use_skill = next(
+            schema
+            for schema in runtime.tools.list_schemas()
+            if schema["function"]["name"] == "use_skill"
+        )
+        assert (
+            "quality--lint"
+            not in use_skill["function"]["parameters"]["properties"]["name"]["description"]
+        )
 
 
 @pytest.mark.asyncio

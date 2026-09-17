@@ -32,6 +32,11 @@ _CONFIG_KEYS = (
     "SKILL_MAX_RESOURCES",
     "SKILL_MAX_RESOURCE_BYTES",
     "SKILL_MAX_RESOURCE_TOTAL_BYTES",
+    "SKILL_MAX_DESCRIPTION_BYTES",
+    "SKILL_MAX_RESOURCE_DESCRIPTION_BYTES",
+    "SKILL_MAX_LISTING_BYTES",
+    "SKILL_AGENT",
+    "SKILL_NAME_ONLY",
     "MODEL_FALLBACK",
     "MODEL_KEEP_WARM",
     "MODEL_ROUTER",
@@ -108,6 +113,22 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
             "maxResources": 4,
             "maxResourceBytes": 500,
             "maxResourceTotalBytes": 1500,
+            "maxDescriptionBytes": 120,
+            "maxResourceDescriptionBytes": 60,
+            "maxListingBytes": 240,
+            "agent": "reviewer",
+            "permissions": {
+                "*": "allow",
+                "dangerous-*": "deny",
+            },
+            "agents": {
+                "reviewer": {
+                    "permissions": {
+                        "dangerous-*": "ask",
+                    }
+                }
+            },
+            "nameOnly": ["very-long-*"],
         },
     )
 
@@ -137,6 +158,16 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     assert config.skill_max_resources == 4
     assert config.skill_max_resource_bytes == 500
     assert config.skill_max_resource_total_bytes == 1500
+    assert config.skill_max_description_bytes == 120
+    assert config.skill_max_resource_description_bytes == 60
+    assert config.skill_max_listing_bytes == 240
+    assert config.skill_agent == "reviewer"
+    assert config.skill_permissions == (
+        ("*", "allow"),
+        ("dangerous-*", "deny"),
+    )
+    assert config.skill_agent_permissions == (("reviewer", (("dangerous-*", "ask"),)),)
+    assert config.skill_name_only == ("very-long-*",)
     assert config.config_dir == config_dir.resolve()
 
     monkeypatch.setenv("AGENT_MODEL", "deepseek")
@@ -154,6 +185,10 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     monkeypatch.setenv("MCP_PRELOAD", "filesystem")
     monkeypatch.setenv("SKILL_PRELOAD", "commit-message")
     monkeypatch.setenv("SKILL_MAX_CONTENT_BYTES", "3000")
+    monkeypatch.setenv("SKILL_MAX_DESCRIPTION_BYTES", "700")
+    monkeypatch.setenv("SKILL_MAX_LISTING_BYTES", "900")
+    monkeypatch.setenv("SKILL_AGENT", "reviewer")
+    monkeypatch.setenv("SKILL_NAME_ONLY", "very-long-*")
     config = AppConfig.load(config_dir)
     assert config.model == "deepseek"
     assert config.event_transport == "custom-transport"
@@ -170,6 +205,10 @@ def test_config_directory_merges_shared_and_section_files(tmp_path, monkeypatch)
     assert config.mcp_preload == ("filesystem",)
     assert config.skill_preload == ("commit-message",)
     assert config.skill_max_content_bytes == 3000
+    assert config.skill_max_description_bytes == 700
+    assert config.skill_max_listing_bytes == 900
+    assert config.skill_agent == "reviewer"
+    assert config.skill_name_only == ("very-long-*",)
 
 
 def test_plugin_config_is_loaded_by_kind_and_name(tmp_path) -> None:
@@ -304,6 +343,13 @@ def test_config_missing_file_uses_defaults(tmp_path, monkeypatch) -> None:
     assert config.skill_max_resources == 32
     assert config.skill_max_resource_bytes == 262144
     assert config.skill_max_resource_total_bytes == 1048576
+    assert config.skill_max_description_bytes == 512
+    assert config.skill_max_resource_description_bytes == 256
+    assert config.skill_max_listing_bytes == 8192
+    assert config.skill_agent == "default"
+    assert config.skill_permissions == ()
+    assert config.skill_agent_permissions == ()
+    assert config.skill_name_only == ()
 
 
 def test_config_invalid_type_fails_fast(tmp_path) -> None:
@@ -364,6 +410,28 @@ def test_config_rejects_invalid_skill_preload_and_budgets(tmp_path, monkeypatch)
     _write(config_dir / "config.json", {"skill": {"maxContentBytes": 0}})
     with pytest.raises(ValueError, match="maxContentBytes"):
         AppConfig.load(config_dir)
+
+    _write(config_dir / "config.json", {"skill": {"maxDescriptionBytes": 0}})
+    with pytest.raises(ValueError, match="maxDescriptionBytes"):
+        AppConfig.load(config_dir)
+
+
+def test_config_rejects_invalid_skill_permissions(tmp_path, monkeypatch) -> None:
+    _clean_env(monkeypatch)
+    config_dir = tmp_path / "config"
+    _write(
+        config_dir / "config.json",
+        {"skill": {"permissions": {"*": "maybe"}}},
+    )
+    with pytest.raises(ValueError, match="skill.permissions"):
+        AppConfig.load(config_dir)
+
+    _write(
+        config_dir / "config.json",
+        {"skill": {"agents": {"reviewer": {"permissions": {"*": "deny"}}}}},
+    )
+    config = AppConfig.load(config_dir)
+    assert config.skill_agent_permissions == (("reviewer", (("*", "deny"),)),)
 
 
 def test_config_rejects_invalid_session_compaction(tmp_path, monkeypatch) -> None:

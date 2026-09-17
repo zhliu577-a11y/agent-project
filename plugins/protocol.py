@@ -4,6 +4,8 @@ from dataclasses import dataclass
 MANIFEST_API_VERSION = "1"
 PLUGIN_PROTOCOL_VERSION = 1
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({PLUGIN_PROTOCOL_VERSION})
+SKILL_PROTOCOL_VERSION = 1
+SKILL_PROTOCOL_VERSIONS = (1, 2)
 
 
 @dataclass(frozen=True)
@@ -19,9 +21,12 @@ class CapabilityContract:
 
 
 def capability_contract(kind: str, protocol_version: int) -> CapabilityContract:
-    if protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
+    if (
+        isinstance(protocol_version, bool)
+        or not isinstance(protocol_version, int)
+        or protocol_version <= 0
+    ):
         raise ValueError(
-            f"unsupported plugin protocolVersion {protocol_version!r}; "
-            f"supported: {sorted(SUPPORTED_PROTOCOL_VERSIONS)}"
+            f"plugin protocolVersion must be a positive integer, got {protocol_version!r}"
         )
     return CapabilityContract(kind=kind, protocol_version=protocol_version)

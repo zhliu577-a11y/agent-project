@@ -2,7 +2,7 @@
 import inspect
 import logging
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from config import AppConfig
@@ -28,7 +28,13 @@ from gateways.memory_gateway import (
 )
 from gateways.model_gateway import ModelGateway
 from gateways.session_gateway import SessionGateway
-from gateways.skill_gateway import SkillGateway, UseSkill
+from gateways.skill_gateway import (
+    ApprovalCallback,
+    SkillGateway,
+    SkillPermissionPolicy,
+    SkillUsageStats,
+    UseSkill,
+)
 from plugins.context import PluginContext
 from plugins.lifecycle import PluginLifecycleManager
 from plugins.loader import (
@@ -85,6 +91,10 @@ class SkillRuntimeStatus:
     preload: bool
     loaded: bool
     bytes: int
+    access: str = "allow"
+    priority: int = 0
+    listing: str = "full"
+    usage: SkillUsageStats = field(default_factory=SkillUsageStats)
     error: str | None = None
 
 
@@ -108,9 +118,11 @@ class HarnessRuntime:
         config: AppConfig,
         *,
         plugin_manager: PluginManager | None = None,
+        skill_approver: ApprovalCallback | None = None,
     ) -> None:
         self.config = config
         self.plugin_manager = plugin_manager or PluginManager()
+        self._skill_approver = skill_approver
         self._external_names = {record.name for record in self.plugin_manager.list_installed()}
         self._plugin_states: dict[tuple[str, str], PluginRuntimeStatus] = {
             ("external", record.name): PluginRuntimeStatus(
@@ -260,6 +272,11 @@ class HarnessRuntime:
             if self.mcp_gateway is not None
             else ()
         )
+        skill_entries = (
+            {entry.name: entry for entry in self.skills.entries()}
+            if self.skills is not None
+            else {}
+        )
         return RuntimeSnapshot(
             ready=self._ready,
             plugins=tuple(
@@ -297,6 +314,10 @@ class HarnessRuntime:
                         preload=name in self.config.skill_preload,
                         loaded=self.skills.is_loaded(name),
                         bytes=self.skills.loaded_bytes(name),
+                        access=skill_entries[name].access,
+                        priority=skill_entries[name].priority,
+                        listing=skill_entries[name].listing,
+                        usage=self.skills.usage(name),
                         error=self.skills.error(name),
                     )
                     for name in self.skills.available()
@@ -748,11 +769,19 @@ class HarnessRuntime:
             max_content_bytes=self.config.skill_max_content_bytes,
             max_resource_bytes=self.config.skill_max_resource_bytes,
             max_resource_total_bytes=self.config.skill_max_resource_total_bytes,
+            max_listing_bytes=self.config.skill_max_listing_bytes,
+            policy=SkillPermissionPolicy(
+                global_rules=self.config.skill_permissions,
+                agent_rules=self.config.skill_agent_permissions,
+                agent=self.config.skill_agent,
+            ),
+            name_only=self.config.skill_name_only,
         )
         self.tools.register(
             UseSkill(
                 self.skills,
                 events=self._require_events().publisher(EventIdentity.host("skill-gateway")),
+                approver=self._skill_approver,
             )
         )
         if self.memory is None:
@@ -807,6 +836,9 @@ class HarnessRuntime:
         preloads: list[tuple[str, str]] = []
         total_bytes = 0
         for name in self.config.skill_preload:
+            decision = self.skills.permission(name)
+            if decision.access != "allow":
+                raise RuntimeStartupError(f"Skill 预加载被权限策略拒绝: {name} ({decision.access})")
             try:
                 content = self.skills.get(name)
             except ValueError as exc:
@@ -833,9 +865,14 @@ class HarnessRuntime:
                 )
             )
 
+        try:
+            skill_listing = self.skills.listing()
+        except ValueError as exc:
+            raise RuntimeStartupError(f"Skill listing budget failed: {exc}") from exc
+
         self.system_prompt = build_system_prompt(
             mcp=[(spec.manifest.name, spec.manifest.description) for spec in self._assembly.mcp],
-            skills=self.skills.catalog(),
+            skills=skill_listing,
             preloads=preloads,
         )
 

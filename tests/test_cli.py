@@ -17,6 +17,7 @@ def _write_package(root: Path) -> Path:
                     {
                         "id": "lint",
                         "kind": "skill",
+                        "contract": "skill.v1",
                         "entry": {"content": "SKILL.md"},
                     }
                 ],
@@ -42,6 +43,24 @@ def _write_mcp_builtin(root: Path) -> None:
         encoding="utf-8",
     )
     (package / "server.py").write_text("# placeholder\n", encoding="utf-8")
+
+
+def _write_skill_builtin(root: Path, *, description: str = "code review") -> None:
+    package = root / "skills" / "review"
+    package.mkdir(parents=True)
+    (package / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "review",
+                "type": "skill",
+                "contract": "skill.v1",
+                "description": description,
+                "entry": {"content": "SKILL.md"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (package / "SKILL.md").write_text("# review\n", encoding="utf-8")
 
 
 def test_cli_install_enable_and_list(tmp_path, capsys) -> None:
@@ -97,3 +116,56 @@ def test_cli_manages_mcp_preload_config(tmp_path, capsys) -> None:
 
     assert main([*common, "mcp", "preload", "add", "missing"]) == 1
     assert "unknown or disabled MCP plugin" in capsys.readouterr().err
+
+
+def test_cli_lists_shows_and_searches_skills(tmp_path, capsys) -> None:
+    builtins = tmp_path / "builtins"
+    _write_skill_builtin(builtins)
+    config = tmp_path / "config.json"
+    common = [
+        "--config",
+        str(config),
+        "--registry",
+        str(tmp_path / "data" / "plugin-registry.json"),
+        "--store-dir",
+        str(tmp_path / "data" / "plugin-store"),
+        "--plugin-dir",
+        str(builtins),
+    ]
+
+    assert main([*common, "skill", "list"]) == 0
+    assert "review" in capsys.readouterr().out
+
+    assert main([*common, "skill", "show", "review"]) == 0
+    assert "# review" in capsys.readouterr().out
+
+    assert main([*common, "skill", "search", "code"]) == 0
+    assert "review" in capsys.readouterr().out
+
+
+def test_cli_skill_ask_requires_manual_approval(tmp_path, capsys) -> None:
+    builtins = tmp_path / "builtins"
+    _write_skill_builtin(builtins)
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "config.json").write_text("{}", encoding="utf-8")
+    (config_dir / "skill.json").write_text(
+        json.dumps({"permissions": {"review": "ask"}}),
+        encoding="utf-8",
+    )
+    common = [
+        "--config",
+        str(config_dir),
+        "--registry",
+        str(tmp_path / "data" / "plugin-registry.json"),
+        "--store-dir",
+        str(tmp_path / "data" / "plugin-store"),
+        "--plugin-dir",
+        str(builtins),
+    ]
+
+    assert main([*common, "skill", "show", "review"]) == 1
+    assert "requires --approve" in capsys.readouterr().err
+
+    assert main([*common, "skill", "show", "review", "--approve"]) == 0
+    assert "# review" in capsys.readouterr().out

@@ -18,7 +18,10 @@
     },
     "protocolVersion": {
       "type": "integer",
-      "const": 1
+      "enum": [
+        1,
+        2
+      ]
     },
     "capabilityKinds": {
       "type": "string",
@@ -143,6 +146,61 @@
           "items": {
             "$ref": "#/$defs/skillResource"
           }
+        },
+        "when_to_use": {
+          "type": "string"
+        },
+        "whenToUse": {
+          "type": "string"
+        },
+        "tags": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          ]
+        },
+        "compatibility": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          }
+        },
+        "listing": {
+          "type": "string",
+          "enum": [
+            "full",
+            "name-only"
+          ]
+        },
+        "name_only": {
+          "type": "boolean"
+        },
+        "nameOnly": {
+          "type": "boolean"
+        },
+        "import_frontmatter": {
+          "type": "boolean"
+        },
+        "importFrontmatter": {
+          "type": "boolean"
         }
       }
     },
@@ -220,6 +278,27 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "type": {
+                  "const": "skill"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "protocolVersion": {
+                "const": 1
+              }
+            }
+          }
         }
       ]
     },
@@ -239,7 +318,7 @@
           "const": "1"
         },
         "protocolVersion": {
-          "$ref": "#/$defs/protocolVersion"
+          "const": 1
         },
         "name": {
           "$ref": "#/$defs/name"
@@ -281,6 +360,12 @@
               },
               "entry": {
                 "type": "object"
+              },
+              "description": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "integer"
               },
               "model": {
                 "$ref": "#/$defs/modelMetadata"

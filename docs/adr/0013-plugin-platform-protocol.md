@@ -41,16 +41,19 @@
 `apiVersion` 表示 manifest schema 版本；`version` 表示插件自身版本；
 `protocolVersion` 表示宿主与插件之间的执行协议版本。三者不能混用。
 
-加载器仍会把旧清单缺失的 `protocolVersion` / `contract` 规范化为 v1 默认值，
-作为迁移兼容层；新插件和新功能包不应依赖这个兼容行为，JSON Schema 已将
-`apiVersion`、`protocolVersion` 和 `contract` 标记为必填。
+加载器会把缺失的 `protocolVersion` 规范化为该 kind 的首选版本，作为迁移兼容层。
+`contract` 仍可推导，但 `KindHandler.explicit_contract=True` 的 kind（当前是
+Skill）必须显式声明，避免高信任能力依赖隐式契约。
 
 ### 2. Capability Contract 由 kind 注册表验证
 
-每个受信任的 `KindHandler` 声明它支持的 `protocol_version`。
+每个受信任的 `KindHandler` 声明首选 `protocol_version`，并可通过
+`protocol_versions` 声明一个受支持的版本集合。宿主只接受清单中显式声明或
+按首选版本推导出的、该 kind 已支持的版本。
 装载器根据 `type + protocolVersion` 得到规范契约名，例如 `hook.v1`、`tool.v1`。
 
-如果清单显式写了 `contract`，必须与宿主计算结果一致。
+如果清单显式写了 `contract`，必须与宿主计算结果一致；要求显式契约的 kind
+缺失该字段时会在 discovery 阶段失败。
 `KindHandler.load()` 继续负责产物类型校验，例如：
 
 - `hook` 必须返回 `LifecycleHooks`
@@ -87,15 +90,16 @@ discover
 
 ### 4. Versioned Protocol 在装载前协商
 
-宿主当前支持：
+宿主内置插件当前使用：
 
 ```text
 manifest apiVersion: "1"
 plugin protocolVersion: 1
 ```
 
-发现阶段会拒绝未知 `apiVersion`、未知 `protocolVersion` 和契约不匹配，
-而不是等到插件函数执行后才失败。
+发现阶段会拒绝未知 `apiVersion`、kind 不支持的 `protocolVersion` 和契约不匹配，
+而不是等到插件函数执行后才失败。多版本协商采用“清单声明精确版本、宿主按 kind
+校验支持集合”的模型；清单省略版本时使用该 kind 的首选版本，不做隐式降级。
 
 未来新增协议版本时，应同时提供迁移策略：
 

@@ -4,5 +4,14 @@
   "maxPreloadBytes": 524288,
   "maxResources": 32,
   "maxResourceBytes": 262144,
-  "maxResourceTotalBytes": 1048576
+  "maxResourceTotalBytes": 1048576,
+  "maxDescriptionBytes": 512,
+  "maxResourceDescriptionBytes": 256,
+  "maxListingBytes": 8192,
+  "agent": "default",
+  "permissions": {
+    "*": "allow"
+  },
+  "agents": {},
+  "nameOnly": []
 }

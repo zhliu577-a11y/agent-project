@@ -20,6 +20,7 @@ def _write_package(root: Path, name: str = "quality", version: str = "1.0.0") ->
                     {
                         "id": "lint",
                         "kind": "skill",
+                        "contract": "skill.v1",
                         "entry": {"content": "SKILL.md"},
                     }
                 ],

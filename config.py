@@ -32,6 +32,11 @@ DEFAULT_SKILL_MAX_PRELOAD_BYTES = 512 * 1024
 DEFAULT_SKILL_MAX_RESOURCES = 32
 DEFAULT_SKILL_MAX_RESOURCE_BYTES = 256 * 1024
 DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES = 1024 * 1024
+DEFAULT_SKILL_MAX_DESCRIPTION_BYTES = 512
+DEFAULT_SKILL_MAX_RESOURCE_DESCRIPTION_BYTES = 256
+DEFAULT_SKILL_MAX_LISTING_BYTES = 8192
+_SKILL_PERMISSIONS = frozenset({"allow", "ask", "deny"})
+_SKILL_AGENT_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _SECTION_FILES = {
     "event": "event.json",
     "event_transport": "event_transport.json",
@@ -76,6 +81,13 @@ class AppConfig:
     skill_max_resources: int = DEFAULT_SKILL_MAX_RESOURCES
     skill_max_resource_bytes: int = DEFAULT_SKILL_MAX_RESOURCE_BYTES
     skill_max_resource_total_bytes: int = DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES
+    skill_max_description_bytes: int = DEFAULT_SKILL_MAX_DESCRIPTION_BYTES
+    skill_max_resource_description_bytes: int = DEFAULT_SKILL_MAX_RESOURCE_DESCRIPTION_BYTES
+    skill_max_listing_bytes: int = DEFAULT_SKILL_MAX_LISTING_BYTES
+    skill_agent: str = "default"
+    skill_permissions: tuple[tuple[str, str], ...] = ()
+    skill_agent_permissions: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = ()
+    skill_name_only: tuple[str, ...] = ()
     config_dir: Path | None = None
 
     @classmethod
@@ -240,6 +252,43 @@ class AppConfig:
                 os.getenv("SKILL_MAX_RESOURCE_TOTAL_BYTES"),
                 "skill.maxResourceTotalBytes",
             ),
+            skill_max_description_bytes=_load_positive_int(
+                skill.get(
+                    "maxDescriptionBytes",
+                    DEFAULT_SKILL_MAX_DESCRIPTION_BYTES,
+                ),
+                os.getenv("SKILL_MAX_DESCRIPTION_BYTES"),
+                "skill.maxDescriptionBytes",
+            ),
+            skill_max_resource_description_bytes=_load_positive_int(
+                skill.get(
+                    "maxResourceDescriptionBytes",
+                    DEFAULT_SKILL_MAX_RESOURCE_DESCRIPTION_BYTES,
+                ),
+                os.getenv("SKILL_MAX_RESOURCE_DESCRIPTION_BYTES"),
+                "skill.maxResourceDescriptionBytes",
+            ),
+            skill_max_listing_bytes=_load_positive_int(
+                skill.get("maxListingBytes", DEFAULT_SKILL_MAX_LISTING_BYTES),
+                os.getenv("SKILL_MAX_LISTING_BYTES"),
+                "skill.maxListingBytes",
+            ),
+            skill_agent=os.getenv(
+                "SKILL_AGENT",
+                _expect_str(skill.get("agent", "default"), "skill.agent"),
+            ),
+            skill_permissions=_load_skill_permissions(
+                skill.get("permissions", {}),
+                "skill.permissions",
+            ),
+            skill_agent_permissions=_load_skill_agent_permissions(
+                skill.get("agents", {}),
+            ),
+            skill_name_only=_load_skill_name_patterns(
+                skill.get("nameOnly", []),
+                os.getenv("SKILL_NAME_ONLY"),
+                "skill.nameOnly",
+            ),
             config_dir=config_path.parent.resolve(),
         )
 
@@ -398,6 +447,84 @@ def _load_skill_preload(configured: Any, env_value: str | None) -> tuple[str, ..
             raise ValueError(f"{key}: duplicate skill plugin name: {name}")
         names.append(name)
     return tuple(names)
+
+
+def _load_skill_permissions(
+    configured: Any,
+    where: str,
+) -> tuple[tuple[str, str], ...]:
+    """Load pattern -> allow/ask/deny rules without executing plugin code."""
+    if not isinstance(configured, dict):
+        raise ValueError(f"config: '{where}' must be an object")
+
+    rules: list[tuple[str, str]] = []
+    for raw_pattern, raw_access in configured.items():
+        if not isinstance(raw_pattern, str) or not raw_pattern.strip():
+            raise ValueError(f"config: '{where}' keys must be non-empty strings")
+        pattern = raw_pattern.strip()
+        if not pattern.isprintable():
+            raise ValueError(f"config: '{where}.{pattern}' must be printable text")
+        if not isinstance(raw_access, str) or raw_access not in _SKILL_PERMISSIONS:
+            raise ValueError(
+                f"config: '{where}.{pattern}' must be one of {sorted(_SKILL_PERMISSIONS)}"
+            )
+        rules.append((pattern, raw_access))
+    return tuple(rules)
+
+
+def _load_skill_agent_permissions(
+    configured: Any,
+) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    if not isinstance(configured, dict):
+        raise ValueError("config: 'skill.agents' must be an object")
+
+    agents: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+    for raw_agent, raw_value in configured.items():
+        if not isinstance(raw_agent, str) or not _SKILL_AGENT_RE.fullmatch(raw_agent):
+            raise ValueError(f"config: 'skill.agents' has invalid agent name: {raw_agent!r}")
+        if not isinstance(raw_value, dict):
+            raise ValueError(f"config: 'skill.agents.{raw_agent}' must be an object")
+        permissions = raw_value.get("permissions")
+        if permissions is None and raw_value:
+            raise ValueError(
+                f"config: 'skill.agents.{raw_agent}' must contain a 'permissions' object"
+            )
+        agents.append(
+            (
+                raw_agent,
+                _load_skill_permissions(
+                    permissions if permissions is not None else {},
+                    f"skill.agents.{raw_agent}.permissions",
+                ),
+            )
+        )
+    return tuple(agents)
+
+
+def _load_skill_name_patterns(
+    configured: Any,
+    env_value: str | None,
+    where: str,
+) -> tuple[str, ...]:
+    if env_value is not None:
+        raw_patterns = [] if not env_value.strip() else env_value.split(",")
+    else:
+        if not isinstance(configured, list):
+            raise ValueError(f"config: '{where}' must be a string array")
+        raw_patterns = configured
+
+    patterns: list[str] = []
+    for index, value in enumerate(raw_patterns, start=1):
+        key = f"{where}[{index}]" if env_value is None else "SKILL_NAME_ONLY"
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"config: '{key}' must be a non-empty string")
+        pattern = value.strip()
+        if not pattern.isprintable():
+            raise ValueError(f"config: '{key}' must be printable text")
+        if pattern in patterns:
+            raise ValueError(f"config: '{key}' duplicate pattern: {pattern}")
+        patterns.append(pattern)
+    return tuple(patterns)
 
 
 def _load_positive_int(configured: Any, env_value: str | None, key: str) -> int:
