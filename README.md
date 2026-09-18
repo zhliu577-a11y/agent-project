@@ -15,3 +15,35 @@ agent-project/
 cd harness
 ..\.venv\Scripts\python.exe -m pytest -q
 ```
+
+启动后端 HTTP API：
+
+```powershell
+cd harness
+..\.venv\Scripts\python.exe -m api
+```
+
+默认监听 `http://127.0.0.1:8000`，接口文档位于
+`http://127.0.0.1:8000/docs`。
+
+启动前端控制台：
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+默认访问 `http://127.0.0.1:5173`。前端开发服务器会把 `/api` 代理到
+`http://127.0.0.1:8000`。
+
+前端校验命令：
+
+```powershell
+cd frontend
+npm run typecheck
+npm run build
+npm run verify:ui
+```
+
+`verify:ui` 需要后端和 Vite 开发服务器保持运行。

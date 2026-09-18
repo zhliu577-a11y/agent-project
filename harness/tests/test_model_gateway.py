@@ -180,6 +180,37 @@ async def test_explicit_use_overrides_role() -> None:
     assert gateway.active_model == "default"
 
 
+async def test_failed_explicit_switch_keeps_previous_model() -> None:
+    trace: list[str] = []
+
+    class FailingSetupAdapter(FakeAdapter):
+        async def setup(self, context) -> None:
+            self.trace.append(f"setup:{self.name}")
+            raise RuntimeError("setup failed")
+
+    failing = ModelPlugin(
+        manifest=_manifest("failing"),
+        factory=lambda _directory: FailingSetupAdapter("failing", trace),
+        context=PluginContext.create(
+            name="failing",
+            kind="model",
+            directory=Path("."),
+        ),
+    )
+    gateway = ModelGateway(
+        [_provider("working", trace), failing],
+        default_model="working",
+    )
+
+    await gateway.use("working")
+    with pytest.raises(ModelError, match="initialization failed"):
+        await gateway.use("failing")
+
+    assert gateway.active_model == "working"
+    assert gateway.status()["working"] == "active"
+    assert gateway.status()["failing"] == "error"
+
+
 async def test_gateway_rejects_router_result_with_unknown_provider() -> None:
     class BrokenRouter(ModelRouter):
         def route(self, request):

@@ -19,6 +19,7 @@
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,8 @@ DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES = 1024 * 1024
 DEFAULT_SKILL_MAX_DESCRIPTION_BYTES = 512
 DEFAULT_SKILL_MAX_RESOURCE_DESCRIPTION_BYTES = 256
 DEFAULT_SKILL_MAX_LISTING_BYTES = 8192
+MODEL_CONFIG_OVERLAY_FILE = "model-configs.json"
+MCP_CONFIG_OVERLAY_FILE = "mcp-config.json"
 _SKILL_PERMISSIONS = frozenset({"allow", "ask", "deny"})
 _SKILL_AGENT_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _SECTION_FILES = {
@@ -135,6 +138,15 @@ class AppConfig:
                 "config: 'memory.index' is deprecated; "
                 "select either memory.index or memory.retriever, not both"
             )
+
+        mcp_preload = _load_mcp_preload(
+            mcp.get("preload", []),
+            os.getenv("MCP_PRELOAD"),
+        )
+        local_mcp_preload = load_local_mcp_preload(config_path.parent)
+        if local_mcp_preload is not None:
+            # A page-level host choice is authoritative over tracked files and env defaults.
+            mcp_preload = local_mcp_preload
 
         return cls(
             event_transport=os.getenv(
@@ -248,7 +260,7 @@ class AppConfig:
                 "CONTEXT_STRATEGY",
                 _expect_str(context.get("strategy", "tail-window"), "context.strategy"),
             ),
-            mcp_preload=_load_mcp_preload(mcp.get("preload", []), os.getenv("MCP_PRELOAD")),
+            mcp_preload=mcp_preload,
             skill_preload=_load_skill_preload(
                 skill.get("preload", []),
                 os.getenv("SKILL_PRELOAD"),
@@ -361,15 +373,118 @@ def load_plugin_config(config_dir: str | Path, kind: str, name: str) -> dict[str
     path = plugin_dir / f"{name}.json"
     if not path.is_file() and "--" in name:
         path = plugin_dir / f"{name.split('--', 1)[0]}.json"
+    plugin_config: dict[str, Any] = {}
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{path}: invalid JSON plugin config: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ValueError(f"{path}: plugin config root must be a JSON object")
+        plugin_config.update(raw)
+
+    if kind == "model":
+        plugin_config.update(load_model_config_overlay(config_dir, name))
+    return plugin_config
+
+
+def load_model_config_overlay(config_dir: str | Path, name: str) -> dict[str, Any]:
+    """Load one non-versioned model settings overlay from the local data dir."""
+    if not _PLUGIN_NAME_RE.fullmatch(name):
+        raise ValueError(f"invalid model plugin name: {name!r}")
+    path = _model_config_overlay_path(config_dir)
     if not path.exists():
         return {}
+    raw = AppConfig._read_json(path)
+    value = raw.get(name, {})
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: model '{name}' config must be an object")
+    return dict(value)
+
+
+def save_model_config_overlay(
+    config_dir: str | Path,
+    name: str,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    """Atomically persist one local model config without changing tracked files."""
+    if not _PLUGIN_NAME_RE.fullmatch(name):
+        raise ValueError(f"invalid model plugin name: {name!r}")
+    if not isinstance(values, dict):
+        raise ValueError("model config overlay values must be an object")
+
+    path = _model_config_overlay_path(config_dir)
+    payload: dict[str, Any] = {}
+    if path.exists():
+        raw = AppConfig._read_json(path)
+        for key, value in raw.items():
+            if not isinstance(value, dict):
+                raise ValueError(f"{path}: model '{key}' config must be an object")
+            payload[str(key)] = dict(value)
+
+    if values:
+        payload[name] = dict(values)
+    else:
+        payload.pop(name, None)
+
+    _write_json_atomic(path, payload)
+    return dict(values)
+
+
+def _model_config_overlay_path(config_dir: str | Path) -> Path:
+    return _local_config_path(config_dir, MODEL_CONFIG_OVERLAY_FILE)
+
+
+def load_local_mcp_preload(config_dir: str | Path) -> tuple[str, ...] | None:
+    """Load the page-owned MCP startup list, or None when no override exists."""
+    path = _local_config_path(config_dir, MCP_CONFIG_OVERLAY_FILE)
+    if not path.exists():
+        return None
+    raw = AppConfig._read_json(path)
+    return _load_mcp_preload(raw.get("preload", []), None)
+
+
+def save_local_mcp_preload(
+    config_dir: str | Path,
+    names: list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    """Persist the page-owned MCP startup list in the local data directory."""
+    preload = _load_mcp_preload(list(names), None)
+    path = _local_config_path(config_dir, MCP_CONFIG_OVERLAY_FILE)
+    _write_json_atomic(path, {"preload": list(preload)})
+    return preload
+
+
+def clear_local_mcp_preload(config_dir: str | Path) -> None:
+    """Remove the page-owned MCP startup override."""
+    _local_config_path(config_dir, MCP_CONFIG_OVERLAY_FILE).unlink(missing_ok=True)
+
+
+def _local_config_path(config_dir: str | Path, filename: str) -> Path:
+    return Path(config_dir).resolve().parent / "data" / filename
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{path}: invalid JSON plugin config: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise ValueError(f"{path}: plugin config root must be a JSON object")
-    return raw
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            temporary_path.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _merge_section_files(config_dir: Path, base: dict[str, Any]) -> dict[str, Any]:

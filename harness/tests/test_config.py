@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from config import DEFAULT_CONFIG_PATH, AppConfig
+from config import (
+    DEFAULT_CONFIG_PATH,
+    AppConfig,
+    clear_local_mcp_preload,
+    load_local_mcp_preload,
+    save_local_mcp_preload,
+    save_model_config_overlay,
+)
 
 _CONFIG_KEYS = (
     "EVENT_TRANSPORT",
@@ -251,6 +258,52 @@ def test_plugin_config_is_loaded_by_kind_and_name(tmp_path) -> None:
     assert config.plugin_config("skill", "quality--lint") == {"feature": "on"}
     with pytest.raises(ValueError, match="invalid plugin config kind"):
         config.plugin_config("../hook", "permission")
+
+
+def test_local_model_config_overrides_tracked_plugin_config(tmp_path) -> None:
+    config_dir = tmp_path / "config"
+    _write(config_dir / "config.json", {})
+    _write(
+        config_dir / "plugins" / "model" / "deepseek.json",
+        {"baseUrl": "https://tracked.example", "model": "tracked-model"},
+    )
+    save_model_config_overlay(
+        config_dir,
+        "deepseek",
+        {
+            "apiKey": "local-secret",
+            "baseUrl": "http://127.0.0.1:9000/v1",
+            "model": "local-model",
+        },
+    )
+
+    config = AppConfig.load(config_dir)
+
+    assert config.plugin_config("model", "deepseek") == {
+        "baseUrl": "http://127.0.0.1:9000/v1",
+        "model": "local-model",
+        "apiKey": "local-secret",
+    }
+    assert (tmp_path / "data" / "model-configs.json").is_file()
+
+
+def test_local_mcp_preload_overrides_tracked_config_and_env(tmp_path, monkeypatch) -> None:
+    config_dir = tmp_path / "config"
+    _write(config_dir / "config.json", {})
+    _write(config_dir / "mcp.json", {"preload": ["time"]})
+    monkeypatch.setenv("MCP_PRELOAD", "math")
+
+    assert load_local_mcp_preload(config_dir) is None
+    assert AppConfig.load(config_dir).mcp_preload == ("math",)
+
+    saved = save_local_mcp_preload(config_dir, ["filesystem", "time"])
+    assert saved == ("filesystem", "time")
+    assert load_local_mcp_preload(config_dir) == ("filesystem", "time")
+    assert AppConfig.load(config_dir).mcp_preload == ("filesystem", "time")
+
+    clear_local_mcp_preload(config_dir)
+    assert load_local_mcp_preload(config_dir) is None
+    assert AppConfig.load(config_dir).mcp_preload == ("math",)
 
 
 def test_memory_retriever_config_and_legacy_index_compatibility(tmp_path, monkeypatch) -> None:

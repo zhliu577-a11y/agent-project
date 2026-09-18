@@ -50,6 +50,9 @@
   与关闭状态会回写到 registry，CLI 和未来网页只依赖这一运行时边界
 - **CLI**：`python cli.py plugin ...` 提供 validate / install / enable / disable /
   remove / list；后续网页前端复用同一套 `PluginManager`
+- **HTTP API**：`python -m api` 启动 FastAPI，提供插件包检查、安装、启停、
+  Runtime 状态、会话对话、SSE 事件流和 Skill/Tool 审批接口；前端通过 OpenAPI
+  生成客户端
 - **MCP 预加载**：宿主通过 `mcp.preload` 或 `MCP_PRELOAD` 选择启动即挂载的
   MCP；其余 MCP 仍由模型通过 `use_plugin` 按需挂载
 - 权限钩子插件示例：`allow / ask / deny` 策略随插件文件夹走，支持通配符
@@ -103,6 +106,15 @@ pip install -r requirements.txt
 
 启动日志会列出已发现的插件；对话里让模型“查询当前时间”，它会先 `use_plugin`
 挂载 time，再调用 `time__get_current_time`。
+
+启动 HTTP API：
+
+```powershell
+.venv\Scripts\python.exe -m api
+```
+
+默认地址为 `http://127.0.0.1:8000`，OpenAPI 文档位于
+`http://127.0.0.1:8000/docs`，前端联调契约见 `docs/api.md`。
 
 ## 插件目录（如何加插件）
 
@@ -451,6 +463,11 @@ await runtime.models.prewarm("openai")  # 只初始化，不切换
 await runtime.models.unload("openai")  # 等待在途请求结束后释放
 runtime.models.status()  # idle / loading / active / error / stopped
 ```
+
+前端模型页支持直接填写 `apiKey`、`baseUrl`、模型名、超时和重试次数。
+保存结果写入本机 `data/model-configs.json` 覆盖层，不修改受版本管理的示例
+配置；API 只返回 `hasApiKey`，不会回显密钥。修改后 Runtime 会重新装配并
+激活目标模型。
 
 默认模型与 `keepWarm` 中的 provider 会在 Runtime 启动时预热；其它 provider
 保持惰性创建。一次请求结束后 provider 默认继续保留，避免每轮重复建连；

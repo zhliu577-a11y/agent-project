@@ -76,6 +76,7 @@ class PluginRuntimeStatus:
 class McpRuntimeStatus:
     name: str
     status: str
+    preload: bool
 
 
 @dataclass(frozen=True)
@@ -270,14 +271,16 @@ class HarnessRuntime:
         tool_names = tuple(
             sorted(schema["function"]["name"] for schema in self.tools.list_schemas())
         )
-        mcp = (
-            tuple(
-                McpRuntimeStatus(name=name, status=status)
+        mcp = ()
+        if self.mcp_gateway is not None:
+            mcp = tuple(
+                McpRuntimeStatus(
+                    name=name,
+                    status=status,
+                    preload=name in self.config.mcp_preload,
+                )
                 for name, status in sorted(self.mcp_gateway.status().items())
             )
-            if self.mcp_gateway is not None
-            else ()
-        )
         skill_entries = (
             {entry.name: entry for entry in self.skills.entries()}
             if self.skills is not None

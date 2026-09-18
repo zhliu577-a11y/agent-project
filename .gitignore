@@ -1,7 +1,16 @@
 .venv/
+frontend/node_modules/
+frontend/dist/
+frontend/artifacts/
+frontend/desktop.png
+frontend/mobile.png
+frontend/.vite-smoke.*.log
+frontend/*.tsbuildinfo
 __pycache__/
 *.pyc
 .pytest_cache/
+.test-tmp/
+pytest-cache-files-*/
 .ruff_cache/
 .vscode/
 .DS_Store
@@ -13,4 +22,10 @@ timeline.jsonl
 data/plugin-registry.json
 data/plugin-store/
 data/tool-metrics.json
+**/data/model-configs.json
+**/data/.model-configs.json.*.tmp
+**/data/mcp-config.json
+**/data/.mcp-config.json.*.tmp
+**/data/event-journal.jsonl
+**/data/.event-journal.jsonl.*.tmp
 .env
