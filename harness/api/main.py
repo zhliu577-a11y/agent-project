@@ -27,14 +27,17 @@ from api.services import (
     ConversationBusyError,
     InvalidMcpPreloadError,
     InvalidModelSettingsError,
+    InvalidSessionError,
     McpConfigurationError,
     ModelActivationError,
     ModelConfigurationError,
     PromptRejectedError,
     RuntimeController,
     RuntimeNotReadyError,
+    SessionNotFoundError,
     UnknownModelError,
 )
+from core.types import message_to_dict
 from plugins.loader import PackageInspection
 from plugins.registry import PluginRecord
 
@@ -51,6 +54,11 @@ class HealthResponse(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=100_000)
     maxTurns: int = Field(default=20, ge=1, le=100)
+    sessionId: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class SessionCreateRequest(BaseModel):
+    title: str = Field(default="", max_length=200)
 
 
 class ChatResponse(BaseModel):
@@ -411,6 +419,67 @@ def _register_routes(app: FastAPI) -> None:
     async def skills_list(request: Request) -> dict[str, Any]:
         return {"skills": (_controller(request).snapshot() or {}).get("skills", [])}
 
+    @app.get("/api/v1/sessions")
+    async def sessions_list(request: Request) -> dict[str, Any]:
+        controller = _controller(request)
+        try:
+            return {"sessions": await controller.list_sessions()}
+        except RuntimeNotReadyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.post("/api/v1/sessions", status_code=status.HTTP_201_CREATED)
+    async def sessions_create(
+        request: Request,
+        body: SessionCreateRequest,
+    ) -> dict[str, Any]:
+        controller = _controller(request)
+        try:
+            return await controller.create_session(body.title)
+        except ConversationBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeNotReadyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.get("/api/v1/sessions/{session_id}")
+    async def sessions_get(request: Request, session_id: str) -> dict[str, Any]:
+        controller = _controller(request)
+        try:
+            snapshot = await controller.get_session(session_id)
+        except InvalidSessionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeNotReadyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {
+            "id": snapshot.session_id,
+            "title": snapshot.metadata.title,
+            "createdAt": snapshot.metadata.created_at,
+            "updatedAt": snapshot.metadata.updated_at,
+            "messageCount": snapshot.metadata.message_count,
+            "revision": snapshot.metadata.revision,
+            "active": False,
+            "messages": [message_to_dict(message) for message in snapshot.messages],
+        }
+
+    @app.delete("/api/v1/sessions/{session_id}")
+    async def sessions_delete(request: Request, session_id: str) -> dict[str, Any]:
+        controller = _controller(request)
+        try:
+            active_session_id = await controller.delete_session(session_id)
+        except InvalidSessionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConversationBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeNotReadyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {
+            "deleted": session_id,
+            "activeSessionId": active_session_id,
+        }
+
     @app.get("/api/v1/approvals")
     async def approvals_list(request: Request) -> dict[str, Any]:
         controller = _controller(request)
@@ -447,6 +516,8 @@ def _register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except PromptRejectedError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except InvalidSessionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeNotReadyError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return ChatResponse(**result.to_dict())
@@ -456,6 +527,12 @@ def _register_routes(app: FastAPI) -> None:
         controller = _controller(request)
         try:
             controller.ensure_ready()
+            if body.sessionId is not None:
+                await controller.activate_session(body.sessionId)
+        except InvalidSessionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ConversationBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RuntimeNotReadyError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -463,6 +540,7 @@ def _register_routes(app: FastAPI) -> None:
             async for item in controller.stream_turn(
                 body.message,
                 max_turns=body.maxTurns,
+                session_id=body.sessionId,
             ):
                 yield _sse(item["event"], item["data"])
 

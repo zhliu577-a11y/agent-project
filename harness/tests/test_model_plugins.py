@@ -102,12 +102,12 @@ async def test_sub2api_model_reads_config_and_closes_responses_client(monkeypatc
     model = create_sub2api(Path("."), context=context)
     await model.stop()
 
-    assert captured["client"] == {
-        "api_key": "config-key",
-        "base_url": "http://gateway.invalid/v1",
-        "timeout": 12.0,
-        "max_retries": 1,
-    }
+    client = captured["client"]
+    assert client["api_key"] == "config-key"
+    assert client["base_url"] == "http://gateway.invalid/v1"
+    assert client["timeout"] == 12.0
+    assert client["max_retries"] == 1
+    assert client["http_client"] is not None
     assert model._model == "deepseek-v4-flash"
     assert model._disable_response_storage is False
     assert captured["closed"] is True

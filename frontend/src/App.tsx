@@ -4,6 +4,7 @@ import { ApprovalDrawer } from "./components/ApprovalDrawer";
 import { AppShell } from "./components/AppShell";
 import { ToastRegion, type ToastItem } from "./components/ToastRegion";
 import type { ViewId } from "./api/types";
+import { useConversationWorkspace } from "./hooks/useConversationWorkspace";
 import { useHarness } from "./hooks/useHarness";
 import { ActivityView } from "./views/ActivityView";
 import { CapabilitiesView } from "./views/CapabilitiesView";
@@ -33,6 +34,11 @@ export function App() {
     },
     []
   );
+  const conversation = useConversationWorkspace({
+    runtime: harness.runtime,
+    onRefresh: harness.refresh,
+    onNotify: notify
+  });
 
   const changeView = useCallback((next: ViewId) => {
     setView(next);
@@ -79,8 +85,21 @@ export function App() {
           <ChatView
             runtime={harness.runtime}
             approvals={harness.approvals}
-            onRefresh={harness.refresh}
-            onNotify={notify}
+            sessions={conversation.sessions}
+            activeSessionId={conversation.activeSessionId}
+            messages={conversation.messages}
+            input={conversation.input}
+            streaming={conversation.streaming}
+            sessionsLoading={conversation.sessionsLoading}
+            historyLoading={conversation.historyLoading}
+            activities={conversation.activities}
+            approvalHint={conversation.approvalHint}
+            onInputChange={conversation.setInput}
+            onSubmit={conversation.submit}
+            onStop={conversation.stop}
+            onCreateSession={conversation.createNewSession}
+            onSelectSession={conversation.selectSession}
+            onDeleteSession={conversation.removeSession}
           />
         ) : null}
         {view === "capabilities" ? (

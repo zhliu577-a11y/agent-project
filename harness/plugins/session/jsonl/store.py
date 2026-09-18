@@ -213,6 +213,41 @@ class JsonlSessionStore(SessionStore):
             with _exclusive_file_lock(self._lock_path(session_id)):
                 self._write_metadata_unlocked(session_id, metadata)
 
+    async def list_sessions(self) -> list[tuple[str, SessionMetadata]]:
+        if not self._data_dir.is_dir():
+            return []
+
+        session_ids: set[str] = set()
+        for path in self._data_dir.glob("*.metadata.json"):
+            session_ids.add(path.name[: -len(".metadata.json")])
+        for path in self._data_dir.glob("*.jsonl"):
+            session_ids.add(path.name[: -len(".jsonl")])
+
+        sessions: list[tuple[str, SessionMetadata]] = []
+        for session_id in sorted(session_ids):
+            try:
+                session_id = self._session_id(session_id)
+            except ValueError:
+                continue
+            async with self._lock(session_id):
+                with _exclusive_file_lock(self._lock_path(session_id)):
+                    metadata, _messages = self._read_metadata_unlocked(session_id)
+            sessions.append((session_id, metadata))
+        sessions.sort(
+            key=lambda item: (item[1].updated_at, item[0]),
+            reverse=True,
+        )
+        return sessions
+
+    async def delete(self, session_id: str) -> None:
+        session_id = self._session_id(session_id)
+        async with self._lock(session_id):
+            with _exclusive_file_lock(self._lock_path(session_id)):
+                self._path(session_id).unlink(missing_ok=True)
+                self._metadata_path(session_id).unlink(missing_ok=True)
+                self._checkpoint_path(session_id).unlink(missing_ok=True)
+        self._lock_path(session_id).unlink(missing_ok=True)
+
     async def snapshot(
         self,
         session_id: str,

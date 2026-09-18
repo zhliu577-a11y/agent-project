@@ -5,16 +5,13 @@
   "version": "1.0.0",
   "protocolVersion": 1,
   "contract": "mcp.v1",
-  "description": "读写本地文件（含写入、编辑、移动等危险操作，由 permission 钩子插件拦截确认）",
+  "description": "读写项目沙箱内的文件（写入和移动由 permission 钩子插件拦截确认）",
   "enabled": true,
   "entry": {
-    "command": "cmd.exe",
+    "command": "python",
     "args": [
-      "/c",
-      "npx",
-      "-y",
-      "@modelcontextprotocol/server-filesystem",
-      "E:/documents/learning/Agent/demo_files"
+      "server.py",
+      "../../../data/workspace"
     ]
   }
 }

@@ -75,6 +75,15 @@ try {
     await page.getByRole("heading", { name: "Agent 对话" }).waitFor();
     await page.getByPlaceholder("输入消息").waitFor();
     await page.getByText("运行轨迹").waitFor();
+    const draft = "页面切换后仍需保留";
+    const chatInput = page.locator(".composer textarea");
+    await chatInput.fill(draft);
+    await clickVisibleButton(page, "活动");
+    await clickVisibleButton(page, "对话");
+    await chatInput.waitFor();
+    if ((await chatInput.inputValue()) !== draft) {
+      throw new Error(`${viewport.name}/chat: draft was lost after view switch`);
+    }
     await assertNoHorizontalOverflow(page, `${viewport.name}/chat`);
 
     await clickVisibleButton(page, "活动");

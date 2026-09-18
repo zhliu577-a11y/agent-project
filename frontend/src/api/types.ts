@@ -206,6 +206,32 @@ export interface ChatResult {
   error: Record<string, unknown> | null;
 }
 
+export interface SessionSummary {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+  revision: number;
+  active: boolean;
+}
+
+export interface SessionMessage {
+  id: string;
+  role: "system" | "user" | "assistant" | "tool";
+  content: string;
+  timestamp?: string;
+}
+
+export interface SessionDetail extends SessionSummary {
+  messages: SessionMessage[];
+}
+
+export interface SessionDeleteResult {
+  deleted: string;
+  activeSessionId: string;
+}
+
 export interface StreamCallbacks {
   onToken: (delta: string) => void;
   onRuntime: (event: RuntimeEvent) => void;

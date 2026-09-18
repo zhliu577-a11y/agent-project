@@ -120,6 +120,22 @@ class InMemorySessionStore(SessionStore):
         async with self._lock(session_id):
             self._metadata[session_id] = copy.deepcopy(metadata)
 
+    async def list_sessions(self) -> list[tuple[str, SessionMetadata]]:
+        session_ids = set(self._data) | set(self._metadata)
+        sessions = [
+            (session_id, copy.deepcopy(self._metadata.get(session_id, SessionMetadata())))
+            for session_id in session_ids
+        ]
+        sessions.sort(key=lambda item: (item[1].updated_at, item[0]), reverse=True)
+        return sessions
+
+    async def delete(self, session_id: str) -> None:
+        session_id = self._session_id(session_id)
+        async with self._lock(session_id):
+            self._data.pop(session_id, None)
+            self._metadata.pop(session_id, None)
+            self._checkpoints.pop(session_id, None)
+
     async def snapshot(
         self,
         session_id: str,

@@ -14,6 +14,9 @@ import type {
   PluginMutationResult,
   RuntimeEvent,
   RuntimeStatus,
+  SessionDeleteResult,
+  SessionDetail,
+  SessionSummary,
   StreamCallbacks
 } from "./types";
 
@@ -184,16 +187,47 @@ export async function resolveApproval(
   });
 }
 
+export async function getSessions(): Promise<SessionSummary[]> {
+  const payload = await request<{ sessions: SessionSummary[] }>("/sessions");
+  return payload.sessions;
+}
+
+export async function createSession(title = ""): Promise<SessionSummary> {
+  return request<SessionSummary>("/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title })
+  });
+}
+
+export async function getSession(sessionId: string): Promise<SessionDetail> {
+  return request<SessionDetail>(`/sessions/${encodeURIComponent(sessionId)}`);
+}
+
+export async function deleteSession(sessionId: string): Promise<SessionDeleteResult> {
+  return request<SessionDeleteResult>(`/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE"
+  });
+}
+
 export async function streamChat(
   message: string,
   callbacks: StreamCallbacks,
-  signal?: AbortSignal
+  options: {
+    sessionId?: string;
+    maxTurns?: number;
+    signal?: AbortSignal;
+  } = {}
 ): Promise<void> {
   const response = await fetch(`${API_BASE}/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, maxTurns: 20 }),
-    signal
+    body: JSON.stringify({
+      message,
+      maxTurns: options.maxTurns ?? 20,
+      sessionId: options.sessionId
+    }),
+    signal: options.signal
   });
   if (!response.ok) {
     throw await toApiError(response);

@@ -1,17 +1,22 @@
-# filesystem —— 外部 MCP 插件（第三方服务）
+# filesystem - 仓库内置 MCP 插件
 
-本插件不包含服务器代码，`plugin.json` 直接启动官方包：
+该插件通过 `server.py` 提供文件系统工具，不依赖 `npx`、npm 缓存、网络或系统
+`PATH` 中的 `python`。加载器会把 `"command": "python"` 替换为当前 Runtime
+使用的虚拟环境解释器。
 
-```text
-cmd.exe /c npx -y @modelcontextprotocol/server-filesystem <沙箱目录>
-```
+默认允许目录是 `harness/data/workspace`。也可以用
+`HARNESS_FILESYSTEM_ROOT` 覆盖，或在 `entry.args` 中传入一个或多个根目录。
 
-用途：读写本地文件。危险操作（write / edit / move / delete）由
-`plugins/hooks/permission` 的规则改成 `ask/deny`，工具名带命名空间
-（如 `filesystem__write_file`）。
+提供的工具：
 
-## 错误说明
+- `read_text_file`
+- `write_file`
+- `list_directory`
+- `create_directory`
+- `move_file`
+- `get_file_info`
+- `list_allowed_directories`
 
-第三方服务器不会输出本项目约定的 `[code] 错误文本` 前缀，因此这里**不声明
-`errors`**——它返回 `isError` 时，网关按通用 `ToolError` 处理并记录原始文本。
-如果你自己包装一层 MCP 服务器，可以采用约定前缀来获得 code/hint 支持。
+所有路径都会先解析并校验，任何 `..`、绝对路径或符号链接逃逸都会被拒绝。
+`write_file` / `move_file` 仍由 `plugins/hooks/permission` 执行 ask/deny
+权限确认，模型侧工具名为 `filesystem__<tool>`。

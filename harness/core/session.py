@@ -222,6 +222,18 @@ class SessionStore(ABC):
         """Persist revision metadata when a backend supports it."""
         return None
 
+    async def list_sessions(self) -> list[tuple[str, SessionMetadata]]:
+        """List known sessions without loading their message bodies.
+
+        Legacy stores may not support enumeration. The empty default keeps the
+        original v1 contract valid while richer backends can expose history.
+        """
+        return []
+
+    async def delete(self, session_id: str) -> None:
+        """Delete a session; compatibility stores clear it instead."""
+        await self.clear(session_id)
+
     async def snapshot(self, session_id: str, limit: int | None = None) -> SessionSnapshot:
         """Read messages, metadata, and checkpoint as one gateway-facing view."""
         messages = await self.get(session_id, limit=limit)

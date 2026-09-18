@@ -1353,16 +1353,116 @@ p {
   display: grid;
   height: calc(100vh - 130px);
   min-height: 620px;
-  grid-template-columns: minmax(0, 1fr) 310px;
+  grid-template-columns: 238px minmax(0, 1fr) 310px;
   gap: 16px;
 }
 
+.chat-sessions,
 .chat-main,
 .chat-inspector {
   min-height: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
+}
+
+.chat-sessions {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.chat-sessions__header {
+  display: flex;
+  min-height: 62px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 12px 11px 15px;
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-sessions__header h3 {
+  margin-top: 3px;
+  font-size: 13px;
+}
+
+.chat-sessions__list {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  align-content: start;
+  gap: 4px;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.chat-session {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
+  border-radius: 7px;
+}
+
+.chat-session:hover {
+  background: #f4f7f8;
+}
+
+.chat-session.is-active {
+  background: var(--accent-soft);
+}
+
+.chat-session__main,
+.chat-session__delete {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.chat-session__main {
+  min-width: 0;
+  padding: 9px 5px 9px 9px;
+  text-align: left;
+}
+
+.chat-session__main strong,
+.chat-session__main span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-session__main strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.chat-session__main span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.chat-session__delete {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--muted);
+}
+
+.chat-session__delete:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.chat-session__main:disabled,
+.chat-session__delete:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .chat-main {
@@ -2078,6 +2178,16 @@ p {
   .capability-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+
+  .chat-layout {
+    height: auto;
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  .chat-inspector {
+    max-height: 320px;
+    grid-column: 1 / -1;
+  }
 }
 
 @media (max-width: 960px) {
@@ -2134,11 +2244,16 @@ p {
     grid-template-columns: 1fr;
   }
 
+  .chat-sessions {
+    max-height: 230px;
+  }
+
   .chat-main {
     min-height: 620px;
   }
 
   .chat-inspector {
+    grid-column: auto;
     max-height: none;
   }
 

@@ -12,6 +12,7 @@ __pycache__/
 .test-tmp/
 pytest-cache-files-*/
 .ruff_cache/
+**/.runtime/
 .vscode/
 .DS_Store
 *.log
@@ -22,6 +23,8 @@ timeline.jsonl
 data/plugin-registry.json
 data/plugin-store/
 data/tool-metrics.json
+**/data/tool-metrics.json
+**/data/workspace/
 **/data/model-configs.json
 **/data/.model-configs.json.*.tmp
 **/data/mcp-config.json

@@ -34,8 +34,10 @@ from config import (
 from core.errors import ModelError
 from core.events import Event, EventIdentity, EventPublisher
 from core.hooks import PromptRequest
+from core.session import SessionMetadata, SessionSnapshot, validate_session_id
 from core.state import capture
 from core.types import Message, message_to_dict
+from gateways.session_gateway import SessionGateway
 from loop import run_agent
 from plugins.manager import PluginManager
 from runtime import HarnessRuntime, RuntimeStartupError
@@ -49,6 +51,14 @@ class RuntimeNotReadyError(RuntimeError):
 
 class ConversationBusyError(RuntimeError):
     """The single-session Runtime is already processing a turn."""
+
+
+class SessionNotFoundError(ValueError):
+    """The requested conversation session does not exist."""
+
+
+class InvalidSessionError(ValueError):
+    """The requested conversation session id is malformed."""
 
 
 class PromptRejectedError(RuntimeError):
@@ -359,7 +369,7 @@ class TurnResult:
 
 
 class ConversationService:
-    """Serialize turns and commit them through the existing SessionGateway."""
+    """Serialize turns and switch between persisted SessionGateway instances."""
 
     def __init__(
         self,
@@ -368,6 +378,13 @@ class ConversationService:
     ) -> None:
         self._runtime = runtime
         self._approvals = approvals
+        self._store = runtime.session_store
+        self._session = runtime.session
+        if self._store is None:
+            raise RuntimeNotReadyError("session store service is not initialized")
+        if self._session is None:
+            raise RuntimeNotReadyError("session gateway is not initialized")
+        self._session_id = self._session.session_id
         self._history = list(runtime.history)
         self._busy = False
 
@@ -378,6 +395,116 @@ class ConversationService:
     @property
     def history(self) -> tuple[Message, ...]:
         return tuple(self._history)
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
+    def session(self) -> SessionSnapshot:
+        return SessionSnapshot(
+            session_id=self._session_id,
+            messages=list(self._history),
+            metadata=self._session.metadata,
+            checkpoint=self._session.checkpoint,
+        )
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        """List sessions with active-state decoration for the console."""
+        sessions = await self._store.list_sessions()  # type: ignore[attr-defined]
+        return [
+            _session_summary(
+                session_id,
+                metadata,
+                active=session_id == self._session_id,
+            )
+            for session_id, metadata in sessions
+        ]
+
+    async def create_session(self, title: str = "") -> dict[str, Any]:
+        """Create and activate a new persisted session."""
+        if self._busy:
+            raise ConversationBusyError(
+                "cannot create a conversation while a turn is running"
+            )
+        session_id = _new_session_id()
+        metadata = SessionMetadata(title=_clean_session_title(title))
+        await self._store.save_metadata(session_id, metadata)  # type: ignore[attr-defined]
+        await self.activate_session(session_id)
+        return _session_summary(
+            session_id,
+            self._session.metadata,
+            active=True,
+        )
+
+    async def activate_session(self, session_id: str) -> SessionSnapshot:
+        """Switch the active conversation without rebuilding the Runtime."""
+        if self._busy:
+            raise ConversationBusyError(
+                "cannot switch conversations while a turn is running"
+            )
+        try:
+            normalized = validate_session_id(session_id)
+        except ValueError as exc:
+            raise InvalidSessionError(str(exc)) from exc
+        if normalized == self._session_id:
+            return self.session
+
+        gateway = self._create_gateway(normalized)
+        snapshot = await gateway.load_snapshot()
+        self._session = gateway
+        self._session_id = normalized
+        self._history = list(snapshot.messages)
+        self._runtime.session = gateway
+        self._runtime.history = list(snapshot.messages)
+        self._runtime.session_checkpoint = snapshot.checkpoint
+        return snapshot
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """Read one persisted session without changing the active session."""
+        try:
+            normalized = validate_session_id(session_id)
+        except ValueError as exc:
+            raise InvalidSessionError(str(exc)) from exc
+        known = {item[0] for item in await self._store.list_sessions()}  # type: ignore[attr-defined]
+        if normalized not in known:
+            raise SessionNotFoundError(f"session {normalized!r} was not found")
+        return await self._store.snapshot(normalized)  # type: ignore[attr-defined]
+
+    async def delete_session(self, session_id: str) -> str:
+        """Delete one session and return the active session after deletion."""
+        if self._busy:
+            raise ConversationBusyError(
+                "cannot delete a conversation while a turn is running"
+            )
+        try:
+            normalized = validate_session_id(session_id)
+        except ValueError as exc:
+            raise InvalidSessionError(str(exc)) from exc
+        known = {item[0] for item in await self._store.list_sessions()}  # type: ignore[attr-defined]
+        if normalized not in known:
+            raise SessionNotFoundError(f"session {normalized!r} was not found")
+
+        deleting_active = normalized == self._session_id
+        await self._store.delete(normalized)  # type: ignore[attr-defined]
+        if deleting_active:
+            created = await self.create_session()
+            return str(created["id"])
+        return self._session_id
+
+    def _create_gateway(self, session_id: str):
+        events = self._runtime.events
+        return SessionGateway(
+            self._store,  # type: ignore[arg-type]
+            session_id=session_id,
+            compaction=self._runtime.compaction_policy,
+            max_tokens=self._runtime.config.context_max_tokens,
+            events=(
+                events.publisher(EventIdentity.host("session-gateway"))
+                if events is not None
+                else None
+            ),
+        )
 
     async def activate_model(self, name: str) -> str:
         """Prewarm and activate one model while excluding conversation turns."""
@@ -407,6 +534,7 @@ class ConversationService:
         self,
         user_input: str,
         *,
+        session_id: str | None = None,
         max_turns: int = 20,
         on_token: Callable[[str], None] | None = None,
     ) -> TurnResult:
@@ -419,6 +547,8 @@ class ConversationService:
         if self._runtime.model is None:
             raise RuntimeNotReadyError("model is not initialized")
 
+        if session_id is not None:
+            await self.activate_session(session_id)
         self._busy = True
         try:
             return await self._submit_locked(
@@ -437,8 +567,8 @@ class ConversationService:
         on_token: Callable[[str], None] | None,
     ) -> TurnResult:
         runtime = self._runtime
-        session = runtime.session
-        session_id = session.session_id if session is not None else runtime.config.session_id
+        session = self._session
+        session_id = self._session_id
         events = runtime.events
         publisher = (
             events.publisher(EventIdentity.host("api-conversation")) if events is not None else None
@@ -490,6 +620,8 @@ class ConversationService:
         if session is not None:
             committed = await session.commit_turn(history, capture(ctx))
             history = list(committed.messages)
+            if not session.metadata.title:
+                await session.set_title(_session_title_from_prompt(user_input))
             if runtime.memory_extraction is not None:
                 await runtime.memory_extraction.process_turn(committed, new_messages)
 
@@ -548,7 +680,13 @@ class RuntimeController:
         return {
             "ready": bool(runtime is not None and runtime.ready),
             "started": runtime is not None,
-            "sessionId": runtime.session.session_id if runtime is not None else None,
+            "sessionId": (
+                conversation.session_id
+                if conversation is not None
+                else runtime.session.session_id
+                if runtime is not None and runtime.session is not None
+                else None
+            ),
             "startedAt": self._started_at,
             "busy": bool(conversation is not None and conversation.busy),
             "error": self._last_error,
@@ -838,6 +976,7 @@ class RuntimeController:
         self,
         user_input: str,
         *,
+        session_id: str | None = None,
         max_turns: int = 20,
         on_token: Callable[[str], None] | None = None,
     ) -> TurnResult:
@@ -846,9 +985,45 @@ class RuntimeController:
             raise RuntimeNotReadyError("conversation service is not initialized")
         return await self._conversation.submit(
             user_input,
+            session_id=session_id,
             max_turns=max_turns,
             on_token=on_token,
         )
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        """Return persisted conversations without exposing store internals."""
+        self.ensure_ready()
+        if self._conversation is None:
+            raise RuntimeNotReadyError("conversation service is not initialized")
+        return await self._conversation.list_sessions()
+
+    async def create_session(self, title: str = "") -> dict[str, Any]:
+        """Create and activate a conversation."""
+        self.ensure_ready()
+        if self._conversation is None:
+            raise RuntimeNotReadyError("conversation service is not initialized")
+        return await self._conversation.create_session(title)
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """Read one conversation and its messages."""
+        self.ensure_ready()
+        if self._conversation is None:
+            raise RuntimeNotReadyError("conversation service is not initialized")
+        return await self._conversation.get_session(session_id)
+
+    async def activate_session(self, session_id: str) -> SessionSnapshot:
+        """Make one persisted conversation active for the next turn."""
+        self.ensure_ready()
+        if self._conversation is None:
+            raise RuntimeNotReadyError("conversation service is not initialized")
+        return await self._conversation.activate_session(session_id)
+
+    async def delete_session(self, session_id: str) -> str:
+        """Delete one conversation and return the active session id."""
+        self.ensure_ready()
+        if self._conversation is None:
+            raise RuntimeNotReadyError("conversation service is not initialized")
+        return await self._conversation.delete_session(session_id)
 
     async def activate_model(self, name: str) -> str:
         """Switch the active model through the serialized conversation service."""
@@ -874,10 +1049,13 @@ class RuntimeController:
         self,
         user_input: str,
         *,
+        session_id: str | None = None,
         max_turns: int = 20,
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield token, runtime-event, approval, and final result records."""
         runtime = self.ensure_ready()
+        if session_id is not None:
+            await self.activate_session(session_id)
         events = runtime.events
         if events is None:
             raise RuntimeNotReadyError("event gateway is not initialized")
@@ -913,6 +1091,7 @@ class RuntimeController:
             try:
                 result = await self.submit(
                     user_input,
+                    session_id=session_id,
                     max_turns=max_turns,
                     on_token=enqueue_token,
                 )
@@ -965,6 +1144,42 @@ def _snapshot_to_dict(snapshot: object) -> dict[str, Any]:
         "mcp": [asdict(item) for item in getattr(snapshot, "mcp", ())],
         "models": [asdict(item) for item in getattr(snapshot, "models", ())],
         "skills": [asdict(item) for item in getattr(snapshot, "skills", ())],
+    }
+
+
+def _new_session_id() -> str:
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    return f"session-{timestamp}-{uuid4().hex[:8]}"
+
+
+def _clean_session_title(title: str) -> str:
+    normalized = " ".join(str(title or "").split())
+    if len(normalized) > 200:
+        return normalized[:197].rstrip() + "..."
+    return normalized
+
+
+def _session_title_from_prompt(prompt: str) -> str:
+    normalized = " ".join(prompt.split())
+    if len(normalized) > 72:
+        return normalized[:69].rstrip() + "..."
+    return normalized or "New conversation"
+
+
+def _session_summary(
+    session_id: str,
+    metadata: SessionMetadata,
+    *,
+    active: bool,
+) -> dict[str, Any]:
+    return {
+        "id": session_id,
+        "title": metadata.title,
+        "createdAt": metadata.created_at,
+        "updatedAt": metadata.updated_at,
+        "messageCount": metadata.message_count,
+        "revision": metadata.revision,
+        "active": active,
     }
 
 

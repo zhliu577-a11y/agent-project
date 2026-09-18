@@ -277,6 +277,34 @@ class SessionGateway:
         await self._emit("session.cleared", revision=metadata.revision)
         return metadata
 
+    @boundary("failed to update session title")
+    async def set_title(self, title: str) -> SessionMetadata:
+        """Update the display title without changing the message count."""
+        normalized = " ".join(title.split())
+        if len(normalized) > 200:
+            normalized = normalized[:197].rstrip() + "..."
+        async with self._lock:
+            if not self._loaded:
+                await self._refresh()
+            metadata = self._metadata.advanced(
+                message_count=self._metadata.message_count,
+                title=normalized,
+            )
+            await self._store.save_metadata(self._session_id, metadata)
+            self._metadata = metadata
+        await self._emit("session.title_updated", revision=metadata.revision)
+        return metadata
+
+    @boundary("failed to delete session")
+    async def delete(self) -> None:
+        """Delete the whole session through the store contract."""
+        async with self._lock:
+            await self._store.delete(self._session_id)
+            self._metadata = SessionMetadata()
+            self._checkpoint = None
+            self._loaded = True
+        await self._emit("session.deleted")
+
     @staticmethod
     def _validate_compaction(result: CompactionResult, *, original: list[Message]) -> None:
         if not isinstance(result, CompactionResult):

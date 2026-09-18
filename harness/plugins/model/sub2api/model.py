@@ -4,7 +4,7 @@ import os
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpx2Client
 
 from core.model import ModelAdapter
 from core.parser import OpenAIResponsesParser
@@ -97,11 +97,16 @@ class Sub2APIModel(ModelAdapter):
         max_retries: int,
         disable_response_storage: bool,
     ) -> None:
+        http_client = DefaultAsyncHttpx2Client(
+            trust_env=False,
+            timeout=timeout,
+        )
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
             max_retries=max_retries,
+            http_client=http_client,
         )
         self._model = model
         self._disable_response_storage = disable_response_storage

@@ -16,6 +16,7 @@ from api.services import (
     UnknownModelError,
 )
 from core.events import Event, EventIdentity
+from core.session import SessionMetadata, SessionSnapshot
 from core.types import Message
 from plugins.manager import PluginManager
 
@@ -70,12 +71,26 @@ class _FakeController:
         self.active_model = "fake"
         self.mcp_preload: list[str] = []
         self.event_journal = EventJournal()
+        self.active_session_id = "test"
+        self.session_messages: dict[str, list[Message]] = {
+            "test": [
+                Message(role="user", content="hello"),
+                Message(role="assistant", content="hi"),
+            ]
+        }
+        self.session_metadata: dict[str, SessionMetadata] = {
+            "test": SessionMetadata(
+                revision=1,
+                message_count=2,
+                title="Existing conversation",
+            )
+        }
 
     def status(self) -> dict[str, Any]:
         return {
             "ready": self.started,
             "started": self.started,
-            "sessionId": "test" if self.started else None,
+            "sessionId": self.active_session_id if self.started else None,
             "startedAt": None,
             "busy": self.busy,
             "error": None,
@@ -193,12 +208,71 @@ class _FakeController:
             "hasApiKey": bool(changes.get("apiKey")) or self.model_settings(name)["hasApiKey"],
         }
 
-    async def submit(self, message: str, *, max_turns: int, on_token=None) -> TurnResult:
+    async def list_sessions(self) -> list[dict[str, Any]]:
         self.ensure_ready()
+        return [
+            {
+                "id": session_id,
+                "title": metadata.title,
+                "createdAt": metadata.created_at,
+                "updatedAt": metadata.updated_at,
+                "messageCount": metadata.message_count,
+                "revision": metadata.revision,
+                "active": session_id == self.active_session_id,
+            }
+            for session_id, metadata in self.session_metadata.items()
+        ]
+
+    async def create_session(self, title: str = "") -> dict[str, Any]:
+        self.ensure_ready()
+        session_id = f"session-{len(self.session_metadata) + 1}"
+        metadata = SessionMetadata(title=title)
+        self.session_metadata[session_id] = metadata
+        self.session_messages[session_id] = []
+        self.active_session_id = session_id
+        return next(
+            item for item in await self.list_sessions() if item["id"] == session_id
+        )
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        self.ensure_ready()
+        return SessionSnapshot(
+            session_id=session_id,
+            messages=list(self.session_messages.get(session_id, [])),
+            metadata=self.session_metadata[session_id],
+        )
+
+    async def activate_session(self, session_id: str) -> SessionSnapshot:
+        self.active_session_id = session_id
+        return await self.get_session(session_id)
+
+    async def delete_session(self, session_id: str) -> str:
+        self.ensure_ready()
+        self.session_metadata.pop(session_id, None)
+        self.session_messages.pop(session_id, None)
+        if session_id == self.active_session_id:
+            if self.session_metadata:
+                self.active_session_id = next(iter(self.session_metadata))
+            else:
+                created = await self.create_session()
+                self.active_session_id = str(created["id"])
+        return self.active_session_id
+
+    async def submit(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+        max_turns: int,
+        on_token=None,
+    ) -> TurnResult:
+        self.ensure_ready()
+        if session_id is not None:
+            await self.activate_session(session_id)
         if on_token is not None:
             on_token("hello")
         return TurnResult(
-            session_id="test",
+            session_id=session_id or self.active_session_id,
             content="hello",
             stop_reason="done",
             messages=(
@@ -207,8 +281,19 @@ class _FakeController:
             ),
         )
 
-    async def stream_turn(self, message: str, *, max_turns: int):
-        result = await self.submit(message, max_turns=max_turns, on_token=None)
+    async def stream_turn(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+        max_turns: int,
+    ):
+        result = await self.submit(
+            message,
+            session_id=session_id,
+            max_turns=max_turns,
+            on_token=None,
+        )
         yield {"event": "token", "data": {"delta": "hello"}}
         yield {"event": "done", "data": result.to_dict()}
 
@@ -290,6 +375,38 @@ def test_api_chat_stream_and_unknown_approval(tmp_path) -> None:
             json={"approved": True},
         )
         assert missing.status_code == 404
+
+
+def test_api_manages_conversation_history(tmp_path) -> None:
+    controller = _FakeController(_manager(tmp_path))
+
+    with TestClient(create_app(controller, autostart=False)) as client:
+        client.post("/api/v1/runtime/start")
+
+        listed = client.get("/api/v1/sessions")
+        assert listed.status_code == 200
+        assert listed.json()["sessions"][0]["id"] == "test"
+
+        created = client.post("/api/v1/sessions", json={"title": "Page session"})
+        assert created.status_code == 201
+        session_id = created.json()["id"]
+        assert created.json()["title"] == "Page session"
+
+        detail = client.get(f"/api/v1/sessions/{session_id}")
+        assert detail.status_code == 200
+        assert detail.json()["messages"] == []
+
+        response = client.post(
+            "/api/v1/chat",
+            json={"message": "hello", "sessionId": session_id},
+        )
+        assert response.status_code == 200
+        assert response.json()["sessionId"] == session_id
+
+        removed = client.delete(f"/api/v1/sessions/{session_id}")
+        assert removed.status_code == 200
+        assert removed.json()["deleted"] == session_id
+        assert removed.json()["activeSessionId"] != session_id
 
 
 def test_api_activates_model_and_reports_busy(tmp_path) -> None:

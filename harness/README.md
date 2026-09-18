@@ -125,7 +125,7 @@ plugins/
 │   │   ├── plugin.json         #   清单（名字/类型/入口）
 │   │   └── server.py           #   插件自带代码/配置
 │   ├── math/
-│   └── filesystem/             #   也可以是外部 MCP（npx 等）的启动配置
+│   └── filesystem/             #   仓库内置 Python MCP 服务（无 npx/网络依赖）
 ├── tools/                      # 工具插件（Python 进程内或外部进程）
 │   ├── text/                   #   文本工具示例（slugify / count_words）
 │   └── json/                   #   JSON 处理（format / get）
@@ -301,17 +301,27 @@ validate -> staging -> 静态入口检查 -> sha256 -> 原子移动 -> registry
   "name": "filesystem",
   "type": "mcp",
   "entry": {
-    "command": "cmd.exe",
-    "args": ["/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "E:/demo"]
+    "command": "python",
+    "args": ["server.py", "../../../data/workspace"]
   }
 }
 ```
 
 - `command == "python"` 会自动替换为当前解释器；`args` 中相对路径且真实存在于
   插件目录的文件会被解析为绝对路径（所以写 `"args": ["server.py"]` 即可），
-  其余参数（如 `npx -y`）原样保留。
+  其余参数原样保留。内置 `filesystem` 服务默认使用 `harness/data/workspace`，
+  并可通过 `HARNESS_FILESYSTEM_ROOT` 覆盖允许目录。
 - 子进程工作目录固定为该插件目录，插件自带资源用相对路径即可。
 - `transport` 目前只支持 `stdio`（远程 HTTP 在 Roadmap）。
+
+内置 `filesystem` 服务提供 `read_text_file`、`write_file`、`list_directory`、
+`create_directory`、`move_file`、`get_file_info` 和
+`list_allowed_directories`。所有路径都限制在允许根目录内；`..`、绝对路径或
+符号链接逃逸会被拒绝。它不依赖 `npx`、npm 缓存、网络或系统 `PATH` 中的
+Python，避免子进程启动依赖过多外部状态。
+
+> Windows 下应从普通 PowerShell 终端启动后端。受限沙箱或后台任务可能禁止
+> 为 MCP stdio 创建子进程管道，从而出现 `[WinError 5] 拒绝访问`。
 
 MCP 默认按需挂载：Runtime 启动时只读取插件清单，模型调用 `use_plugin` 后
 才连接服务器并执行 `tools/list`。频繁使用、希望第一轮模型请求就携带工具
@@ -817,7 +827,7 @@ $env:CONTEXT_STRATEGY="tail-window"
   `filesystem__write_file`），多插件同名工具天然隔离；
 - 权限策略因此按命名空间匹配：示例见
   `plugins/hooks/permission/permission.json`（如
-  `filesystem__delete_file → deny`）；
+  `filesystem__move_file → ask`）；
 - 挂载工具 `use_plugin` 本身是普通内核工具，模型调用后网关负责连接与注册；
   重复挂载幂等，不会产生第二个连接。
 
@@ -1005,8 +1015,8 @@ loader 在启动时注册订阅，并拒绝 manifest 未声明的事件。需要
 {
   "default": "allow",
   "rules": [
-    { "tool": "filesystem__delete_file", "mode": "deny" },
-    { "tool": "filesystem__write_file", "mode": "ask" }
+    { "tool": "filesystem__write_file", "mode": "ask" },
+    { "tool": "filesystem__move_file", "mode": "ask" }
   ]
 }
 ```

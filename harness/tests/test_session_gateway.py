@@ -7,7 +7,7 @@ from core.compaction import CompactionRequest, CompactionResult
 from core.hooks import HookGateway
 from core.model import ModelAdapter
 from core.registry import ToolRegistry
-from core.session import SessionConflictError, SessionStore
+from core.session import SessionConflictError, SessionMetadata, SessionStore
 from core.types import Message, ModelResponse, ToolCall
 from gateways.session_gateway import SessionGateway
 from loop import run_agent
@@ -229,6 +229,25 @@ async def test_jsonl_checkpoint_roundtrip_and_delete(tmp_path, monkeypatch) -> N
 
     await gateway.delete_checkpoint()
     assert await gateway.load_checkpoint() is None
+
+
+@pytest.mark.asyncio
+async def test_jsonl_store_lists_and_deletes_sessions(tmp_path, monkeypatch) -> None:
+    plugin = next(p for p in load_session_plugins(REPO_PLUGINS) if p.manifest.name == "jsonl")
+    monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path))
+    store = plugin.create()
+
+    await store.save_metadata("one", SessionMetadata(title="One"))
+    await store.save_metadata("two", SessionMetadata(title="Two"))
+    await SessionGateway(store, session_id="one").append_messages(_sample_history())
+
+    sessions = dict(await store.list_sessions())
+    assert set(sessions) == {"one", "two"}
+    assert sessions["one"].message_count == 4
+    assert sessions["two"].title == "Two"
+
+    await store.delete("one")
+    assert {session_id for session_id, _metadata in await store.list_sessions()} == {"two"}
 
 
 @pytest.mark.asyncio
